@@ -82,7 +82,10 @@ export function PlanBoard() {
           </span>
         </div>
         <div className="flex items-center gap-3">
-          <h2 className="text-xl font-bold">{plan.title}</h2>
+          <h2 className="text-xl font-bold">
+            {plan.title}
+            <span className="text-sm font-mono font-normal text-gray-600 ml-2">{plan.name}</span>
+          </h2>
           <span className="text-xs text-gray-500 bg-gray-800 px-2 py-0.5 rounded">
             {done}/{total} tasks done ({pct}%)
             {inProgress > 0 && (

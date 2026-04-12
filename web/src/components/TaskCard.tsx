@@ -3,6 +3,7 @@ import type { PlanTask } from "../stores/plan-store.js";
 import { postJson, putJson } from "../api.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
+import { useSettingsStore } from "../stores/settings-store.js";
 
 interface Props {
   task: PlanTask;
@@ -46,6 +47,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
   const [showMenu, setShowMenu] = useState(false);
   const selectAgent = useAgentStore((s) => s.selectAgent);
   const selectPlan = usePlanStore((s) => s.selectPlan);
+  const effort = useSettingsStore((s) => s.effort);
 
   const status = task.status ?? "pending";
   const cfg = statusConfig[status] ?? statusConfig.pending;
@@ -58,6 +60,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
         phaseNumber,
         taskNumber: task.number,
         mode,
+        effort,
       });
       setAgentId(res.agentId);
       selectAgent(res.agentId);

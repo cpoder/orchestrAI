@@ -40,6 +40,7 @@ function initSchema(db: DatabaseSync) {
       task_id TEXT,
       cwd TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'starting',
+      mode TEXT NOT NULL DEFAULT 'pty',
       prompt TEXT,
       started_at TEXT NOT NULL DEFAULT (datetime('now')),
       finished_at TEXT,

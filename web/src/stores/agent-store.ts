@@ -10,6 +10,7 @@ export interface Agent {
   task_id: string | null;
   cwd: string;
   status: string;
+  mode: "pty" | "stream-json";
   prompt: string | null;
   started_at: string;
   finished_at: string | null;

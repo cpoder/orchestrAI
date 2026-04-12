@@ -3,7 +3,7 @@ import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
 import { execSync } from "node:child_process";
-import { PLANS_DIR } from "./config.js";
+import { PLANS_DIR, DEFAULT_EFFORT } from "./config.js";
 import { listPlans, parsePlanFile } from "./plan-parser.js";
 import {
   getAllAgents,
@@ -20,30 +20,38 @@ export const apiRouter = Router();
 // --- Plans ---
 
 apiRouter.get("/plans", (_req: Request, res: Response) => {
-  const plans = listPlans();
   const db = getDb();
-  // Merge DB project overrides
   const overrides = db.prepare(`SELECT plan_name, project FROM plan_project`).all() as { plan_name: string; project: string }[];
   const overrideMap = new Map(overrides.map((o) => [o.plan_name, o.project]));
-  // Get completed/total counts per plan
-  const statusCounts = db.prepare(
-    `SELECT plan_name, status, COUNT(*) as cnt FROM task_status GROUP BY plan_name, status`
-  ).all() as { plan_name: string; status: string; cnt: number }[];
-  const countMap = new Map<string, Record<string, number>>();
-  for (const row of statusCounts) {
-    if (!countMap.has(row.plan_name)) countMap.set(row.plan_name, {});
-    countMap.get(row.plan_name)![row.status] = row.cnt;
-  }
-  const enriched = plans.map((plan) => {
-    const counts = countMap.get(plan.name) ?? {};
-    const doneCount = (counts.completed ?? 0) + (counts.skipped ?? 0);
-    return {
-      ...plan,
-      project: overrideMap.get(plan.name) ?? plan.project,
-      doneCount,
-    };
+
+  // For each plan, parse it fully and merge statuses to get accurate counts
+  const plans = listPlans().map((plan) => {
+    const filePath = path.join(PLANS_DIR, `${plan.name}.md`);
+    try {
+      const parsed = parsePlanFile(filePath);
+      const statuses = db
+        .prepare(`SELECT task_number, status FROM task_status WHERE plan_name = ?`)
+        .all(plan.name) as { task_number: string; status: string }[];
+      const statusMap = new Map(statuses.map((s) => [s.task_number, s.status]));
+
+      let doneCount = 0;
+      for (const phase of parsed.phases) {
+        for (const task of phase.tasks) {
+          const s = statusMap.get(task.number) ?? "pending";
+          if (s === "completed" || s === "skipped") doneCount++;
+        }
+      }
+      return {
+        ...plan,
+        project: overrideMap.get(plan.name) ?? plan.project,
+        doneCount,
+      };
+    } catch {
+      return { ...plan, project: overrideMap.get(plan.name) ?? plan.project, doneCount: 0 };
+    }
   });
-  res.json(enriched);
+
+  res.json(plans);
 });
 
 apiRouter.get("/plans/:name", (req: Request, res: Response) => {
@@ -70,6 +78,107 @@ apiRouter.get("/plans/:name", (req: Request, res: Response) => {
     res.json(plan);
   } catch {
     res.status(404).json({ error: "Plan not found" });
+  }
+});
+
+// --- Create Plan ---
+
+apiRouter.post("/plans/create", (req: Request, res: Response) => {
+  const { description, folder, createFolder } = req.body as {
+    description: string;
+    folder: string;
+    createFolder?: boolean;
+  };
+
+  if (!description?.trim()) {
+    res.status(400).json({ error: "description is required" });
+    return;
+  }
+  if (!folder?.trim()) {
+    res.status(400).json({ error: "folder is required" });
+    return;
+  }
+
+  // Resolve folder path
+  const resolvedFolder = folder.startsWith("~")
+    ? path.join(os.homedir(), folder.slice(1))
+    : path.resolve(folder);
+
+  if (!fs.existsSync(resolvedFolder)) {
+    if (!createFolder) {
+      res.status(400).json({
+        error: "folder_not_found",
+        message: `Directory does not exist: ${resolvedFolder}`,
+        resolvedFolder,
+      });
+      return;
+    }
+    fs.mkdirSync(resolvedFolder, { recursive: true });
+  }
+
+  const stat = fs.statSync(resolvedFolder);
+  if (!stat.isDirectory()) {
+    res.status(400).json({ error: `Not a directory: ${resolvedFolder}` });
+    return;
+  }
+
+  const prompt = [
+    `You are creating an implementation plan for a project.`,
+    ``,
+    `Working directory: ${resolvedFolder}`,
+    ``,
+    `Request:`,
+    description,
+    ``,
+    `Create a detailed implementation plan. Structure it as:`,
+    `# Plan Title`,
+    ``,
+    `## Context`,
+    `Brief background and motivation.`,
+    ``,
+    `## Phase 0: ...`,
+    `### 0.1 Task Title`,
+    `- **What:** ...`,
+    `- **Where:** file paths`,
+    `- **Acceptance:** success criteria`,
+    ``,
+    `Continue with Phase 1, 2, etc.`,
+    ``,
+    `First explore the working directory to understand the existing codebase (if any).`,
+    `Then write the plan to a file at ${PLANS_DIR}/<generated-name>.md using the Write tool.`,
+    `The filename should be a short kebab-case slug derived from the plan title.`,
+    ``,
+    `IMPORTANT: When you are finished, end with:`,
+    `{"status": "completed", "reason": "Plan created at <filepath>"}`,
+  ].join("\n");
+
+  const agentId = startAgent({
+    prompt,
+    cwd: resolvedFolder,
+  });
+
+  // Store the project association
+  const projectName = path.basename(resolvedFolder);
+  const db = getDb();
+  // We'll link it once the plan file is created (via file watcher)
+
+  res.json({ agentId, folder: resolvedFolder, projectName });
+});
+
+// --- List folders (for autocomplete) ---
+
+apiRouter.get("/folders", (_req: Request, res: Response) => {
+  const homeDir = os.homedir();
+  try {
+    const entries = fs.readdirSync(homeDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && !d.name.startsWith("."))
+      .map((d) => ({
+        name: d.name,
+        path: path.join(homeDir, d.name),
+      }));
+    res.json(entries);
+  } catch {
+    res.json([]);
   }
 });
 
@@ -177,6 +286,7 @@ apiRouter.post("/plans/:name/tasks/:taskNumber/check", (req: Request, res: Respo
     planName,
     taskId: taskNumber,
     readOnly: true,
+    effort: currentEffort,
   });
 
   // Set task to checking state
@@ -455,12 +565,13 @@ apiRouter.delete("/agents/:id", (req: Request, res: Response) => {
 // --- Actions ---
 
 apiRouter.post("/actions/start-task", (req: Request, res: Response) => {
-  const { planName, phaseNumber, taskNumber, cwd, mode } = req.body as {
+  const { planName, phaseNumber, taskNumber, cwd, mode, effort } = req.body as {
     planName: string;
     phaseNumber: number;
     taskNumber: string;
     cwd?: string;
     mode?: "start" | "continue";
+    effort?: "low" | "medium" | "high" | "max";
   };
 
   if (!planName || phaseNumber === undefined || !taskNumber) {
@@ -511,10 +622,12 @@ apiRouter.post("/actions/start-task", (req: Request, res: Response) => {
       ? `First, read the relevant files to understand what has already been done. Then complete the remaining work. When done, summarize what was already in place and what you changed.`
       : `Please implement this task. When done, summarize what you changed.`,
     ``,
-    `IMPORTANT: When you are finished, you MUST end your final message with a JSON status on its own line:`,
-    `{"status": "completed", "reason": "brief summary of what was done"}`,
-    `If you could not fully complete the task, use:`,
-    `{"status": "in_progress", "reason": "what remains to be done"}`,
+    `IMPORTANT: When you think you are done, do NOT stop. Instead:`,
+    `1. Summarize what you did`,
+    `2. Mark the task status by running: curl -s -X PUT http://localhost:3100/api/plans/${planName}/tasks/${taskNumber}/status -H "Content-Type: application/json" -d '{"status":"completed"}'`,
+    `   (use "in_progress" instead if the task is not fully done)`,
+    `3. Ask the user if they need anything else or want to review the changes`,
+    `4. Only stop when the user explicitly says they are done`,
   ]
     .filter(Boolean)
     .join("\n");
@@ -525,10 +638,32 @@ apiRouter.post("/actions/start-task", (req: Request, res: Response) => {
     prompt,
     cwd: workDir,
     planName,
-    taskId: `${phaseNumber}.${taskNumber}`,
+    taskId: taskNumber,
+    effort: effort ?? currentEffort,
   });
 
-  res.json({ agentId, taskId: `${phaseNumber}.${taskNumber}` });
+  res.json({ agentId, taskId: taskNumber });
+});
+
+// --- Settings ---
+
+let currentEffort = DEFAULT_EFFORT;
+
+apiRouter.get("/settings", (_req: Request, res: Response) => {
+  res.json({ effort: currentEffort });
+});
+
+apiRouter.put("/settings", (req: Request, res: Response) => {
+  const { effort } = req.body as { effort?: string };
+  if (effort) {
+    const valid = ["low", "medium", "high", "max"];
+    if (!valid.includes(effort)) {
+      res.status(400).json({ error: `effort must be one of: ${valid.join(", ")}` });
+      return;
+    }
+    currentEffort = effort as typeof currentEffort;
+  }
+  res.json({ effort: currentEffort });
 });
 
 // --- Hook Events ---

@@ -2,12 +2,14 @@ import { useEffect, useState } from "react";
 import { usePlanStore } from "./stores/plan-store.js";
 import { useAgentStore } from "./stores/agent-store.js";
 import { useWsStore } from "./stores/ws-store.js";
+import { useSettingsStore } from "./stores/settings-store.js";
 import { Sidebar } from "./components/Sidebar.js";
 import { PlanBoard } from "./components/PlanBoard.js";
 import { AgentTree } from "./components/AgentTree.js";
 import { AgentPanel } from "./components/AgentPanel.js";
+import { NewPlanForm } from "./components/NewPlanForm.js";
 
-type View = "plans" | "agents";
+type View = "plans" | "agents" | "new-plan";
 
 export function App() {
   const [view, setView] = useState<View>("plans");
@@ -17,24 +19,33 @@ export function App() {
   const fetchAgents = useAgentStore((s) => s.fetchAgents);
   const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
 
+  const fetchSettings = useSettingsStore((s) => s.fetchSettings);
+
   useEffect(() => {
     connect();
     fetchPlans();
     fetchAgents();
+    fetchSettings();
   }, []);
 
   return (
     <div className="flex h-screen bg-gray-950 text-gray-100">
-      <Sidebar view={view} onViewChange={setView} />
+      <Sidebar
+        view={view}
+        onViewChange={setView}
+      />
 
       <main className="flex-1 flex overflow-hidden">
         <div className="flex-1 overflow-auto">
           {view === "plans" && <PlanBoard />}
           {view === "agents" && <AgentTree />}
+          {view === "new-plan" && (
+            <NewPlanForm onClose={() => setView("plans")} />
+          )}
         </div>
 
         {selectedAgentId && (
-          <div className="w-[480px] border-l border-gray-800">
+          <div className="w-[600px] border-l border-gray-800 h-full">
             <AgentPanel />
           </div>
         )}

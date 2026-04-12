@@ -12,6 +12,10 @@ export default defineConfig({
         target: "ws://localhost:3100",
         ws: true,
       },
+      "/terminal": {
+        target: "ws://localhost:3100",
+        ws: true,
+      },
     },
   },
 });

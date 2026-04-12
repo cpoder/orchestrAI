@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { usePlanStore, type PlanSummary } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
+import { useSettingsStore, type EffortLevel } from "../stores/settings-store.js";
 import { postJson } from "../api.js";
 
 function formatDate(iso: string): string {
@@ -20,8 +21,8 @@ function isPlanDone(p: PlanSummary): boolean {
 }
 
 interface Props {
-  view: "plans" | "agents";
-  onViewChange: (v: "plans" | "agents") => void;
+  view: "plans" | "agents" | "new-plan";
+  onViewChange: (v: "plans" | "agents" | "new-plan") => void;
 }
 
 export function Sidebar({ view, onViewChange }: Props) {
@@ -88,6 +89,7 @@ export function Sidebar({ view, onViewChange }: Props) {
             {dimmed && <span className="text-emerald-600 text-[10px]">&#10003;</span>}
             <span className="truncate">{p.title}</span>
           </div>
+          <div className="text-[9px] font-mono text-gray-700 truncate">{p.name}</div>
           <div className="text-[10px] text-gray-600 flex items-center gap-1">
             {p.taskCount > 0 && (
               <>
@@ -151,7 +153,20 @@ export function Sidebar({ view, onViewChange }: Props) {
         >
           {syncingAll ? "Scanning projects..." : "Sync All Statuses"}
         </button>
+        <button
+          onClick={() => onViewChange("new-plan")}
+          className={`w-full px-3 py-1.5 text-xs border rounded transition mt-1 ${
+            view === "new-plan"
+              ? "bg-indigo-600 border-indigo-600 text-white"
+              : "bg-gray-800 border-gray-700 hover:border-indigo-600 hover:text-indigo-400 text-gray-400"
+          }`}
+        >
+          + New Plan
+        </button>
       </div>
+
+      {/* Effort level */}
+      <EffortSelector />
 
       {/* Plan list grouped by project */}
       <div className="flex-1 overflow-auto p-2">
@@ -200,5 +215,36 @@ export function Sidebar({ view, onViewChange }: Props) {
         ))}
       </div>
     </aside>
+  );
+}
+
+const EFFORT_LEVELS: { value: EffortLevel; label: string; color: string }[] = [
+  { value: "low", label: "Low", color: "text-gray-400" },
+  { value: "medium", label: "Med", color: "text-blue-400" },
+  { value: "high", label: "High", color: "text-amber-400" },
+  { value: "max", label: "Max", color: "text-red-400" },
+];
+
+function EffortSelector() {
+  const effort = useSettingsStore((s) => s.effort);
+  const setEffort = useSettingsStore((s) => s.setEffort);
+
+  return (
+    <div className="px-2 pb-2 flex items-center gap-1">
+      <span className="text-[10px] text-gray-600 mr-1">Effort</span>
+      {EFFORT_LEVELS.map((l) => (
+        <button
+          key={l.value}
+          onClick={() => setEffort(l.value)}
+          className={`px-1.5 py-0.5 text-[10px] rounded transition ${
+            effort === l.value
+              ? `${l.color} bg-gray-800 font-semibold`
+              : "text-gray-600 hover:text-gray-400"
+          }`}
+        >
+          {l.label}
+        </button>
+      ))}
+    </div>
   );
 }

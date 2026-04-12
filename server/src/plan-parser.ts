@@ -213,9 +213,10 @@ export function parsePlanMarkdown(raw: string, name: string, filePath: string): 
     const taskSections = body.split(/(?=^### )/m);
 
     for (const taskBlock of taskSections) {
-      // Match ### N.M Title, ### N. Title, or ### Title
+      // Match ### N.M Title, ### Phase A: Title, ### N. Title, or ### Title
       const taskHeadingMatch =
         /^### (\d+[\.\d]*\w?)\s+(.+)/.exec(taskBlock) ??
+        /^### (?:Phase|Step)\s+(\w+)[:\s.—-]+(.+)/i.exec(taskBlock) ??
         /^### (\S+)\s+(.+)/.exec(taskBlock);
       if (!taskHeadingMatch) continue;
 

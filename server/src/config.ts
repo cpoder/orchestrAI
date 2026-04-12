@@ -7,3 +7,4 @@ export const PLANS_DIR = path.join(CLAUDE_DIR, "plans");
 export const TASKS_DIR = path.join(CLAUDE_DIR, "tasks");
 export const SESSIONS_DIR = path.join(CLAUDE_DIR, "sessions");
 export const DB_PATH = path.join(CLAUDE_DIR, "orchestrai.db");
+export const DEFAULT_EFFORT = (process.env.ORCHESTRAI_EFFORT ?? "high") as "low" | "medium" | "high" | "max";

@@ -1,8 +1,11 @@
 import { useEffect } from "react";
 import { useAgentStore, type Agent } from "../stores/agent-store.js";
+import { usePlanStore } from "../stores/plan-store.js";
 
 export function AgentTree() {
   const agents = useAgentStore((s) => s.agents);
+  const plans = usePlanStore((s) => s.plans);
+  const planTitles = new Map(plans.map((p) => [p.name, p.title]));
   const fetchAgents = useAgentStore((s) => s.fetchAgents);
   const selectAgent = useAgentStore((s) => s.selectAgent);
   const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
@@ -56,7 +59,10 @@ export function AgentTree() {
 
           <div className="mt-1 text-[11px] text-gray-500 space-y-0.5">
             {agent.plan_name && (
-              <div>Plan: {agent.plan_name}</div>
+              <div>
+                {planTitles.get(agent.plan_name) ?? agent.plan_name}
+                <span className="text-gray-600 font-mono ml-1">{agent.plan_name}</span>
+              </div>
             )}
             {agent.last_tool && (
               <div>
