@@ -13,6 +13,7 @@ pub struct AppState {
     pub db: Db,
     pub plans_dir: PathBuf,
     pub claude_dir: PathBuf,
+    pub port: u16,
     pub effort: Arc<std::sync::Mutex<Effort>>,
     pub broadcast_tx: broadcast::Sender<String>,
     pub registry: AgentRegistry,
@@ -29,9 +30,14 @@ impl AppState {
             db,
             plans_dir: config.plans_dir.clone(),
             claude_dir: config.claude_dir.clone(),
+            port: config.port,
             effort: Arc::new(std::sync::Mutex::new(config.effort)),
             broadcast_tx,
             registry,
         }
+    }
+
+    pub fn config_port(&self) -> u16 {
+        self.port
     }
 }

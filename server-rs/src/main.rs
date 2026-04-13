@@ -62,7 +62,10 @@ async fn main() {
         .route("/api/plans/{name}/project", axum::routing::put(api::plans::set_project))
         .route("/api/plans/{name}/tasks/{task_number}/status", axum::routing::put(api::plans::set_task_status))
         .route("/api/plans/{name}/statuses", get(api::plans::get_statuses))
+        .route("/api/plans/create", post(api::plans::create_plan))
         .route("/api/plans/{name}/auto-status", post(api::plans::auto_status))
+        .route("/api/plans/{name}/tasks/{task_number}/check", post(api::plans::check_task))
+        .route("/api/actions/start-task", post(api::plans::start_task))
         // Settings
         .route("/api/settings", get(api::settings::get_settings).put(api::settings::put_settings))
         .route("/api/folders", get(api::settings::list_folders))

@@ -11,6 +11,19 @@ pub enum Effort {
     Max,
 }
 
+impl std::str::FromStr for Effort {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "low" => Ok(Effort::Low),
+            "medium" => Ok(Effort::Medium),
+            "high" => Ok(Effort::High),
+            "max" => Ok(Effort::Max),
+            _ => Err(format!("invalid effort: {s}")),
+        }
+    }
+}
+
 impl std::fmt::Display for Effort {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

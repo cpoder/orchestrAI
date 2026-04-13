@@ -8,6 +8,7 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::agents::{check_agent, pty_agent};
 use crate::auto_status;
 use crate::plan_parser;
 use crate::state::AppState;
@@ -473,4 +474,295 @@ pub async fn sync_all(State(state): State<AppState>) -> impl IntoResponse {
         "in_progress": totals.get("in_progress").unwrap_or(&0),
         "pending": totals.get("pending").unwrap_or(&0),
     }))
+}
+
+// ── POST /api/actions/start-task ────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartTaskBody {
+    plan_name: String,
+    phase_number: u32,
+    task_number: String,
+    cwd: Option<String>,
+    mode: Option<String>,
+    effort: Option<String>,
+}
+
+pub async fn start_task(
+    State(state): State<AppState>,
+    Json(body): Json<StartTaskBody>,
+) -> impl IntoResponse {
+    let plan_path = state.plans_dir.join(format!("{}.md", body.plan_name));
+    let plan = match plan_parser::parse_plan_file(&plan_path) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Plan not found"}))).into_response(),
+    };
+
+    let phase = match plan.phases.iter().find(|p| p.number == body.phase_number) {
+        Some(p) => p,
+        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Phase not found"}))).into_response(),
+    };
+
+    let task = match phase.tasks.iter().find(|t| t.number == body.task_number) {
+        Some(t) => t,
+        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Task not found"}))).into_response(),
+    };
+
+    let is_continue = body.mode.as_deref() == Some("continue");
+    let home = dirs::home_dir().unwrap();
+    let work_dir = body.cwd.map(std::path::PathBuf::from)
+        .unwrap_or_else(|| plan.project.as_ref()
+            .map(|p| home.join(p))
+            .unwrap_or_else(|| std::env::current_dir().unwrap()));
+
+    let files_section = if !task.file_paths.is_empty() {
+        format!("\nFiles involved:\n{}", task.file_paths.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n"))
+    } else {
+        String::new()
+    };
+
+    let acceptance_section = if !task.acceptance.is_empty() {
+        format!("\nAcceptance criteria:\n{}", task.acceptance)
+    } else {
+        String::new()
+    };
+
+    let prompt = format!(
+        "{intro}\n\n\
+         Plan: {plan_title}\n\
+         Phase {phase_num}: {phase_title}\n\
+         Task {task_num}: {task_title}\n\n\
+         Description:\n{description}\n\
+         {files}{acceptance}\n\n\
+         {instruction}\n\n\
+         IMPORTANT: When you think you are done, do NOT stop. Instead:\n\
+         1. Summarize what you did\n\
+         2. Mark the task status by running: curl -s -X PUT http://localhost:{port}/api/plans/{plan_name}/tasks/{task_num}/status -H \"Content-Type: application/json\" -d '{{\"status\":\"completed\"}}'\n\
+         3. Ask the user if they need anything else\n\
+         4. Only stop when the user explicitly says they are done",
+        intro = if is_continue {
+            "You are continuing work on a partially implemented task. Some parts may already exist — check the current state of the code before making changes."
+        } else {
+            "You are working on the following task from a plan."
+        },
+        plan_title = plan.title,
+        phase_num = phase.number,
+        phase_title = phase.title,
+        task_num = task.number,
+        task_title = task.title,
+        description = task.description,
+        files = files_section,
+        acceptance = acceptance_section,
+        instruction = if is_continue {
+            "First, read the relevant files to understand what has already been done. Then complete the remaining work."
+        } else {
+            "Please implement this task. When done, summarize what you changed."
+        },
+        port = state.config_port(),
+        plan_name = body.plan_name,
+    );
+
+    let effort = body.effort
+        .and_then(|e| e.parse().ok())
+        .unwrap_or(*state.effort.lock().unwrap());
+
+    let agent_id = pty_agent::start_pty_agent(
+        &state.registry,
+        prompt,
+        &work_dir,
+        Some(&body.plan_name),
+        Some(&body.task_number),
+        effort,
+    )
+    .await;
+
+    Json(serde_json::json!({
+        "agentId": agent_id,
+        "taskId": body.task_number,
+    }))
+    .into_response()
+}
+
+// ── POST /api/plans/:name/tasks/:num/check ──────────────────────────────────
+
+pub async fn check_task(
+    State(state): State<AppState>,
+    Path((plan_name, task_number)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let plan_path = state.plans_dir.join(format!("{plan_name}.md"));
+    let plan = match plan_parser::parse_plan_file(&plan_path) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Plan not found"}))).into_response(),
+    };
+
+    let project = match plan.project.as_deref() {
+        Some(p) => p,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Plan has no associated project"}))).into_response(),
+    };
+
+    let phase = plan.phases.iter().find(|p| p.tasks.iter().any(|t| t.number == task_number));
+    let task = phase.and_then(|p| p.tasks.iter().find(|t| t.number == task_number));
+    let (phase, task) = match (phase, task) {
+        (Some(p), Some(t)) => (p, t),
+        _ => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Task not found"}))).into_response(),
+    };
+
+    let home = dirs::home_dir().unwrap();
+    let project_dir = home.join(project);
+
+    let files_section = if !task.file_paths.is_empty() {
+        format!("\nFiles mentioned:\n{}", task.file_paths.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n"))
+    } else {
+        String::new()
+    };
+
+    let acceptance_section = if !task.acceptance.is_empty() {
+        format!("\nAcceptance criteria:\n{}", task.acceptance)
+    } else {
+        String::new()
+    };
+
+    let prompt = format!(
+        "You are verifying whether a task from a plan has been implemented.\n\
+         Answer with ONLY a JSON object, no other text: {{\"status\": \"completed\"|\"in_progress\"|\"pending\", \"reason\": \"brief explanation\"}}\n\n\
+         Project directory: {project_dir}\n\
+         Plan: {plan_title}\n\
+         Phase {phase_num}: {phase_title}\n\
+         Task {task_num}: {task_title}\n\n\
+         Task description:\n{description}\n\
+         {files}{acceptance}\n\n\
+         Check the project at {project_dir}. Read the relevant files. Determine if this task is:\n\
+         - \"completed\": all described changes exist in the code\n\
+         - \"in_progress\": some changes exist but the task is not fully done\n\
+         - \"pending\": no evidence of this task being started\n\n\
+         Respond with ONLY the JSON object.",
+        project_dir = project_dir.display(),
+        plan_title = plan.title,
+        phase_num = phase.number,
+        phase_title = phase.title,
+        task_num = task.number,
+        task_title = task.title,
+        description = task.description,
+        files = files_section,
+        acceptance = acceptance_section,
+    );
+
+    // Set task to checking state
+    {
+        let db = state.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO task_status (plan_name, task_number, status, updated_at)
+             VALUES (?1, ?2, 'checking', datetime('now'))
+             ON CONFLICT(plan_name, task_number)
+             DO UPDATE SET status = 'checking', updated_at = datetime('now')",
+            params![plan_name, task_number],
+        ).ok();
+    }
+
+    let effort = *state.effort.lock().unwrap();
+    let agent_id = check_agent::start_check_agent(
+        &state.registry,
+        prompt,
+        &project_dir,
+        Some(&plan_name),
+        Some(&task_number),
+        effort,
+    )
+    .await;
+
+    Json(serde_json::json!({
+        "agentId": agent_id,
+        "planName": plan_name,
+        "taskNumber": task_number,
+    }))
+    .into_response()
+}
+
+// ── POST /api/plans/create ──────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePlanBody {
+    description: String,
+    folder: String,
+    create_folder: Option<bool>,
+}
+
+pub async fn create_plan(
+    State(state): State<AppState>,
+    Json(body): Json<CreatePlanBody>,
+) -> impl IntoResponse {
+    if body.description.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "description is required"}))).into_response();
+    }
+    if body.folder.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "folder is required"}))).into_response();
+    }
+
+    let home = dirs::home_dir().unwrap();
+    let resolved = if body.folder.starts_with('~') {
+        home.join(&body.folder[1..].trim_start_matches('/'))
+    } else {
+        std::path::PathBuf::from(&body.folder)
+    };
+
+    if !resolved.exists() {
+        if body.create_folder != Some(true) {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": "folder_not_found",
+                "message": format!("Directory does not exist: {}", resolved.display()),
+                "resolvedFolder": resolved.to_str(),
+            }))).into_response();
+        }
+        std::fs::create_dir_all(&resolved).ok();
+    }
+
+    if !resolved.is_dir() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Not a directory: {}", resolved.display())}))).into_response();
+    }
+
+    let plans_dir = state.plans_dir.display();
+    let prompt = format!(
+        "You are creating an implementation plan for a project.\n\n\
+         Working directory: {folder}\n\n\
+         Request:\n{description}\n\n\
+         Create a detailed implementation plan. Structure it as:\n\
+         # Plan Title\n\n\
+         ## Context\nBrief background and motivation.\n\n\
+         ## Phase 0: ...\n### 0.1 Task Title\n- **What:** ...\n- **Where:** file paths\n- **Acceptance:** success criteria\n\n\
+         Continue with Phase 1, 2, etc.\n\n\
+         First explore the working directory to understand the existing codebase (if any).\n\
+         Then write the plan to a file at {plans_dir}/<generated-name>.md using the Write tool.\n\
+         The filename should be a short kebab-case slug derived from the plan title.\n\n\
+         IMPORTANT: When you are finished, do NOT stop. Instead:\n\
+         1. Summarize the plan you created\n\
+         2. Ask the user if they want to adjust anything\n\
+         3. Only stop when the user explicitly says they are done",
+        folder = resolved.display(),
+        description = body.description,
+        plans_dir = plans_dir,
+    );
+
+    let effort = *state.effort.lock().unwrap();
+    let agent_id = pty_agent::start_pty_agent(
+        &state.registry,
+        prompt,
+        &resolved,
+        None,
+        None,
+        effort,
+    )
+    .await;
+
+    let project_name = resolved.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+
+    Json(serde_json::json!({
+        "agentId": agent_id,
+        "folder": resolved.to_str(),
+        "projectName": project_name,
+    }))
+    .into_response()
 }
