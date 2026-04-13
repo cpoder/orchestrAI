@@ -96,7 +96,17 @@ fn handle_event(kind: &DebouncedEventKind, path: &PathBuf, tx: &broadcast::Sende
                     );
                 }
                 Err(e) => {
+                    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                     eprintln!("[watcher] Failed to parse {}: {e}", path.display());
+                    broadcast_event(
+                        tx,
+                        "plan_warning",
+                        serde_json::json!({
+                            "name": name,
+                            "file": path.to_string_lossy(),
+                            "error": e.to_string(),
+                        }),
+                    );
                 }
             }
         } else {

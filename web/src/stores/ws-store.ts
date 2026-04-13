@@ -98,6 +98,16 @@ function handleWsMessage(msg: { type: string; data: unknown }) {
       }
       break;
     }
+    case "plan_warning": {
+      const d = msg.data as { name: string; file: string; error: string };
+      planStore.addWarning({
+        name: d.name,
+        file: d.file,
+        error: d.error,
+        timestamp: Date.now(),
+      });
+      break;
+    }
     case "hook_event":
       // Could display in an activity feed
       break;

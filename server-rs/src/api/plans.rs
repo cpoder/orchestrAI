@@ -115,10 +115,14 @@ pub async fn get_plan(
     };
     let mut plan = match plan_parser::parse_plan_file(&plan_path) {
         Ok(p) => p,
-        Err(_) => {
+        Err(e) => {
             return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Plan not found"})),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "parse_error",
+                    "message": format!("Failed to parse plan: {e}"),
+                    "file": plan_path.to_string_lossy(),
+                })),
             )
                 .into_response();
         }

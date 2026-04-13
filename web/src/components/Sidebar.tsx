@@ -30,6 +30,8 @@ export function Sidebar({ view, onViewChange }: Props) {
   const selectedPlan = usePlanStore((s) => s.selectedPlan);
   const selectPlan = usePlanStore((s) => s.selectPlan);
   const fetchPlans = usePlanStore((s) => s.fetchPlans);
+  const warnings = usePlanStore((s) => s.warnings);
+  const dismissWarning = usePlanStore((s) => s.dismissWarning);
   const agents = useAgentStore((s) => s.agents);
   const activeCount = agents.filter(
     (a) => a.status === "running" || a.status === "starting"
@@ -195,6 +197,31 @@ export function Sidebar({ view, onViewChange }: Props) {
 
       {/* Plan list grouped by project */}
       <div className="flex-1 overflow-auto p-2">
+        {warnings.length > 0 && (
+          <div className="mb-3 space-y-1">
+            {warnings.map((w) => (
+              <div
+                key={w.name}
+                className="bg-amber-900/30 border border-amber-700/50 rounded px-2 py-1.5 text-xs"
+              >
+                <div className="flex items-start justify-between gap-1">
+                  <span className="text-amber-400 font-medium truncate">
+                    {w.name}.yaml
+                  </span>
+                  <button
+                    onClick={() => dismissWarning(w.name)}
+                    className="text-gray-600 hover:text-gray-400 flex-shrink-0"
+                  >
+                    x
+                  </button>
+                </div>
+                <p className="text-amber-500/70 text-[10px] mt-0.5 line-clamp-2">
+                  {w.error}
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
         {grouped.map(([project, { active, done }]) => (
           <div key={project} className="mb-3">
             <h3 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider px-2 mb-1 flex items-center gap-1.5">

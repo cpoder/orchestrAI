@@ -41,19 +41,30 @@ export interface PlanSummary {
   modifiedAt: string;
 }
 
+export interface PlanWarning {
+  name: string;
+  file: string;
+  error: string;
+  timestamp: number;
+}
+
 interface PlanStore {
   plans: PlanSummary[];
   selectedPlan: ParsedPlan | null;
   loading: boolean;
+  warnings: PlanWarning[];
   fetchPlans: () => Promise<void>;
   selectPlan: (name: string) => Promise<void>;
   updatePlan: (plan: ParsedPlan) => void;
+  addWarning: (w: PlanWarning) => void;
+  dismissWarning: (name: string) => void;
 }
 
 export const usePlanStore = create<PlanStore>((set, get) => ({
   plans: [],
   selectedPlan: null,
   loading: false,
+  warnings: [],
 
   fetchPlans: async () => {
     set({ loading: true });
@@ -72,5 +83,20 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
     if (selectedPlan?.name === plan.name) {
       set({ selectedPlan: plan });
     }
+  },
+
+  addWarning: (w: PlanWarning) => {
+    set((s) => ({
+      warnings: [
+        ...s.warnings.filter((x) => x.name !== w.name),
+        w,
+      ],
+    }));
+  },
+
+  dismissWarning: (name: string) => {
+    set((s) => ({
+      warnings: s.warnings.filter((w) => w.name !== name),
+    }));
   },
 }));
