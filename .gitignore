@@ -3,3 +3,5 @@ dist/
 target/
 *.db
 .env
+package-lock.json
+screenshots/take-screenshots.mjs

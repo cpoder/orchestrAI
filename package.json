@@ -5,5 +5,8 @@
     "dev": "pnpm --filter server dev & pnpm --filter web dev",
     "dev:server": "pnpm --filter server dev",
     "dev:web": "pnpm --filter web dev"
+  },
+  "dependencies": {
+    "playwright": "^1.59.1"
   }
 }

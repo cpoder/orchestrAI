@@ -73,6 +73,11 @@ export function AgentTree() {
                 ? `Task ${agent.task_id}`
                 : `Agent ${agent.id.slice(0, 8)}`}
             </span>
+            {agent.cost_usd != null && (
+              <span className="text-[10px] text-amber-500/80 font-mono flex-shrink-0">
+                ${agent.cost_usd.toFixed(4)}
+              </span>
+            )}
             <span className="text-[10px] text-gray-500 ml-auto flex-shrink-0">
               {agent.status}
             </span>

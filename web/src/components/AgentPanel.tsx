@@ -1,19 +1,21 @@
-import { useEffect, useRef, useMemo } from "react";
+import { useEffect, useRef, useMemo, useState, useCallback } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
-import { useAgentStore, type AgentOutputLine } from "../stores/agent-store.js";
+import { useAgentStore, type AgentOutputLine, type AgentDiff } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
+
+type Tab = "output" | "diff";
 
 export function AgentPanel() {
   const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
   const agents = useAgentStore((s) => s.agents);
-  const agentOutput = useAgentStore((s) => s.agentOutput);
-  const fetchAgentOutput = useAgentStore((s) => s.fetchAgentOutput);
   const killAgent = useAgentStore((s) => s.killAgent);
   const selectAgent = useAgentStore((s) => s.selectAgent);
   const plans = usePlanStore((s) => s.plans);
+
+  const [activeTab, setActiveTab] = useState<Tab>("output");
 
   const agent = agents.find((a) => a.id === selectedAgentId);
   const planTitle = agent?.plan_name
@@ -22,6 +24,12 @@ export function AgentPanel() {
 
   const isPty = agent?.mode === "pty";
   const isActive = agent?.status === "running" || agent?.status === "starting";
+  const hasBaseCommit = !!agent?.base_commit;
+
+  // Reset to output tab when switching agents
+  useEffect(() => {
+    setActiveTab("output");
+  }, [selectedAgentId]);
 
   if (!agent) return null;
 
@@ -41,11 +49,21 @@ export function AgentPanel() {
             </span>
             <span className="text-[10px] text-gray-600">{agent.status}</span>
             <span className="text-[10px] text-gray-700">{agent.mode}</span>
+            {agent.cost_usd != null && (
+              <span className="text-[10px] text-amber-500/80 font-mono">
+                ${agent.cost_usd.toFixed(4)}
+              </span>
+            )}
           </div>
           {agent.plan_name && (
             <div className="text-[10px] text-gray-500 truncate">
               {planTitle ?? agent.plan_name}
               <span className="text-gray-700 font-mono ml-1">{agent.plan_name}</span>
+            </div>
+          )}
+          {agent.branch && (
+            <div className="text-[10px] text-indigo-500/70 font-mono truncate">
+              {agent.branch}
             </div>
           )}
         </div>
@@ -67,11 +85,46 @@ export function AgentPanel() {
         </div>
       </div>
 
-      {/* Content: PTY terminal or stream-json text view */}
-      {isPty ? (
-        <PtyTerminal agentId={agent.id} />
+      {/* Tab bar */}
+      <div className="flex border-b border-gray-800 flex-shrink-0">
+        <button
+          onClick={() => setActiveTab("output")}
+          className={`px-3 py-1.5 text-xs font-medium transition ${
+            activeTab === "output"
+              ? "text-gray-200 border-b-2 border-indigo-500"
+              : "text-gray-500 hover:text-gray-300"
+          }`}
+        >
+          Output
+        </button>
+        <button
+          onClick={() => setActiveTab("diff")}
+          disabled={!hasBaseCommit}
+          className={`px-3 py-1.5 text-xs font-medium transition ${
+            activeTab === "diff"
+              ? "text-gray-200 border-b-2 border-indigo-500"
+              : hasBaseCommit
+                ? "text-gray-500 hover:text-gray-300"
+                : "text-gray-700 cursor-not-allowed"
+          }`}
+        >
+          Diff
+        </button>
+      </div>
+
+      {/* Content */}
+      {activeTab === "output" ? (
+        isPty ? (
+          <PtyTerminal agentId={agent.id} />
+        ) : (
+          <StreamJsonView agentId={agent.id} isActive={isActive} />
+        )
       ) : (
-        <StreamJsonView agentId={agent.id} isActive={isActive} />
+        <DiffView
+          agentId={agent.id}
+          canMerge={!isActive && !!agent.branch}
+          sourceBranch={agent.source_branch}
+        />
       )}
     </div>
   );
@@ -250,9 +303,11 @@ function StreamJsonView({ agentId, isActive }: { agentId: string; isActive: bool
       }
       if (d.type === "result") {
         const dur = d.duration_ms ? `${(d.duration_ms / 1000).toFixed(1)}s` : "";
+        const cost = typeof d.total_cost_usd === "number" ? `$${d.total_cost_usd.toFixed(4)}` : null;
         return (
           <div key={line.id} className="text-[10px] text-gray-600 py-1 border-t border-gray-800 mt-1">
             Finished in {dur} ({d.num_turns ?? 0} turns)
+            {cost && <span className="text-amber-500/80 ml-2">{cost}</span>}
           </div>
         );
       }
@@ -293,4 +348,397 @@ function StreamJsonView({ agentId, isActive }: { agentId: string; isActive: bool
       </div>
     </div>
   );
+}
+
+// --- Diff View ---
+
+function DiffView({
+  agentId,
+  canMerge,
+  sourceBranch,
+}: {
+  agentId: string;
+  canMerge: boolean;
+  sourceBranch: string | null;
+}) {
+  const agentDiffs = useAgentStore((s) => s.agentDiffs);
+  const fetchAgentDiff = useAgentStore((s) => s.fetchAgentDiff);
+  const mergeAgentBranch = useAgentStore((s) => s.mergeAgentBranch);
+  const discardAgentBranch = useAgentStore((s) => s.discardAgentBranch);
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [mergeState, setMergeState] = useState<"idle" | "confirming" | "merging" | "merged" | "error">("idle");
+  const [discardState, setDiscardState] = useState<"idle" | "confirming" | "discarding" | "discarded" | "error">("idle");
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const diffData = agentDiffs[agentId];
+
+  const refresh = useCallback(() => {
+    fetchAgentDiff(agentId);
+  }, [agentId, fetchAgentDiff]);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  if (!diffData) {
+    return (
+      <div className="flex-1 flex items-center justify-center">
+        <p className="text-xs text-gray-600">Loading diff...</p>
+      </div>
+    );
+  }
+
+  if (diffData.error) {
+    return (
+      <div className="flex-1 flex items-center justify-center p-4">
+        <p className="text-xs text-red-400">{diffData.error}</p>
+      </div>
+    );
+  }
+
+  if (diffData.files.length === 0) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center gap-2 p-4">
+        <p className="text-xs text-gray-500">No file changes detected.</p>
+        <button
+          onClick={refresh}
+          className="text-xs text-indigo-400 hover:text-indigo-300 transition"
+        >
+          Refresh
+        </button>
+      </div>
+    );
+  }
+
+  // Parse unified diff into per-file hunks
+  const fileDiffs = parseDiff(diffData.diff);
+  const displayed = selectedFile
+    ? fileDiffs.filter((f) => f.path === selectedFile)
+    : fileDiffs;
+
+  return (
+    <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+      {/* File list bar */}
+      <div className="flex items-center gap-1 px-2 py-1.5 border-b border-gray-800 flex-shrink-0 overflow-x-auto">
+        <button
+          onClick={() => setSelectedFile(null)}
+          className={`px-2 py-0.5 text-[11px] rounded whitespace-nowrap transition ${
+            selectedFile === null
+              ? "bg-indigo-600/30 text-indigo-300"
+              : "text-gray-500 hover:text-gray-300"
+          }`}
+        >
+          All ({diffData.files.length})
+        </button>
+        {diffData.files.map((file) => (
+          <button
+            key={file}
+            onClick={() => setSelectedFile(file)}
+            className={`px-2 py-0.5 text-[11px] rounded whitespace-nowrap transition ${
+              selectedFile === file
+                ? "bg-indigo-600/30 text-indigo-300"
+                : "text-gray-500 hover:text-gray-300"
+            }`}
+          >
+            {file.split("/").pop()}
+          </button>
+        ))}
+        <div className="flex-1" />
+        <button
+          onClick={refresh}
+          className="px-2 py-0.5 text-[11px] text-gray-600 hover:text-gray-400 transition"
+          title="Refresh diff"
+        >
+          Refresh
+        </button>
+      </div>
+
+      {/* Diff content */}
+      <div className="flex-1 overflow-auto font-mono text-[12px] leading-[1.6]">
+        {displayed.map((file, i) => (
+          <div key={i}>
+            {/* File header */}
+            <div className="sticky top-0 bg-gray-900/95 backdrop-blur-sm px-3 py-1.5 border-b border-gray-800 flex items-center gap-2 z-10">
+              <span className="text-indigo-400 font-medium">{file.path}</span>
+            </div>
+            {/* Hunks */}
+            {file.hunks.map((hunk, hi) => (
+              <div key={hi}>
+                <div className="px-3 py-0.5 text-blue-400/60 bg-blue-950/20 select-none">
+                  {hunk.header}
+                </div>
+                {hunk.lines.map((line, li) => (
+                  <DiffLine key={li} line={line} />
+                ))}
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+
+      {/* Footer with merge actions */}
+      <div className="px-3 py-2 border-t border-gray-800 flex-shrink-0">
+        <div className="flex items-center justify-between">
+          <span className="text-[10px] text-gray-700">
+            base: {diffData.base_commit?.slice(0, 10)}
+            {sourceBranch && <> &rarr; {sourceBranch}</>}
+          </span>
+
+          {canMerge && mergeState !== "merged" && discardState !== "discarded" && (
+            <div className="flex items-center gap-2">
+              {/* Discard button */}
+              {discardState === "confirming" ? (
+                <div className="flex items-center gap-1">
+                  <span className="text-[10px] text-red-400">Delete branch?</span>
+                  <button
+                    onClick={async () => {
+                      setDiscardState("discarding");
+                      setActionError(null);
+                      const result = await discardAgentBranch(agentId);
+                      if (result.ok) {
+                        setDiscardState("discarded");
+                      } else {
+                        setDiscardState("error");
+                        setActionError(result.error ?? "Discard failed");
+                      }
+                    }}
+                    className="px-2 py-0.5 text-[11px] bg-red-900/60 text-red-300 hover:bg-red-900 rounded transition"
+                  >
+                    Yes
+                  </button>
+                  <button
+                    onClick={() => setDiscardState("idle")}
+                    className="px-2 py-0.5 text-[11px] text-gray-500 hover:text-gray-300 transition"
+                  >
+                    No
+                  </button>
+                </div>
+              ) : discardState === "discarding" ? (
+                <span className="text-[10px] text-gray-500">Discarding...</span>
+              ) : (
+                <button
+                  onClick={() => setDiscardState("confirming")}
+                  className="px-2 py-0.5 text-[11px] text-red-500/70 hover:text-red-400 transition"
+                >
+                  Discard
+                </button>
+              )}
+
+              {/* Merge button */}
+              {mergeState === "confirming" ? (
+                <div className="flex items-center gap-1">
+                  <span className="text-[10px] text-amber-400">
+                    Merge into {sourceBranch ?? "main"}?
+                  </span>
+                  <button
+                    onClick={async () => {
+                      setMergeState("merging");
+                      setActionError(null);
+                      const result = await mergeAgentBranch(agentId);
+                      if (result.ok) {
+                        setMergeState("merged");
+                      } else {
+                        setMergeState("error");
+                        setActionError(result.error ?? "Merge failed");
+                      }
+                    }}
+                    className="px-2 py-0.5 text-[11px] bg-emerald-900/60 text-emerald-300 hover:bg-emerald-900 rounded transition"
+                  >
+                    Yes
+                  </button>
+                  <button
+                    onClick={() => setMergeState("idle")}
+                    className="px-2 py-0.5 text-[11px] text-gray-500 hover:text-gray-300 transition"
+                  >
+                    No
+                  </button>
+                </div>
+              ) : mergeState === "merging" ? (
+                <span className="text-[10px] text-gray-500">Merging...</span>
+              ) : (
+                <button
+                  onClick={() => setMergeState("confirming")}
+                  className="px-3 py-1 text-xs bg-emerald-900/50 text-emerald-400 hover:bg-emerald-900 rounded transition font-medium"
+                >
+                  Merge
+                </button>
+              )}
+            </div>
+          )}
+
+          {mergeState === "merged" && (
+            <span className="text-xs text-emerald-400 font-medium">
+              Merged into {sourceBranch ?? "main"}
+            </span>
+          )}
+
+          {discardState === "discarded" && (
+            <span className="text-xs text-gray-500">Branch discarded</span>
+          )}
+        </div>
+
+        {/* Error display */}
+        {actionError && (
+          <div className="mt-1 text-[10px] text-red-400">{actionError}</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// --- Diff line rendering ---
+
+interface DiffLineData {
+  type: "add" | "del" | "ctx" | "noNewline";
+  content: string;
+  oldNum?: number;
+  newNum?: number;
+}
+
+function DiffLine({ line }: { line: DiffLineData }) {
+  if (line.type === "noNewline") {
+    return (
+      <div className="px-3 text-gray-600 italic select-none">
+        \ No newline at end of file
+      </div>
+    );
+  }
+
+  const bgClass =
+    line.type === "add"
+      ? "bg-emerald-950/30"
+      : line.type === "del"
+        ? "bg-red-950/30"
+        : "";
+
+  const textClass =
+    line.type === "add"
+      ? "text-emerald-400"
+      : line.type === "del"
+        ? "text-red-400"
+        : "text-gray-400";
+
+  const gutterClass =
+    line.type === "add"
+      ? "text-emerald-700"
+      : line.type === "del"
+        ? "text-red-700"
+        : "text-gray-700";
+
+  const prefix = line.type === "add" ? "+" : line.type === "del" ? "-" : " ";
+
+  return (
+    <div className={`flex ${bgClass} hover:brightness-125 transition-all duration-75`}>
+      {/* Line numbers */}
+      <span className={`w-10 text-right px-1 select-none flex-shrink-0 ${gutterClass}`}>
+        {line.oldNum ?? ""}
+      </span>
+      <span className={`w-10 text-right px-1 select-none flex-shrink-0 border-r border-gray-800/50 ${gutterClass}`}>
+        {line.newNum ?? ""}
+      </span>
+      {/* Prefix and content */}
+      <span className={`px-1 select-none flex-shrink-0 ${textClass}`}>{prefix}</span>
+      <span className={`flex-1 whitespace-pre ${textClass}`}>
+        {line.content}
+      </span>
+    </div>
+  );
+}
+
+// --- Diff parser ---
+
+interface FileDiff {
+  path: string;
+  hunks: HunkData[];
+}
+
+interface HunkData {
+  header: string;
+  lines: DiffLineData[];
+}
+
+function parseDiff(raw: string): FileDiff[] {
+  const files: FileDiff[] = [];
+  const lines = raw.split("\n");
+  let current: FileDiff | null = null;
+  let currentHunk: HunkData | null = null;
+  let oldLine = 0;
+  let newLine = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // New file diff header
+    if (line.startsWith("diff --git")) {
+      // Extract path from "diff --git a/path b/path"
+      const match = line.match(/diff --git a\/(.+?) b\/(.+)/);
+      const path = match ? match[2] : line.slice(13);
+      current = { path, hunks: [] };
+      files.push(current);
+      currentHunk = null;
+      continue;
+    }
+
+    // Skip index, --- and +++ lines
+    if (
+      line.startsWith("index ") ||
+      line.startsWith("--- ") ||
+      line.startsWith("+++ ") ||
+      line.startsWith("new file mode") ||
+      line.startsWith("deleted file mode") ||
+      line.startsWith("old mode") ||
+      line.startsWith("new mode") ||
+      line.startsWith("similarity index") ||
+      line.startsWith("rename from") ||
+      line.startsWith("rename to") ||
+      line.startsWith("Binary files")
+    ) {
+      continue;
+    }
+
+    // Hunk header
+    if (line.startsWith("@@")) {
+      const hunkMatch = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)/);
+      if (hunkMatch && current) {
+        oldLine = parseInt(hunkMatch[1], 10);
+        newLine = parseInt(hunkMatch[2], 10);
+        currentHunk = { header: line, lines: [] };
+        current.hunks.push(currentHunk);
+      }
+      continue;
+    }
+
+    if (!currentHunk) continue;
+
+    // No newline at end of file
+    if (line.startsWith("\\ No newline")) {
+      currentHunk.lines.push({ type: "noNewline", content: "" });
+      continue;
+    }
+
+    // Diff lines
+    if (line.startsWith("+")) {
+      currentHunk.lines.push({
+        type: "add",
+        content: line.slice(1),
+        newNum: newLine++,
+      });
+    } else if (line.startsWith("-")) {
+      currentHunk.lines.push({
+        type: "del",
+        content: line.slice(1),
+        oldNum: oldLine++,
+      });
+    } else {
+      // Context line (starts with space or is empty)
+      currentHunk.lines.push({
+        type: "ctx",
+        content: line.startsWith(" ") ? line.slice(1) : line,
+        oldNum: oldLine++,
+        newNum: newLine++,
+      });
+    }
+  }
+
+  return files;
 }

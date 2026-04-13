@@ -16,6 +16,18 @@ export interface Agent {
   finished_at: string | null;
   last_tool: string | null;
   last_activity_at: string | null;
+  base_commit: string | null;
+  branch: string | null;
+  source_branch: string | null;
+  cost_usd: number | null;
+}
+
+export interface AgentDiff {
+  diff: string;
+  stat: string;
+  files: string[];
+  base_commit: string;
+  error?: string;
 }
 
 export interface AgentOutputLine {
@@ -30,11 +42,15 @@ interface AgentStore {
   agents: Agent[];
   selectedAgentId: string | null;
   agentOutput: Record<string, AgentOutputLine[]>;
+  agentDiffs: Record<string, AgentDiff>;
   fetchAgents: () => Promise<void>;
   fetchAgentOutput: (agentId: string) => Promise<void>;
+  fetchAgentDiff: (agentId: string) => Promise<void>;
   selectAgent: (agentId: string | null) => void;
   sendMessage: (agentId: string, message: string) => Promise<void>;
   killAgent: (agentId: string) => Promise<void>;
+  mergeAgentBranch: (agentId: string) => Promise<{ ok?: boolean; error?: string }>;
+  discardAgentBranch: (agentId: string) => Promise<{ ok?: boolean; error?: string }>;
   addAgent: (agent: Agent) => void;
   updateAgentStatus: (agentId: string, status: string) => void;
   appendOutput: (agentId: string, line: AgentOutputLine) => void;
@@ -44,6 +60,7 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
   agents: [],
   selectedAgentId: null,
   agentOutput: {},
+  agentDiffs: {},
 
   fetchAgents: async () => {
     const agents = await fetchJson<Agent[]>("/api/agents");
@@ -59,6 +76,13 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
     }));
   },
 
+  fetchAgentDiff: async (agentId: string) => {
+    const diff = await fetchJson<AgentDiff>(`/api/agents/${agentId}/diff`);
+    set((s) => ({
+      agentDiffs: { ...s.agentDiffs, [agentId]: diff },
+    }));
+  },
+
   selectAgent: (agentId) => set({ selectedAgentId: agentId }),
 
   sendMessage: async (agentId, message) => {
@@ -67,6 +91,45 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
 
   killAgent: async (agentId) => {
     await deleteJson(`/api/agents/${agentId}`);
+  },
+
+  mergeAgentBranch: async (agentId) => {
+    try {
+      const result = await postJson<{ ok?: boolean; error?: string }>(
+        `/api/agents/${agentId}/merge`,
+        {}
+      );
+      if (result.ok) {
+        // Clear branch from local state after merge
+        set((s) => ({
+          agents: s.agents.map((a) =>
+            a.id === agentId ? { ...a, branch: null } : a
+          ),
+        }));
+      }
+      return result;
+    } catch (e) {
+      return { error: String(e) };
+    }
+  },
+
+  discardAgentBranch: async (agentId) => {
+    try {
+      const result = await postJson<{ ok?: boolean; error?: string }>(
+        `/api/agents/${agentId}/discard`,
+        {}
+      );
+      if (result.ok) {
+        set((s) => ({
+          agents: s.agents.map((a) =>
+            a.id === agentId ? { ...a, branch: null } : a
+          ),
+        }));
+      }
+      return result;
+    } catch (e) {
+      return { error: String(e) };
+    }
   },
 
   addAgent: (agent) =>
