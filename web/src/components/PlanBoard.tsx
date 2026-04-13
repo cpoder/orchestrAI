@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { usePlanStore } from "../stores/plan-store.js";
 import { postJson } from "../api.js";
-import { PhaseColumn } from "./PhaseColumn.js";
+import { PhaseCard } from "./PhaseCard.js";
 import { EditableText } from "./EditableText.js";
 
 interface SyncResult {
@@ -225,10 +225,10 @@ export function PlanBoard() {
         ))}
       </div>
 
-      {/* Phase columns -- horizontal scroll */}
-      <div className="flex gap-4 overflow-x-auto pb-4">
+      {/* Phase cards -- vertical layout */}
+      <div className="space-y-3 pb-4">
         {plan.phases.map((phase) => (
-          <PhaseColumn key={phase.number} phase={phase} planName={plan.name} statusFilter={statusFilter} />
+          <PhaseCard key={phase.number} phase={phase} planName={plan.name} statusFilter={statusFilter} />
         ))}
       </div>
     </div>
