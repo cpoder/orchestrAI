@@ -57,6 +57,7 @@ interface PlanStore {
   fetchPlans: () => Promise<void>;
   selectPlan: (name: string) => Promise<void>;
   updatePlan: (plan: ParsedPlan) => void;
+  patchTaskStatus: (planName: string, taskNumber: string, status: string) => void;
   savePlan: (plan: ParsedPlan) => Promise<void>;
   addWarning: (w: PlanWarning) => void;
   dismissWarning: (name: string) => void;
@@ -85,6 +86,36 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
     if (selectedPlan?.name === plan.name) {
       set({ selectedPlan: plan });
     }
+  },
+
+  patchTaskStatus: (planName, taskNumber, status) => {
+    const { selectedPlan, plans } = get();
+
+    // Patch the selected plan in-place (no refetch)
+    if (selectedPlan?.name === planName) {
+      const patched = {
+        ...selectedPlan,
+        phases: selectedPlan.phases.map((p) => ({
+          ...p,
+          tasks: p.tasks.map((t) =>
+            t.number === taskNumber
+              ? { ...t, status, statusUpdatedAt: new Date().toISOString() }
+              : t
+          ),
+        })),
+      };
+      set({ selectedPlan: patched });
+    }
+
+    // Patch doneCount in the plan list
+    const updatedPlans = plans.map((p) => {
+      if (p.name !== planName) return p;
+      const delta =
+        status === "completed" || status === "skipped" ? 1 : 0;
+      // We don't know the previous status precisely, so just refetch later
+      return { ...p, doneCount: p.doneCount + delta };
+    });
+    set({ plans: updatedPlans });
   },
 
   savePlan: async (plan: ParsedPlan) => {

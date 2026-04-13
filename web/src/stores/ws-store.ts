@@ -117,13 +117,13 @@ function handleWsMessage(msg: { type: string; data: unknown }) {
       break;
     }
     case "task_checked": {
-      // Agent finished checking a task — refresh the plan
-      planStore.fetchPlans();
-      const d2 = msg.data as { plan_name: string };
-      const sel = planStore.selectedPlan;
-      if (sel?.name === d2.plan_name) {
-        planStore.selectPlan(d2.plan_name);
-      }
+      const d2 = msg.data as { plan_name: string; task_number: string; status: string };
+      planStore.patchTaskStatus(d2.plan_name, d2.task_number, d2.status);
+      break;
+    }
+    case "task_status_changed": {
+      const d2 = msg.data as { plan_name: string; task_number: string; status: string };
+      planStore.patchTaskStatus(d2.plan_name, d2.task_number, d2.status);
       break;
     }
     case "plan_warning": {

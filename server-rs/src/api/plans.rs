@@ -248,6 +248,18 @@ pub async fn set_task_status(
         params![name, task_number, body.status],
     )
     .unwrap();
+    drop(db);
+
+    // Broadcast so the dashboard updates in real-time
+    crate::ws::broadcast_event(
+        &state.broadcast_tx,
+        "task_status_changed",
+        serde_json::json!({
+            "plan_name": name,
+            "task_number": task_number,
+            "status": body.status,
+        }),
+    );
 
     (
         StatusCode::OK,
@@ -635,6 +647,12 @@ pub async fn start_task(
         .and_then(|e| e.parse().ok())
         .unwrap_or(*state.effort.lock().unwrap());
 
+    // Create a dedicated branch for this task
+    let branch_name = format!(
+        "orchestrai/{}/{}",
+        body.plan_name, body.task_number
+    );
+
     let agent_id = pty_agent::start_pty_agent(
         &state.registry,
         prompt,
@@ -642,12 +660,15 @@ pub async fn start_task(
         Some(&body.plan_name),
         Some(&body.task_number),
         effort,
+        Some(&branch_name),
+        is_continue,
     )
     .await;
 
     Json(serde_json::json!({
         "agentId": agent_id,
         "taskId": body.task_number,
+        "branch": branch_name,
     }))
     .into_response()
 }
@@ -885,7 +906,7 @@ pub async fn create_plan(
 
     let effort = *state.effort.lock().unwrap();
     let agent_id =
-        pty_agent::start_pty_agent(&state.registry, prompt, &resolved, None, None, effort).await;
+        pty_agent::start_pty_agent(&state.registry, prompt, &resolved, None, None, effort, None, false).await;
 
     let project_name = resolved
         .file_name()
