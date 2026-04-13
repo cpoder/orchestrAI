@@ -23,9 +23,9 @@ export function App() {
 
   useEffect(() => {
     connect();
-    fetchPlans();
-    fetchAgents();
-    fetchSettings();
+    fetchPlans().catch(() => {});
+    fetchAgents().catch(() => {});
+    fetchSettings().catch(() => {});
   }, []);
 
   return (

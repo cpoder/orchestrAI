@@ -38,15 +38,19 @@ export function Sidebar({ view, onViewChange }: Props) {
   ).length;
   const [syncingAll, setSyncingAll] = useState(false);
   const [convertingAll, setConvertingAll] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [showDone, setShowDone] = useState<Record<string, boolean>>({});
 
   async function handleSyncAll() {
     setSyncingAll(true);
+    setActionError(null);
     try {
       await postJson("/api/plans/sync-all", {});
       await fetchPlans();
       if (selectedPlan) await selectPlan(selectedPlan.name);
     } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setActionError(`Sync failed: ${msg}`);
       console.error("Sync all failed:", e);
     } finally {
       setSyncingAll(false);
@@ -57,11 +61,14 @@ export function Sidebar({ view, onViewChange }: Props) {
 
   async function handleConvertAll() {
     setConvertingAll(true);
+    setActionError(null);
     try {
       await postJson("/api/plans/convert-all", {});
       await fetchPlans();
       if (selectedPlan) await selectPlan(selectedPlan.name);
     } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setActionError(`Convert failed: ${msg}`);
       console.error("Convert all failed:", e);
     } finally {
       setConvertingAll(false);
@@ -190,6 +197,12 @@ export function Sidebar({ view, onViewChange }: Props) {
         >
           + New Plan
         </button>
+        {actionError && (
+          <div className="mt-1 text-[10px] text-red-400 bg-red-900/20 border border-red-800/30 rounded px-2 py-1 flex items-start justify-between gap-1">
+            <span>{actionError}</span>
+            <button onClick={() => setActionError(null)} className="text-red-600 hover:text-red-400 flex-shrink-0">x</button>
+          </div>
+        )}
       </div>
 
       {/* Effort level */}

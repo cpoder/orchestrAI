@@ -138,6 +138,10 @@ function PtyTerminal({ agentId }: { agentId: string }) {
       term.write(ev.data);
     };
 
+    ws.onerror = () => {
+      term.write("\r\n\x1b[31m--- connection error ---\x1b[0m\r\n");
+    };
+
     ws.onclose = () => {
       term.write("\r\n\x1b[90m--- session ended ---\x1b[0m\r\n");
     };

@@ -45,6 +45,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
   const [checking, setChecking] = useState(false);
   const [agentId, setAgentId] = useState<string | null>(null);
   const [showMenu, setShowMenu] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const selectAgent = useAgentStore((s) => s.selectAgent);
   const selectPlan = usePlanStore((s) => s.selectPlan);
   const effort = useSettingsStore((s) => s.effort);
@@ -54,6 +55,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
 
   async function handleStart(mode: "start" | "continue" = "start") {
     setStarting(true);
+    setError(null);
     try {
       const res = await postJson<{ agentId: string }>("/api/actions/start-task", {
         planName,
@@ -66,6 +68,8 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
       selectAgent(res.agentId);
       await updateStatus("in_progress");
     } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(`Start failed: ${msg}`);
       console.error("Failed to start task:", e);
     } finally {
       setStarting(false);
@@ -74,6 +78,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
 
   async function handleCheck() {
     setChecking(true);
+    setError(null);
     try {
       const res = await postJson<{ agentId: string }>(
         `/api/plans/${planName}/tasks/${task.number}/check`,
@@ -86,6 +91,8 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
       setTimeout(() => selectPlan(planName), 10000);
       setTimeout(() => selectPlan(planName), 30000);
     } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(`Check failed: ${msg}`);
       console.error("Failed to check task:", e);
     } finally {
       setChecking(false);
@@ -99,6 +106,8 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
       });
       await selectPlan(planName);
     } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(`Status update failed: ${msg}`);
       console.error("Failed to update status:", e);
     }
     setShowMenu(false);
@@ -253,6 +262,19 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
         <p className="mt-1.5 text-[11px] text-gray-500 line-clamp-2">
           {task.acceptance}
         </p>
+      )}
+
+      {/* Error display */}
+      {error && (
+        <div className="mt-2 text-[11px] text-red-400 bg-red-900/20 border border-red-800/30 rounded px-2 py-1 flex items-start justify-between gap-1">
+          <span className="line-clamp-2">{error}</span>
+          <button
+            onClick={() => setError(null)}
+            className="text-red-600 hover:text-red-400 flex-shrink-0"
+          >
+            x
+          </button>
+        </div>
       )}
     </div>
   );

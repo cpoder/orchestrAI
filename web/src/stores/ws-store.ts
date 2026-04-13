@@ -2,9 +2,13 @@ import { create } from "zustand";
 import { usePlanStore } from "./plan-store.js";
 import { useAgentStore } from "./agent-store.js";
 
+const MAX_RECONNECT_DELAY = 30_000;
+const INITIAL_RECONNECT_DELAY = 2_000;
+
 interface WsStore {
   connected: boolean;
   socket: WebSocket | null;
+  reconnectAttempt: number;
   connect: () => void;
   disconnect: () => void;
 }
@@ -12,19 +16,33 @@ interface WsStore {
 export const useWsStore = create<WsStore>((set, get) => ({
   connected: false,
   socket: null,
+  reconnectAttempt: 0,
 
   connect: () => {
     const { socket } = get();
     if (socket) return;
 
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+    } catch (e) {
+      console.error("[ws] Failed to create WebSocket:", e);
+      scheduleReconnect(get);
+      return;
+    }
 
-    ws.onopen = () => set({ connected: true });
+    ws.onopen = () => {
+      set({ connected: true, reconnectAttempt: 0 });
+    };
+
+    ws.onerror = (ev) => {
+      console.error("[ws] WebSocket error:", ev);
+    };
+
     ws.onclose = () => {
       set({ connected: false, socket: null });
-      // Auto-reconnect after 2s
-      setTimeout(() => get().connect(), 2000);
+      scheduleReconnect(get);
     };
 
     ws.onmessage = (ev) => {
@@ -43,10 +61,20 @@ export const useWsStore = create<WsStore>((set, get) => ({
     const { socket } = get();
     if (socket) {
       socket.close();
-      set({ socket: null, connected: false });
+      set({ socket: null, connected: false, reconnectAttempt: 0 });
     }
   },
 }));
+
+function scheduleReconnect(get: () => WsStore) {
+  const attempt = get().reconnectAttempt;
+  const delay = Math.min(
+    INITIAL_RECONNECT_DELAY * Math.pow(2, attempt),
+    MAX_RECONNECT_DELAY
+  );
+  useWsStore.setState({ reconnectAttempt: attempt + 1 });
+  setTimeout(() => get().connect(), delay);
+}
 
 let planRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 

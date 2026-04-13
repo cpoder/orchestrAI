@@ -70,14 +70,30 @@ pub async fn start_pty_agent(
         .env("TERM", "xterm-256color")
         .status();
 
-    if status.is_err() || !status.unwrap().success() {
-        eprintln!("[agent {}] Failed to create tmux session", &id[..8]);
+    let spawn_failed = match &status {
+        Err(_) => true,
+        Ok(s) => !s.success(),
+    };
+    if spawn_failed {
+        let err_msg = match status {
+            Err(e) => format!("tmux spawn error: {e}"),
+            Ok(s) => format!("tmux exited with {}", s.code().unwrap_or(-1)),
+        };
+        eprintln!(
+            "[agent {}] Failed to create tmux session: {err_msg}",
+            &id[..8]
+        );
         let db = registry.db.lock().unwrap();
         db.execute(
             "UPDATE agents SET status = 'failed', finished_at = datetime('now') WHERE id = ?",
             params![id],
         )
         .ok();
+        broadcast_event(
+            &registry.broadcast_tx,
+            "agent_stopped",
+            serde_json::json!({"id": id, "status": "failed", "error": err_msg}),
+        );
         return id;
     }
 

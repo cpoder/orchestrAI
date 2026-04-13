@@ -37,7 +37,7 @@ pub async fn start_check_agent(
         .ok();
     }
 
-    let mut child = Command::new("claude")
+    let mut child = match Command::new("claude")
         .args([
             "-p",
             "--verbose",
@@ -61,7 +61,24 @@ pub async fn start_check_agent(
         .stderr(Stdio::piped())
         .current_dir(cwd)
         .spawn()
-        .expect("Failed to spawn claude");
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("[check-agent {}] Failed to spawn claude: {e}", &id[..8]);
+            let db = registry.db.lock().unwrap();
+            db.execute(
+                "UPDATE agents SET status = 'failed', finished_at = datetime('now') WHERE id = ?",
+                params![id],
+            )
+            .ok();
+            broadcast_event(
+                &registry.broadcast_tx,
+                "agent_stopped",
+                serde_json::json!({"id": id, "status": "failed", "error": e.to_string()}),
+            );
+            return id;
+        }
+    };
 
     let pid = child.id();
 
