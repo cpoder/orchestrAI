@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
@@ -111,11 +112,12 @@ pub async fn start_pty_agent(
     let tx = registry.broadcast_tx.clone();
     let id_clone = id.clone();
     let prompt_clone = prompt.clone();
+    let prompt_sent = Arc::new(AtomicBool::new(false));
+    let prompt_sent_clone = prompt_sent.clone();
 
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
         let mut ready_detected = false;
-        let mut prompt_sent = false;
 
         loop {
             match reader.read(&mut buf) {
@@ -150,8 +152,8 @@ pub async fn start_pty_agent(
                         }
                     }
 
-                    if ready_detected && !prompt_sent {
-                        prompt_sent = true;
+                    if ready_detected && !prompt_sent_clone.load(Ordering::Relaxed) {
+                        prompt_sent_clone.store(true, Ordering::Relaxed);
                         // Small delay then send prompt
                         let agents_clone = agents.clone();
                         let id_for_write = id_clone.clone();
@@ -197,14 +199,21 @@ pub async fn start_pty_agent(
     let agents_fallback = registry.agents.clone();
     let id_fallback = id.clone();
     let prompt_fallback = prompt;
+    let prompt_sent_fallback = prompt_sent;
     tokio::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
+        // Only send if the ready-signal path didn't already send it
+        if prompt_sent_fallback.swap(true, Ordering::Relaxed) {
+            return; // Already sent
+        }
         let mut agents = agents_fallback.lock().await;
         if let Some(agent) = agents.get_mut(&id_fallback) {
             if let Some(ref mut writer) = agent.pty_writer {
                 writer.write_all(prompt_fallback.as_bytes()).ok();
                 writer.write_all(b"\r").ok();
+                drop(agents);
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                let mut agents = agents_fallback.lock().await;
                 if let Some(agent) = agents.get_mut(&id_fallback) {
                     if let Some(ref mut writer) = agent.pty_writer {
                         writer.write_all(b"\r").ok();
