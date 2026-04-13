@@ -1,43 +1,56 @@
 # orchestrAI
 
-Real-time web dashboard for visualizing Claude Code plans, agents, and tasks.
-
-orchestrAI watches your `~/.claude` directory for plan files and hook events, displays them in a live dashboard, and lets you manage agent sessions — all from a single self-contained binary.
+A control plane for Claude Code agents. Visualize plans, track task progress, spawn interactive agent sessions, review diffs, and approve changes — from a single self-contained Rust binary.
 
 ## Screenshots
 
-**Plan Board** — Kanban-style phases with task cards, status tracking, and progress bars:
+**Plan Board** — Collapsible phase cards with task status, progress bars, and inline editing:
 
 ![Plan Board](screenshots/02-plan-board.png)
 
-**Agents** — Track all running and completed agents with filters:
+**Agents** — All running and completed agents with status/plan filters:
 
 ![Agents](screenshots/03-agents.png)
 
-**New Plan** — Describe what to build, pick a folder, and an agent creates a structured plan:
+**New Plan** — Describe what to build, pick a folder, agent creates a structured plan:
 
 ![New Plan](screenshots/05-new-plan.png)
 
-**Sidebar** — Plans grouped by project, effort selector, sync/convert actions:
+**Sidebar** — Plans grouped by project, effort selector, YAML conversion, search:
 
 ![Landing](screenshots/01-landing.png)
 
 ## Features
 
-- **Plan Board**: Parses `~/.claude/plans/*.md` and `.yaml` into Kanban phases/tasks with progress bars
+### Plan Management
+- **Plan Board**: Parses `~/.claude/plans/*.md` and `.yaml` into collapsible phase cards with task grids
 - **Auto-status detection**: Scans project files and git history to infer task completion
-- **Interactive agents**: Start/Continue/Retry tasks via real Claude Code terminal sessions (tmux + xterm.js)
+- **YAML plans**: Structured plan format with one-click conversion from markdown
+- **Inline editing**: Edit plan titles, context, task descriptions, and acceptance criteria directly in the dashboard
+- **Project inference**: Automatically links plans to project directories from file paths
+- **Plan creation**: Describe what you want, pick a folder, an agent creates the plan
+
+### Agent Orchestration
+- **Interactive terminals**: Start/Continue/Retry tasks via real Claude Code sessions (tmux + xterm.js)
 - **Check agents**: One-click verification — spawns a read-only agent to check if a task is done
 - **Agent persistence**: Agents survive server restarts (tmux sessions auto-reattach)
-- **Effort control**: Global effort level selector (Low/Med/High/Max) for all spawned agents
-- **Project inference**: Automatically links plans to project directories
-- **YAML plans**: Structured plan format with conversion from markdown
-- **Real-time updates**: WebSocket broadcasts for plan changes, agent output, and status updates
-- **Embedded frontend**: Single binary serves the React dashboard — no separate web server needed
+- **Effort control**: Global effort level (Low/Med/High/Max) applied to all spawned agents
+
+### Git Integration
+- **Branch isolation**: Each agent works on a dedicated git branch
+- **Diff view**: See exactly what files an agent changed (unified diff in the agent panel)
+- **Approval workflow**: Review diffs, then merge or discard — changes only land when you approve
+- **Base commit tracking**: Diffs are computed against the commit at agent start
+
+### Real-time Dashboard
+- **WebSocket updates**: Task status changes, agent output, and plan modifications push instantly
+- **In-place updates**: Status changes patch the UI without full-screen refresh
+- **Embedded frontend**: Single binary serves the React dashboard — no separate web server
+- **Hook receiver**: `POST /hooks` endpoint for Claude Code hook events from external sessions
 
 ## Build from source
 
-Requires Rust 1.85+, Node.js 20+, and pnpm.
+Requires Rust 1.85+, Node.js 20+, pnpm, and tmux.
 
 ```sh
 # Build frontend
@@ -47,7 +60,7 @@ pnpm --filter @orchestrai/web build
 cd server-rs && cargo build --release
 ```
 
-Binary: `server-rs/target/release/orchestrai-server`
+Binary: `server-rs/target/release/orchestrai-server` (~10 MB, zero runtime dependencies)
 
 ## Usage
 
@@ -63,12 +76,18 @@ orchestrai-server [OPTIONS]
 
 Open `http://localhost:3100` in your browser.
 
+### Prerequisites
+
+- **tmux** — used for persistent agent terminal sessions
+- **claude** CLI — Claude Code must be installed and authenticated
+
 ## Project structure
 
 ```
 orchestrAI/
   server-rs/      Rust server (Axum, rusqlite, portable-pty, tmux)
-  web/            React frontend (Vite, Tailwind, xterm.js)
+  web/            React frontend (Vite, Tailwind, xterm.js, Zustand)
+  screenshots/    Dashboard screenshots (Playwright)
 ```
 
 ## License
