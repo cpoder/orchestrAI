@@ -59,7 +59,7 @@ pub struct PlanSummary {
 
 // ── YAML schema types ───────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct YamlPlanTask {
     number: String,
     title: String,
@@ -69,11 +69,11 @@ struct YamlPlanTask {
     file_paths: Vec<String>,
     #[serde(default)]
     acceptance: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     dependencies: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct YamlPlanPhase {
     number: u32,
     title: String,
@@ -82,14 +82,14 @@ struct YamlPlanPhase {
     tasks: Vec<YamlPlanTask>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct YamlPlan {
     title: String,
     #[serde(default)]
     context: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     project: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     created_at: Option<String>,
     phases: Vec<YamlPlanPhase>,
 }
@@ -461,6 +461,42 @@ pub fn parse_plan_yaml(raw: &str, name: &str, file_path: &str) -> Result<ParsedP
         modified_at: String::new(),
         phases,
     })
+}
+
+/// Serialize a ParsedPlan to YAML string.
+pub fn serialize_plan_yaml(plan: &ParsedPlan) -> Result<String, String> {
+    let yaml = YamlPlan {
+        title: plan.title.clone(),
+        context: plan.context.clone(),
+        project: plan.project.clone(),
+        created_at: if plan.created_at.is_empty() {
+            None
+        } else {
+            Some(plan.created_at.clone())
+        },
+        phases: plan
+            .phases
+            .iter()
+            .map(|p| YamlPlanPhase {
+                number: p.number,
+                title: p.title.clone(),
+                description: p.description.clone(),
+                tasks: p
+                    .tasks
+                    .iter()
+                    .map(|t| YamlPlanTask {
+                        number: t.number.clone(),
+                        title: t.title.clone(),
+                        description: t.description.clone(),
+                        file_paths: t.file_paths.clone(),
+                        acceptance: t.acceptance.clone(),
+                        dependencies: t.dependencies.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+    serde_yaml::to_string(&yaml).map_err(|e| e.to_string())
 }
 
 // ── File-level helpers ───────────────────────────────────────────────────────

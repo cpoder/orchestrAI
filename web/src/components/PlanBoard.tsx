@@ -13,6 +13,10 @@ export function PlanBoard() {
   const selectPlan = usePlanStore((s) => s.selectPlan);
   const [syncing, setSyncing] = useState(false);
   const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
+  const [converting, setConverting] = useState(false);
+  const fetchPlans = usePlanStore((s) => s.fetchPlans);
+
+  const isMd = plan?.filePath?.endsWith(".md") ?? false;
 
   if (loading) {
     return (
@@ -63,6 +67,19 @@ export function PlanBoard() {
     }
   }
 
+  async function handleConvert() {
+    setConverting(true);
+    try {
+      await postJson(`/api/plans/${plan!.name}/convert`, {});
+      await fetchPlans();
+      await selectPlan(plan!.name);
+    } catch (e) {
+      console.error("Convert failed:", e);
+    } finally {
+      setConverting(false);
+    }
+  }
+
   return (
     <div className="p-6">
       {/* Plan header */}
@@ -80,6 +97,9 @@ export function PlanBoard() {
               <> / Modified {new Date(plan.modifiedAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}</>
             )}
           </span>
+          {isMd && (
+            <span className="text-amber-500/60 font-mono">.md</span>
+          )}
         </div>
         <div className="flex items-center gap-3">
           <h2 className="text-xl font-bold">
@@ -99,6 +119,16 @@ export function PlanBoard() {
               {plan.context.slice(0, 300)}
               {plan.context.length > 300 ? "..." : ""}
             </p>
+          )}
+          {isMd && (
+            <button
+              onClick={handleConvert}
+              disabled={converting}
+              className="flex-shrink-0 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 hover:border-amber-600 hover:text-amber-400 disabled:opacity-50 text-gray-300 rounded transition"
+              title="Convert this plan from Markdown to YAML format"
+            >
+              {converting ? "Converting..." : "Convert to YAML"}
+            </button>
           )}
           <button
             onClick={handleSync}

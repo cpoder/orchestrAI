@@ -113,6 +113,8 @@ async fn main() {
         )
         .route("/api/plans/{name}/statuses", get(api::plans::get_statuses))
         .route("/api/plans/create", post(api::plans::create_plan))
+        .route("/api/plans/convert-all", post(api::plans::convert_all))
+        .route("/api/plans/{name}/convert", post(api::plans::convert_plan))
         .route(
             "/api/plans/{name}/auto-status",
             post(api::plans::auto_status),

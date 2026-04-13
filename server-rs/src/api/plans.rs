@@ -894,3 +894,140 @@ pub async fn create_plan(
     }))
     .into_response()
 }
+
+// ── POST /api/plans/:name/convert ──────────────────────────────────────────
+
+pub async fn convert_plan(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let md_path = state.plans_dir.join(format!("{name}.md"));
+    if !md_path.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "No .md plan found with that name"})),
+        )
+            .into_response();
+    }
+
+    let plan = match plan_parser::parse_plan_file(&md_path) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to parse plan: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let yaml = match plan_parser::serialize_plan_yaml(&plan) {
+        Ok(y) => y,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to serialize YAML: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let yaml_path = state.plans_dir.join(format!("{name}.yaml"));
+    if let Err(e) = std::fs::write(&yaml_path, &yaml) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to write YAML: {e}")})),
+        )
+            .into_response();
+    }
+
+    // Remove the .md file now that .yaml exists
+    std::fs::remove_file(&md_path).ok();
+
+    Json(serde_json::json!({
+        "ok": true,
+        "name": name,
+        "yamlPath": yaml_path.to_str(),
+    }))
+    .into_response()
+}
+
+// ── POST /api/plans/convert-all ────────────────────────────────────────────
+
+pub async fn convert_all(State(state): State<AppState>) -> impl IntoResponse {
+    let entries = match std::fs::read_dir(&state.plans_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "error": format!("Failed to read plans directory: {e}")
+            }))
+            .into_response();
+        }
+    };
+
+    let md_files: Vec<_> = entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+        .collect();
+
+    let mut converted = Vec::new();
+    let mut skipped = Vec::new();
+    let mut failed = Vec::new();
+
+    for entry in &md_files {
+        let path = entry.path();
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Skip if .yaml already exists
+        let yaml_path = state.plans_dir.join(format!("{name}.yaml"));
+        if yaml_path.exists() {
+            skipped.push(name);
+            continue;
+        }
+
+        let plan = match plan_parser::parse_plan_file(&path) {
+            Ok(p) => p,
+            Err(e) => {
+                failed.push(serde_json::json!({"name": name, "error": e.to_string()}));
+                continue;
+            }
+        };
+
+        // Skip plans that parsed poorly (0 tasks)
+        let task_count: usize = plan.phases.iter().map(|p| p.tasks.len()).sum();
+        if task_count == 0 {
+            failed.push(
+                serde_json::json!({"name": name, "error": "0 tasks parsed — needs manual review"}),
+            );
+            continue;
+        }
+
+        match plan_parser::serialize_plan_yaml(&plan) {
+            Ok(yaml) => {
+                if let Err(e) = std::fs::write(&yaml_path, &yaml) {
+                    failed.push(serde_json::json!({"name": name, "error": e.to_string()}));
+                } else {
+                    std::fs::remove_file(&path).ok();
+                    converted.push(name);
+                }
+            }
+            Err(e) => {
+                failed.push(serde_json::json!({"name": name, "error": e}));
+            }
+        }
+    }
+
+    Json(serde_json::json!({
+        "converted": converted.len(),
+        "skipped": skipped.len(),
+        "failed": failed.len(),
+        "convertedNames": converted,
+        "skippedNames": skipped,
+        "failures": failed,
+    }))
+    .into_response()
+}
