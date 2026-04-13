@@ -4,11 +4,7 @@ use std::process::Command;
 /// Check if a file path (possibly relative, possibly just a filename) exists in the project.
 pub fn find_file_in_project(project_dir: &Path, file_path: &str) -> bool {
     // Strip line number suffixes like :609-664 or :42
-    let clean = file_path
-        .split(':')
-        .next()
-        .unwrap_or(file_path)
-        .trim();
+    let clean = file_path.split(':').next().unwrap_or(file_path).trim();
 
     // Direct path check
     let direct = project_dir.join(clean);
@@ -97,7 +93,10 @@ pub fn infer_status(
 
     if total_checked == 0 {
         if git_hits >= 2 {
-            return ("completed", format!("{git_hits} git commits match keywords"));
+            return (
+                "completed",
+                format!("{git_hits} git commits match keywords"),
+            );
         } else if git_hits == 1 {
             return ("in_progress", "1 git commit matches".into());
         }

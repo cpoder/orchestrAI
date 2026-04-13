@@ -1,0 +1,52 @@
+# orchestrAI Plan Schema Reference
+#
+# Plans can be written in YAML (.yaml/.yml) or Markdown (.md).
+# YAML is the preferred format for new plans. Both produce identical
+# results in the dashboard.
+
+title: "Plan Title"
+context: |
+  Brief background explaining the motivation for this plan.
+# Optional: explicit project association (otherwise inferred from file paths)
+# project: my-project
+# Optional: creation timestamp (otherwise uses file creation time)
+# created_at: "2025-01-15T10:30:00Z"
+
+phases:
+  - number: 0
+    title: "Phase Title"
+    description: "Brief phase description."
+    tasks:
+      - number: "0.1"
+        title: "Task Title"
+        description: |
+          Detailed description of what needs to be done.
+        file_paths:
+          - path/to/relevant/file.rs
+          - path/to/another/file.ts
+        acceptance: "Success criteria for this task."
+        dependencies: []
+
+      - number: "0.2"
+        title: "Second Task"
+        description: |
+          Another task that depends on the first.
+        file_paths:
+          - path/to/file.rs
+        acceptance: "Tests pass."
+        dependencies:
+          - "0.1"
+
+  - number: 1
+    title: "Next Phase"
+    description: "Builds on Phase 0."
+    tasks:
+      - number: "1.1"
+        title: "Follow-up Task"
+        description: |
+          Depends on tasks from the previous phase.
+        file_paths: []
+        acceptance: "Feature works end-to-end."
+        dependencies:
+          - "0.1"
+          - "0.2"

@@ -46,12 +46,16 @@ pub async fn receive_hook(
 
     drop(db); // release lock before broadcast
 
-    broadcast_event(&state.broadcast_tx, "hook_event", serde_json::json!({
-        "session_id": session_id,
-        "hook_type": hook_type,
-        "tool_name": tool_name,
-        "tool_input": event.tool_input,
-    }));
+    broadcast_event(
+        &state.broadcast_tx,
+        "hook_event",
+        serde_json::json!({
+            "session_id": session_id,
+            "hook_type": hook_type,
+            "tool_name": tool_name,
+            "tool_input": event.tool_input,
+        }),
+    );
 
     Json(serde_json::json!({ "ok": true }))
 }

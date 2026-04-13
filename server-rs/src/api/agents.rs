@@ -49,7 +49,9 @@ pub struct OutputQuery {
     offset: i64,
 }
 
-fn default_limit() -> i64 { 200 }
+fn default_limit() -> i64 {
+    200
+}
 
 pub async fn get_agent_output(
     State(state): State<AppState>,

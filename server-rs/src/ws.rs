@@ -23,23 +23,21 @@ pub fn broadcast_event(tx: &broadcast::Sender<String>, event_type: &str, data: s
 }
 
 /// GET /ws — dashboard WebSocket endpoint.
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_dashboard_ws(socket, state))
 }
 
-async fn handle_dashboard_ws(
-    mut socket: axum::extract::ws::WebSocket,
-    state: AppState,
-) {
+async fn handle_dashboard_ws(mut socket: axum::extract::ws::WebSocket, state: AppState) {
     // Send initial connected message
     let connected = serde_json::json!({
         "type": "connected",
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
-    if socket.send(Message::Text(connected.to_string().into())).await.is_err() {
+    if socket
+        .send(Message::Text(connected.to_string().into()))
+        .await
+        .is_err()
+    {
         return;
     }
 

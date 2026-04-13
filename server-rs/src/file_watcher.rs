@@ -8,12 +8,9 @@ use tokio::sync::broadcast;
 use crate::plan_parser;
 use crate::ws::broadcast_event;
 
-/// Start watching `plans_dir/*.md` for changes. Broadcasts `plan_updated` events.
+/// Start watching `plans_dir/*.{md,yaml,yml}` for changes. Broadcasts `plan_updated` events.
 /// Returns a handle that keeps the watcher alive — drop it to stop watching.
-pub fn start(
-    plans_dir: &Path,
-    tx: broadcast::Sender<String>,
-) -> notify::Result<impl Drop> {
+pub fn start(plans_dir: &Path, tx: broadcast::Sender<String>) -> notify::Result<impl Drop> {
     let plans_dir = plans_dir.to_path_buf();
 
     // Ensure directory exists
@@ -45,8 +42,8 @@ pub fn start(
             for event in events {
                 let path = &event.path;
 
-                // Only handle .md files in the plans directory
-                if !path.extension().is_some_and(|e| e == "md")
+                // Only handle plan files (.md, .yaml, .yml) in the plans directory
+                if !plan_parser::is_plan_ext(path)
                     || path.parent() != Some(plans_dir_clone.as_path())
                 {
                     continue;
@@ -55,14 +52,14 @@ pub fn start(
                 // Check if the file's mtime actually changed
                 let mut mtimes = mtimes.lock().unwrap();
                 if path.exists() {
-                    if let Ok(meta) = std::fs::metadata(path) {
-                        if let Ok(mtime) = meta.modified() {
-                            let prev = mtimes.get(path);
-                            if prev == Some(&mtime) {
-                                continue; // mtime unchanged, skip
-                            }
-                            mtimes.insert(path.clone(), mtime);
+                    if let Ok(meta) = std::fs::metadata(path)
+                        && let Ok(mtime) = meta.modified()
+                    {
+                        let prev = mtimes.get(path);
+                        if prev == Some(&mtime) {
+                            continue; // mtime unchanged, skip
                         }
+                        mtimes.insert(path.clone(), mtime);
                     }
                 } else {
                     mtimes.remove(path);
@@ -83,38 +80,36 @@ pub fn start(
     Ok(debouncer)
 }
 
-fn handle_event(
-    kind: &DebouncedEventKind,
-    path: &PathBuf,
-    tx: &broadcast::Sender<String>,
-) {
-    match kind {
-        DebouncedEventKind::Any => {
-            if path.exists() {
-                match plan_parser::parse_plan_file(path) {
-                    Ok(plan) => {
-                        println!("[watcher] Plan changed: {}", path.display());
-                        broadcast_event(tx, "plan_updated", serde_json::json!({
+fn handle_event(kind: &DebouncedEventKind, path: &PathBuf, tx: &broadcast::Sender<String>) {
+    if kind == &DebouncedEventKind::Any {
+        if path.exists() {
+            match plan_parser::parse_plan_file(path) {
+                Ok(plan) => {
+                    println!("[watcher] Plan changed: {}", path.display());
+                    broadcast_event(
+                        tx,
+                        "plan_updated",
+                        serde_json::json!({
                             "action": "changed",
                             "plan": plan,
-                        }));
-                    }
-                    Err(e) => {
-                        eprintln!("[watcher] Failed to parse {}: {e}", path.display());
-                    }
+                        }),
+                    );
                 }
-            } else {
-                let name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
-                println!("[watcher] Plan removed: {}", path.display());
-                broadcast_event(tx, "plan_updated", serde_json::json!({
+                Err(e) => {
+                    eprintln!("[watcher] Failed to parse {}: {e}", path.display());
+                }
+            }
+        } else {
+            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            println!("[watcher] Plan removed: {}", path.display());
+            broadcast_event(
+                tx,
+                "plan_updated",
+                serde_json::json!({
                     "action": "removed",
                     "name": name,
-                }));
-            }
+                }),
+            );
         }
-        _ => {}
     }
 }

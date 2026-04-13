@@ -1,5 +1,8 @@
 use axum::{
-    extract::{Query, State, ws::{Message, WebSocket, WebSocketUpgrade}},
+    extract::{
+        Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     response::IntoResponse,
 };
 use serde::Deserialize;
@@ -50,7 +53,11 @@ async fn handle_terminal(mut socket: WebSocket, agent_id: String, registry: Agen
 
     // Send buffered output
     for row in &buffered_rows {
-        if socket.send(Message::Text(row.clone().into())).await.is_err() {
+        if socket
+            .send(Message::Text(row.clone().into()))
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -102,9 +109,9 @@ async fn handle_terminal(mut socket: WebSocket, agent_id: String, registry: Agen
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         // Check for resize messages
-                        if text.starts_with('{') {
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&*text) {
-                                if val.get("type").and_then(|t| t.as_str()) == Some("resize") {
+                        if text.starts_with('{')
+                            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&text)
+                                && val.get("type").and_then(|t| t.as_str()) == Some("resize") {
                                     let cols = val.get("cols").and_then(|c| c.as_u64()).unwrap_or(120) as u16;
                                     let rows = val.get("rows").and_then(|r| r.as_u64()).unwrap_or(40) as u16;
                                     // Resize both the PTY (our attach client) and the tmux pane
@@ -124,27 +131,23 @@ async fn handle_terminal(mut socket: WebSocket, agent_id: String, registry: Agen
                                     }
                                     continue;
                                 }
-                            }
-                        }
                         // Regular input — write to PTY writer (goes to tmux attach stdin)
                         {
                             let mut agents = registry.agents.lock().await;
-                            if let Some(agent) = agents.get_mut(&agent_id) {
-                                if let Some(ref mut writer) = agent.pty_writer {
+                            if let Some(agent) = agents.get_mut(&agent_id)
+                                && let Some(ref mut writer) = agent.pty_writer {
                                     use std::io::Write;
                                     writer.write_all(text.as_bytes()).ok();
                                 }
-                            }
                         }
                     }
                     Some(Ok(Message::Binary(data))) => {
                         let mut agents = registry.agents.lock().await;
-                        if let Some(agent) = agents.get_mut(&agent_id) {
-                            if let Some(ref mut writer) = agent.pty_writer {
+                        if let Some(agent) = agents.get_mut(&agent_id)
+                            && let Some(ref mut writer) = agent.pty_writer {
                                 use std::io::Write;
                                 writer.write_all(&data).ok();
                             }
-                        }
                     }
                     None | Some(Err(_)) => break,
                     _ => {}

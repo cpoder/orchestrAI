@@ -35,13 +35,13 @@ pub async fn list_plans(State(state): State<AppState>) -> impl IntoResponse {
 
     // Load all project overrides
     let mut overrides: HashMap<String, String> = HashMap::new();
-    if let Ok(mut stmt) = db.prepare("SELECT plan_name, project FROM plan_project") {
-        if let Ok(rows) = stmt.query_map([], |row| {
+    if let Ok(mut stmt) = db.prepare("SELECT plan_name, project FROM plan_project")
+        && let Ok(rows) = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        }) {
-            for row in rows.flatten() {
-                overrides.insert(row.0, row.1);
-            }
+        })
+    {
+        for row in rows.flatten() {
+            overrides.insert(row.0, row.1);
         }
     }
 
@@ -49,42 +49,37 @@ pub async fn list_plans(State(state): State<AppState>) -> impl IntoResponse {
         .into_iter()
         .map(|s| {
             // Parse the full plan to merge statuses and get accurate done count
-            let plan_path = state.plans_dir.join(format!("{}.md", s.name));
-            let done_count = if let Ok(parsed) = plan_parser::parse_plan_file(&plan_path) {
-                // Load statuses for this plan
-                let mut status_map: HashMap<String, String> = HashMap::new();
-                if let Ok(mut stmt) = db.prepare(
-                    "SELECT task_number, status FROM task_status WHERE plan_name = ?",
-                ) {
-                    if let Ok(rows) = stmt.query_map(params![s.name], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    }) {
+            let done_count = plan_parser::find_plan_file(&state.plans_dir, &s.name)
+                .and_then(|path| plan_parser::parse_plan_file(&path).ok())
+                .map(|parsed| {
+                    let mut status_map: HashMap<String, String> = HashMap::new();
+                    if let Ok(mut stmt) = db
+                        .prepare("SELECT task_number, status FROM task_status WHERE plan_name = ?")
+                        && let Ok(rows) = stmt.query_map(params![s.name], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })
+                    {
                         for row in rows.flatten() {
                             status_map.insert(row.0, row.1);
                         }
                     }
-                }
 
-                parsed
-                    .phases
-                    .iter()
-                    .flat_map(|p| &p.tasks)
-                    .filter(|t| {
-                        let status = status_map
-                            .get(&t.number)
-                            .map(|s| s.as_str())
-                            .unwrap_or("pending");
-                        status == "completed" || status == "skipped"
-                    })
-                    .count()
-            } else {
-                0
-            };
+                    parsed
+                        .phases
+                        .iter()
+                        .flat_map(|p| &p.tasks)
+                        .filter(|t| {
+                            let status = status_map
+                                .get(&t.number)
+                                .map(|s| s.as_str())
+                                .unwrap_or("pending");
+                            status == "completed" || status == "skipped"
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
 
-            let project = overrides
-                .get(&s.name)
-                .cloned()
-                .or(s.project);
+            let project = overrides.get(&s.name).cloned().or(s.project);
 
             PlanListEntry {
                 name: s.name,
@@ -108,10 +103,25 @@ pub async fn get_plan(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let plan_path = state.plans_dir.join(format!("{name}.md"));
+    let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &name) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    };
     let mut plan = match plan_parser::parse_plan_file(&plan_path) {
         Ok(p) => p,
-        Err(_) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Plan not found"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
     };
 
     let db = state.db.lock().unwrap();
@@ -208,7 +218,14 @@ pub async fn set_task_status(
     Path((name, task_number)): Path<(String, String)>,
     Json(body): Json<StatusBody>,
 ) -> impl IntoResponse {
-    let valid = ["pending", "in_progress", "completed", "failed", "skipped", "checking"];
+    let valid = [
+        "pending",
+        "in_progress",
+        "completed",
+        "failed",
+        "skipped",
+        "checking",
+    ];
     if !valid.contains(&body.status.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
@@ -278,7 +295,16 @@ pub async fn auto_status(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let plan_path = state.plans_dir.join(format!("{name}.md"));
+    let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &name) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    };
     let plan = match plan_parser::parse_plan_file(&plan_path) {
         Ok(p) => p,
         Err(_) => {
@@ -286,7 +312,7 @@ pub async fn auto_status(
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": "Plan not found"})),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -297,7 +323,7 @@ pub async fn auto_status(
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": "Plan has no associated project"})),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -317,13 +343,12 @@ pub async fn auto_status(
     let mut manual: HashMap<String, String> = HashMap::new();
     if let Ok(mut stmt) =
         db.prepare("SELECT task_number, status FROM task_status WHERE plan_name = ?")
-    {
-        if let Ok(rows) = stmt.query_map(params![name], |row| {
+        && let Ok(rows) = stmt.query_map(params![name], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        }) {
-            for row in rows.flatten() {
-                manual.insert(row.0, row.1);
-            }
+        })
+    {
+        for row in rows.flatten() {
+            manual.insert(row.0, row.1);
         }
     }
 
@@ -415,7 +440,10 @@ pub async fn sync_all(State(state): State<AppState>) -> impl IntoResponse {
             continue;
         }
 
-        let plan_path = state.plans_dir.join(format!("{}.md", s.name));
+        let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &s.name) {
+            Some(p) => p,
+            None => continue,
+        };
         let plan = match plan_parser::parse_plan_file(&plan_path) {
             Ok(p) => p,
             Err(_) => continue,
@@ -425,13 +453,12 @@ pub async fn sync_all(State(state): State<AppState>) -> impl IntoResponse {
         let mut manual: HashMap<String, String> = HashMap::new();
         if let Ok(mut stmt) =
             db.prepare("SELECT task_number, status FROM task_status WHERE plan_name = ?")
-        {
-            if let Ok(rows) = stmt.query_map(params![s.name], |row| {
+            && let Ok(rows) = stmt.query_map(params![s.name], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            }) {
-                for row in rows.flatten() {
-                    manual.insert(row.0, row.1);
-                }
+            })
+        {
+            for row in rows.flatten() {
+                manual.insert(row.0, row.1);
             }
         }
 
@@ -492,31 +519,67 @@ pub async fn start_task(
     State(state): State<AppState>,
     Json(body): Json<StartTaskBody>,
 ) -> impl IntoResponse {
-    let plan_path = state.plans_dir.join(format!("{}.md", body.plan_name));
+    let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &body.plan_name) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    };
     let plan = match plan_parser::parse_plan_file(&plan_path) {
         Ok(p) => p,
-        Err(_) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Plan not found"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
     };
 
     let phase = match plan.phases.iter().find(|p| p.number == body.phase_number) {
         Some(p) => p,
-        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Phase not found"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Phase not found"})),
+            )
+                .into_response();
+        }
     };
 
     let task = match phase.tasks.iter().find(|t| t.number == body.task_number) {
         Some(t) => t,
-        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Task not found"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Task not found"})),
+            )
+                .into_response();
+        }
     };
 
     let is_continue = body.mode.as_deref() == Some("continue");
     let home = dirs::home_dir().unwrap();
-    let work_dir = body.cwd.map(std::path::PathBuf::from)
-        .unwrap_or_else(|| plan.project.as_ref()
+    let work_dir = body.cwd.map(std::path::PathBuf::from).unwrap_or_else(|| {
+        plan.project
+            .as_ref()
             .map(|p| home.join(p))
-            .unwrap_or_else(|| std::env::current_dir().unwrap()));
+            .unwrap_or_else(|| std::env::current_dir().unwrap())
+    });
 
     let files_section = if !task.file_paths.is_empty() {
-        format!("\nFiles involved:\n{}", task.file_paths.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n"))
+        format!(
+            "\nFiles involved:\n{}",
+            task.file_paths
+                .iter()
+                .map(|f| format!("- {f}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
     } else {
         String::new()
     };
@@ -562,7 +625,8 @@ pub async fn start_task(
         plan_name = body.plan_name,
     );
 
-    let effort = body.effort
+    let effort = body
+        .effort
         .and_then(|e| e.parse().ok())
         .unwrap_or(*state.effort.lock().unwrap());
 
@@ -589,29 +653,66 @@ pub async fn check_task(
     State(state): State<AppState>,
     Path((plan_name, task_number)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let plan_path = state.plans_dir.join(format!("{plan_name}.md"));
+    let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &plan_name) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    };
     let plan = match plan_parser::parse_plan_file(&plan_path) {
         Ok(p) => p,
-        Err(_) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Plan not found"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
     };
 
     let project = match plan.project.as_deref() {
         Some(p) => p,
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Plan has no associated project"}))).into_response(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Plan has no associated project"})),
+            )
+                .into_response();
+        }
     };
 
-    let phase = plan.phases.iter().find(|p| p.tasks.iter().any(|t| t.number == task_number));
+    let phase = plan
+        .phases
+        .iter()
+        .find(|p| p.tasks.iter().any(|t| t.number == task_number));
     let task = phase.and_then(|p| p.tasks.iter().find(|t| t.number == task_number));
     let (phase, task) = match (phase, task) {
         (Some(p), Some(t)) => (p, t),
-        _ => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Task not found"}))).into_response(),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Task not found"})),
+            )
+                .into_response();
+        }
     };
 
     let home = dirs::home_dir().unwrap();
     let project_dir = home.join(project);
 
     let files_section = if !task.file_paths.is_empty() {
-        format!("\nFiles mentioned:\n{}", task.file_paths.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n"))
+        format!(
+            "\nFiles mentioned:\n{}",
+            task.file_paths
+                .iter()
+                .map(|f| format!("- {f}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
     } else {
         String::new()
     };
@@ -656,7 +757,8 @@ pub async fn check_task(
              ON CONFLICT(plan_name, task_number)
              DO UPDATE SET status = 'checking', updated_at = datetime('now')",
             params![plan_name, task_number],
-        ).ok();
+        )
+        .ok();
     }
 
     let effort = *state.effort.lock().unwrap();
@@ -693,32 +795,48 @@ pub async fn create_plan(
     Json(body): Json<CreatePlanBody>,
 ) -> impl IntoResponse {
     if body.description.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "description is required"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "description is required"})),
+        )
+            .into_response();
     }
     if body.folder.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "folder is required"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "folder is required"})),
+        )
+            .into_response();
     }
 
     let home = dirs::home_dir().unwrap();
     let resolved = if body.folder.starts_with('~') {
-        home.join(&body.folder[1..].trim_start_matches('/'))
+        home.join(body.folder[1..].trim_start_matches('/'))
     } else {
         std::path::PathBuf::from(&body.folder)
     };
 
     if !resolved.exists() {
         if body.create_folder != Some(true) {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "error": "folder_not_found",
-                "message": format!("Directory does not exist: {}", resolved.display()),
-                "resolvedFolder": resolved.to_str(),
-            }))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "folder_not_found",
+                    "message": format!("Directory does not exist: {}", resolved.display()),
+                    "resolvedFolder": resolved.to_str(),
+                })),
+            )
+                .into_response();
         }
         std::fs::create_dir_all(&resolved).ok();
     }
 
     if !resolved.is_dir() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Not a directory: {}", resolved.display())}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Not a directory: {}", resolved.display())})),
+        )
+            .into_response();
     }
 
     let plans_dir = state.plans_dir.display();
@@ -726,14 +844,31 @@ pub async fn create_plan(
         "You are creating an implementation plan for a project.\n\n\
          Working directory: {folder}\n\n\
          Request:\n{description}\n\n\
-         Create a detailed implementation plan. Structure it as:\n\
-         # Plan Title\n\n\
-         ## Context\nBrief background and motivation.\n\n\
-         ## Phase 0: ...\n### 0.1 Task Title\n- **What:** ...\n- **Where:** file paths\n- **Acceptance:** success criteria\n\n\
-         Continue with Phase 1, 2, etc.\n\n\
+         Create a detailed implementation plan as a YAML file.\n\
          First explore the working directory to understand the existing codebase (if any).\n\
-         Then write the plan to a file at {plans_dir}/<generated-name>.md using the Write tool.\n\
+         Then write the plan to a file at {plans_dir}/<generated-name>.yaml using the Write tool.\n\
          The filename should be a short kebab-case slug derived from the plan title.\n\n\
+         Use this exact YAML structure:\n\
+         ```yaml\n\
+         title: \"Plan Title\"\n\
+         context: |\n\
+         \x20 Brief background and motivation.\n\
+         phases:\n\
+         \x20 - number: 0\n\
+         \x20   title: \"Phase Title\"\n\
+         \x20   description: \"Phase description\"\n\
+         \x20   tasks:\n\
+         \x20     - number: \"0.1\"\n\
+         \x20       title: \"Task Title\"\n\
+         \x20       description: |\n\
+         \x20         What needs to be done.\n\
+         \x20       file_paths:\n\
+         \x20         - path/to/file.rs\n\
+         \x20       acceptance: \"Success criteria\"\n\
+         \x20       dependencies: []\n\
+         ```\n\n\
+         Continue with Phase 1, 2, etc. Task numbers use phase.index format (0.1, 0.2, 1.1, etc.).\n\
+         The dependencies field lists task numbers this task depends on (e.g. [\"0.1\", \"0.2\"]).\n\n\
          IMPORTANT: When you are finished, do NOT stop. Instead:\n\
          1. Summarize the plan you created\n\
          2. Ask the user if they want to adjust anything\n\
@@ -744,17 +879,11 @@ pub async fn create_plan(
     );
 
     let effort = *state.effort.lock().unwrap();
-    let agent_id = pty_agent::start_pty_agent(
-        &state.registry,
-        prompt,
-        &resolved,
-        None,
-        None,
-        effort,
-    )
-    .await;
+    let agent_id =
+        pty_agent::start_pty_agent(&state.registry, prompt, &resolved, None, None, effort).await;
 
-    let project_name = resolved.file_name()
+    let project_name = resolved
+        .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
 

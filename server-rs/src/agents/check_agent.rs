@@ -140,7 +140,11 @@ pub async fn start_check_agent(
         // Wait for exit
         let status = child.wait().ok();
         let exit_code = status.and_then(|s| s.code()).unwrap_or(-1);
-        let agent_status = if exit_code == 0 { "completed" } else { "failed" };
+        let agent_status = if exit_code == 0 {
+            "completed"
+        } else {
+            "failed"
+        };
 
         {
             let db = db.lock().unwrap();
@@ -174,10 +178,10 @@ pub async fn start_check_agent(
                         .and_then(|c| c.as_array())
                     {
                         for block in content {
-                            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
-                                    text.push_str(t);
-                                }
+                            if block.get("type").and_then(|t| t.as_str()) == Some("text")
+                                && let Some(t) = block.get("text").and_then(|t| t.as_str())
+                            {
+                                text.push_str(t);
                             }
                         }
                     }
@@ -190,7 +194,9 @@ pub async fn start_check_agent(
                         let remainder = &text[json_start..];
                         let verdict_json = (1..=remainder.len())
                             .filter(|&i| remainder.as_bytes().get(i - 1) == Some(&b'}'))
-                            .find_map(|i| serde_json::from_str::<serde_json::Value>(&remainder[..i]).ok());
+                            .find_map(|i| {
+                                serde_json::from_str::<serde_json::Value>(&remainder[..i]).ok()
+                            });
 
                         if let Some(verdict) = verdict_json {
                             let v_status = verdict
@@ -198,10 +204,8 @@ pub async fn start_check_agent(
                                 .and_then(|s| s.as_str())
                                 .filter(|s| ["completed", "in_progress", "pending"].contains(s))
                                 .unwrap_or("pending");
-                            let v_reason = verdict
-                                .get("reason")
-                                .and_then(|s| s.as_str())
-                                .unwrap_or("");
+                            let v_reason =
+                                verdict.get("reason").and_then(|s| s.as_str()).unwrap_or("");
 
                             db_guard.execute(
                                 "INSERT INTO task_status (plan_name, task_number, status, updated_at)

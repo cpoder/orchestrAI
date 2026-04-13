@@ -1,9 +1,9 @@
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::process::Command;
 
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use rusqlite::params;
@@ -34,8 +34,16 @@ pub async fn start_pty_agent(
         db.execute(
             "INSERT INTO agents (id, session_id, cwd, status, mode, plan_name, task_id, prompt)
              VALUES (?1, ?2, ?3, 'starting', 'pty', ?4, ?5, ?6)",
-            params![id, session_id, cwd.to_str().unwrap_or(""), plan_name, task_id, prompt],
-        ).ok();
+            params![
+                id,
+                session_id,
+                cwd.to_str().unwrap_or(""),
+                plan_name,
+                task_id,
+                prompt
+            ],
+        )
+        .ok();
     }
 
     // Create tmux session running claude
@@ -47,7 +55,17 @@ pub async fn start_pty_agent(
     );
 
     let status = Command::new("tmux")
-        .args(["new-session", "-d", "-s", &tmux_name, "-x", "120", "-y", "40", &claude_cmd])
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &tmux_name,
+            "-x",
+            "120",
+            "-y",
+            "40",
+            &claude_cmd,
+        ])
         .current_dir(cwd)
         .env("TERM", "xterm-256color")
         .status();
@@ -55,7 +73,11 @@ pub async fn start_pty_agent(
     if status.is_err() || !status.unwrap().success() {
         eprintln!("[agent {}] Failed to create tmux session", &id[..8]);
         let db = registry.db.lock().unwrap();
-        db.execute("UPDATE agents SET status = 'failed', finished_at = datetime('now') WHERE id = ?", params![id]).ok();
+        db.execute(
+            "UPDATE agents SET status = 'failed', finished_at = datetime('now') WHERE id = ?",
+            params![id],
+        )
+        .ok();
         return id;
     }
 
@@ -64,7 +86,11 @@ pub async fn start_pty_agent(
 
     {
         let db = registry.db.lock().unwrap();
-        db.execute("UPDATE agents SET pid = ?1, status = 'running' WHERE id = ?2", params![pid as i64, id]).ok();
+        db.execute(
+            "UPDATE agents SET pid = ?1, status = 'running' WHERE id = ?2",
+            params![pid as i64, id],
+        )
+        .ok();
     }
 
     broadcast_event(
@@ -89,7 +115,9 @@ pub async fn start_pty_agent(
         // Poll tmux for ready signal
         for _ in 0..80 {
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-            if prompt_sent_for_ready.load(Ordering::Relaxed) { return; }
+            if prompt_sent_for_ready.load(Ordering::Relaxed) {
+                return;
+            }
 
             if let Ok(output) = Command::new("tmux")
                 .args(["capture-pane", "-t", &tmux_for_ready, "-p"])
@@ -97,7 +125,9 @@ pub async fn start_pty_agent(
             {
                 let text = String::from_utf8_lossy(&output.stdout);
                 if text.contains('❯') || text.contains('\u{276f}') {
-                    if prompt_sent_for_ready.swap(true, Ordering::Relaxed) { return; }
+                    if prompt_sent_for_ready.swap(true, Ordering::Relaxed) {
+                        return;
+                    }
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                     send_to_tmux(&tmux_for_ready, &prompt_for_ready);
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -119,23 +149,35 @@ pub async fn start_pty_agent(
 
 /// Reattach to an existing tmux session (for agents that survived a server restart)
 pub async fn reattach_agent(registry: &AgentRegistry, agent_id: &str, tmux_name: &str) {
-    if attach_to_tmux(registry, agent_id, tmux_name).await.is_some() {
-        println!("[orchestrAI] Reattached agent {} to tmux session {}", &agent_id[..8], tmux_name);
+    if attach_to_tmux(registry, agent_id, tmux_name)
+        .await
+        .is_some()
+    {
+        println!(
+            "[orchestrAI] Reattached agent {} to tmux session {}",
+            &agent_id[..8],
+            tmux_name
+        );
     } else {
-        println!("[orchestrAI] Failed to reattach agent {} to tmux {}", &agent_id[..8], tmux_name);
+        println!(
+            "[orchestrAI] Failed to reattach agent {} to tmux {}",
+            &agent_id[..8],
+            tmux_name
+        );
     }
 }
 
 /// Attach a PTY running `tmux attach -t <session>` and start reading its output.
 /// Returns Some(()) on success.
-async fn attach_to_tmux(
-    registry: &AgentRegistry,
-    agent_id: &str,
-    tmux_name: &str,
-) -> Option<()> {
+async fn attach_to_tmux(registry: &AgentRegistry, agent_id: &str, tmux_name: &str) -> Option<()> {
     let pty_system = NativePtySystem::default();
     let pair = pty_system
-        .openpty(PtySize { rows: 40, cols: 120, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .ok()?;
 
     let mut cmd = CommandBuilder::new("tmux");
@@ -162,7 +204,11 @@ async fn attach_to_tmux(
         tmux_session: Some(tmux_name.to_string()),
         terminals: Vec::new(),
     };
-    registry.agents.lock().await.insert(agent_id.to_string(), agent);
+    registry
+        .agents
+        .lock()
+        .await
+        .insert(agent_id.to_string(), agent);
 
     // Spawn reader thread
     let db = registry.db.clone();
@@ -215,7 +261,11 @@ async fn attach_to_tmux(
             ).ok();
             drop(db);
             agents.blocking_lock().remove(&id);
-            broadcast_event(&tx, "agent_stopped", serde_json::json!({"id": id, "status": "completed", "exit_code": 0}));
+            broadcast_event(
+                &tx,
+                "agent_stopped",
+                serde_json::json!({"id": id, "status": "completed", "exit_code": 0}),
+            );
         }
     });
 
@@ -225,22 +275,26 @@ async fn attach_to_tmux(
 fn send_to_tmux(session: &str, text: &str) {
     Command::new("tmux")
         .args(["send-keys", "-t", session, "-l", text])
-        .status().ok();
+        .status()
+        .ok();
     Command::new("tmux")
         .args(["send-keys", "-t", session, "Enter"])
-        .status().ok();
+        .status()
+        .ok();
 }
 
 fn send_to_tmux_key(session: &str, key: &str) {
     Command::new("tmux")
         .args(["send-keys", "-t", session, key])
-        .status().ok();
+        .status()
+        .ok();
 }
 
 fn get_tmux_pid(session: &str) -> Option<u32> {
     let output = Command::new("tmux")
         .args(["list-panes", "-t", session, "-F", "#{pane_pid}"])
-        .output().ok()?;
+        .output()
+        .ok()?;
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 

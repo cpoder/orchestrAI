@@ -15,6 +15,8 @@ pub struct PlanTask {
     pub description: String,
     pub file_paths: Vec<String>,
     pub acceptance: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -53,6 +55,43 @@ pub struct PlanSummary {
     pub task_count: usize,
     pub created_at: String,
     pub modified_at: String,
+}
+
+// ── YAML schema types ───────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct YamlPlanTask {
+    number: String,
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    file_paths: Vec<String>,
+    #[serde(default)]
+    acceptance: String,
+    #[serde(default)]
+    dependencies: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct YamlPlanPhase {
+    number: u32,
+    title: String,
+    #[serde(default)]
+    description: String,
+    tasks: Vec<YamlPlanTask>,
+}
+
+#[derive(Deserialize)]
+struct YamlPlan {
+    title: String,
+    #[serde(default)]
+    context: String,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    phases: Vec<YamlPlanPhase>,
 }
 
 // ── File-path extraction ─────────────────────────────────────────────────────
@@ -211,7 +250,10 @@ pub fn parse_plan_markdown(raw: &str, name: &str, file_path: &str) -> ParsedPlan
 
     for section in &sections {
         let (phase_num, phase_title) = if let Some(caps) = phase_re.captures(&section.heading) {
-            let num: u32 = caps[1].trim_end_matches(char::is_alphabetic).parse().unwrap_or(0);
+            let num: u32 = caps[1]
+                .trim_end_matches(char::is_alphabetic)
+                .parse()
+                .unwrap_or(0);
             (Some(num), caps[2].trim().to_string())
         } else if let Some(caps) = numbered_re.captures(&section.heading) {
             let num: u32 = caps[1].parse().unwrap_or(0);
@@ -244,6 +286,7 @@ pub fn parse_plan_markdown(raw: &str, name: &str, file_path: &str) -> ParsedPlan
                 description: body.trim().to_string(),
                 file_paths: extract_file_paths(&body),
                 acceptance: String::new(),
+                dependencies: Vec::new(),
                 status: None,
                 status_updated_at: None,
             });
@@ -297,34 +340,33 @@ fn parse_tasks_from_headings(body: &str) -> Vec<PlanTask> {
 
         let first_line = block_text.lines().next().unwrap_or("");
 
-        let (task_number, task_title) =
-            if let Some(caps) = task_re_dotnum.captures(first_line) {
-                (
-                    caps[1].trim_end_matches('.').to_string(),
-                    caps[2]
-                        .trim_start_matches(|c: char| c == '—' || c == ':' || c == '-' || c == ' ')
-                        .trim()
-                        .to_string(),
-                )
-            } else if let Some(caps) = task_re_phase.captures(first_line) {
-                (
-                    caps[1].to_string(),
-                    caps[2]
-                        .trim_start_matches(|c: char| c == '—' || c == ':' || c == '-' || c == ' ')
-                        .trim()
-                        .to_string(),
-                )
-            } else if let Some(caps) = task_re_generic.captures(first_line) {
-                (
-                    caps[1].trim_end_matches('.').to_string(),
-                    caps[2]
-                        .trim_start_matches(|c: char| c == '—' || c == ':' || c == '-' || c == ' ')
-                        .trim()
-                        .to_string(),
-                )
-            } else {
-                continue;
-            };
+        let (task_number, task_title) = if let Some(caps) = task_re_dotnum.captures(first_line) {
+            (
+                caps[1].trim_end_matches('.').to_string(),
+                caps[2]
+                    .trim_start_matches(['—', ':', '-', ' '])
+                    .trim()
+                    .to_string(),
+            )
+        } else if let Some(caps) = task_re_phase.captures(first_line) {
+            (
+                caps[1].to_string(),
+                caps[2]
+                    .trim_start_matches(['—', ':', '-', ' '])
+                    .trim()
+                    .to_string(),
+            )
+        } else if let Some(caps) = task_re_generic.captures(first_line) {
+            (
+                caps[1].trim_end_matches('.').to_string(),
+                caps[2]
+                    .trim_start_matches(['—', ':', '-', ' '])
+                    .trim()
+                    .to_string(),
+            )
+        } else {
+            continue;
+        };
 
         let task_body: String = block_text.lines().skip(1).collect::<Vec<_>>().join("\n");
         let task_body = task_body.trim().to_string();
@@ -342,6 +384,7 @@ fn parse_tasks_from_headings(body: &str) -> Vec<PlanTask> {
             description: task_body,
             file_paths,
             acceptance,
+            dependencies: Vec::new(),
             status: None,
             status_updated_at: None,
         });
@@ -355,7 +398,10 @@ fn parse_tasks_from_bullets(body: &str, phase_num: u32) -> Vec<PlanTask> {
     let mut idx = 1u32;
     for caps in bullet_re.captures_iter(body) {
         let title = caps[1].trim().to_string();
-        let desc = caps.get(2).map(|m| m.as_str().trim().to_string()).unwrap_or_default();
+        let desc = caps
+            .get(2)
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_default();
         let file_paths = extract_file_paths(caps.get(0).unwrap().as_str());
         tasks.push(PlanTask {
             number: format!("{phase_num}.{idx}"),
@@ -363,12 +409,58 @@ fn parse_tasks_from_bullets(body: &str, phase_num: u32) -> Vec<PlanTask> {
             description: desc,
             file_paths,
             acceptance: String::new(),
+            dependencies: Vec::new(),
             status: None,
             status_updated_at: None,
         });
         idx += 1;
     }
     tasks
+}
+
+// ── YAML parser ─────────────────────────────────────────────────────────────
+
+pub fn parse_plan_yaml(raw: &str, name: &str, file_path: &str) -> Result<ParsedPlan, String> {
+    let yaml: YamlPlan = serde_yaml::from_str(raw).map_err(|e| e.to_string())?;
+
+    let phases = yaml
+        .phases
+        .into_iter()
+        .map(|p| {
+            let tasks = p
+                .tasks
+                .into_iter()
+                .map(|t| PlanTask {
+                    number: t.number,
+                    title: t.title,
+                    description: t.description,
+                    file_paths: t.file_paths,
+                    acceptance: t.acceptance,
+                    dependencies: t.dependencies,
+                    status: None,
+                    status_updated_at: None,
+                })
+                .collect();
+
+            PlanPhase {
+                number: p.number,
+                title: p.title,
+                description: p.description,
+                tasks,
+            }
+        })
+        .collect();
+
+    Ok(ParsedPlan {
+        name: name.to_string(),
+        file_path: file_path.to_string(),
+        title: yaml.title,
+        context: yaml.context,
+        project: yaml.project.or_else(|| infer_project(raw)),
+        created_at: yaml.created_at.unwrap_or_default(),
+        modified_at: String::new(),
+        phases,
+    })
 }
 
 // ── File-level helpers ───────────────────────────────────────────────────────
@@ -379,14 +471,41 @@ pub fn parse_plan_file(file_path: &Path) -> std::io::Result<ParsedPlan> {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown");
+    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-    let mut plan = parse_plan_markdown(&raw, name, &file_path.to_string_lossy());
+    let mut plan = match ext {
+        "yaml" | "yml" => parse_plan_yaml(&raw, name, &file_path.to_string_lossy())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+        _ => parse_plan_markdown(&raw, name, &file_path.to_string_lossy()),
+    };
+
     let meta = std::fs::metadata(file_path)?;
 
-    plan.created_at = file_time_iso(&meta, true);
+    // YAML may provide its own created_at; fall back to file metadata
+    if plan.created_at.is_empty() {
+        plan.created_at = file_time_iso(&meta, true);
+    }
     plan.modified_at = file_time_iso(&meta, false);
 
     Ok(plan)
+}
+
+/// Find a plan file by name, checking yaml/yml/md extensions in priority order.
+pub fn find_plan_file(plans_dir: &Path, name: &str) -> Option<std::path::PathBuf> {
+    for ext in &["yaml", "yml", "md"] {
+        let path = plans_dir.join(format!("{name}.{ext}"));
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Returns true if the file extension is a supported plan format.
+pub fn is_plan_ext(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e, "md" | "yaml" | "yml"))
 }
 
 fn file_time_iso(meta: &std::fs::Metadata, created: bool) -> String {
@@ -408,22 +527,41 @@ pub fn list_plans(plans_dir: &Path) -> Vec<PlanSummary> {
         Err(_) => return Vec::new(),
     };
 
+    // Collect plan files, sorted so yaml/yml come before md (for dedup)
+    let mut paths: Vec<_> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| is_plan_ext(p))
+        .collect();
+
+    paths.sort_by_key(|p| match p.extension().and_then(|e| e.to_str()) {
+        Some("yaml") => 0,
+        Some("yml") => 1,
+        _ => 2,
+    });
+
+    let mut seen = HashSet::new();
     let mut summaries = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "md") {
-            if let Ok(parsed) = parse_plan_file(&path) {
-                let task_count: usize = parsed.phases.iter().map(|p| p.tasks.len()).sum();
-                summaries.push(PlanSummary {
-                    name: parsed.name,
-                    title: parsed.title,
-                    project: parsed.project,
-                    phase_count: parsed.phases.len(),
-                    task_count,
-                    created_at: parsed.created_at,
-                    modified_at: parsed.modified_at,
-                });
-            }
+    for path in paths {
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        if !seen.insert(name) {
+            continue; // prefer yaml over md for same plan name
+        }
+        if let Ok(parsed) = parse_plan_file(&path) {
+            let task_count: usize = parsed.phases.iter().map(|p| p.tasks.len()).sum();
+            summaries.push(PlanSummary {
+                name: parsed.name,
+                title: parsed.title,
+                project: parsed.project,
+                phase_count: parsed.phases.len(),
+                task_count,
+                created_at: parsed.created_at,
+                modified_at: parsed.modified_at,
+            });
         }
     }
     summaries
@@ -473,12 +611,20 @@ Build the component in `src/App.tsx`.
         assert_eq!(plan.phases[0].tasks.len(), 2);
         assert_eq!(plan.phases[0].tasks[0].number, "1.1");
         assert_eq!(plan.phases[0].tasks[0].title, "Create model");
-        assert!(plan.phases[0].tasks[0].file_paths.contains(&"src/model.rs".to_string()));
+        assert!(
+            plan.phases[0].tasks[0]
+                .file_paths
+                .contains(&"src/model.rs".to_string())
+        );
 
         assert_eq!(plan.phases[1].number, 2);
         assert_eq!(plan.phases[1].tasks.len(), 1);
         assert_eq!(plan.phases[1].tasks[0].number, "2.1");
-        assert!(plan.phases[1].tasks[0].file_paths.contains(&"src/App.tsx".to_string()));
+        assert!(
+            plan.phases[1].tasks[0]
+                .file_paths
+                .contains(&"src/App.tsx".to_string())
+        );
     }
 
     #[test]
@@ -560,7 +706,11 @@ Add `ConfigValue::Concat` in `src/ast.rs`.
         assert_eq!(plan.phases[0].tasks.len(), 2);
         assert_eq!(plan.phases[0].tasks[0].number, "1");
         assert_eq!(plan.phases[0].tasks[0].title, "Grammar extension");
-        assert!(plan.phases[0].tasks[1].file_paths.contains(&"src/ast.rs".to_string()));
+        assert!(
+            plan.phases[0].tasks[1]
+                .file_paths
+                .contains(&"src/ast.rs".to_string())
+        );
     }
 
     #[test]
@@ -594,7 +744,11 @@ Just patch the file at `src/lib.rs` and move on.
         assert_eq!(plan.phases[0].tasks.len(), 1);
         assert_eq!(plan.phases[0].tasks[0].number, "1.1");
         assert_eq!(plan.phases[0].tasks[0].title, "Quick fix");
-        assert!(plan.phases[0].tasks[0].file_paths.contains(&"src/lib.rs".to_string()));
+        assert!(
+            plan.phases[0].tasks[0]
+                .file_paths
+                .contains(&"src/lib.rs".to_string())
+        );
     }
 
     #[test]
@@ -611,7 +765,10 @@ Just patch the file at `src/lib.rs` and move on.
 - **Acceptance:** Tests pass and binary runs.
 ";
         let plan = parse_plan_markdown(md, "test", "/tmp/test.md");
-        assert_eq!(plan.phases[0].tasks[0].acceptance, "Tests pass and binary runs.");
+        assert_eq!(
+            plan.phases[0].tasks[0].acceptance,
+            "Tests pass and binary runs."
+        );
     }
 
     #[test]
@@ -644,7 +801,11 @@ Just patch the file at `src/lib.rs` and move on.
         }
 
         let summaries = list_plans(&plans_dir);
-        assert!(!summaries.is_empty(), "expected plan files in {}", plans_dir.display());
+        assert!(
+            !summaries.is_empty(),
+            "expected plan files in {}",
+            plans_dir.display()
+        );
 
         for s in &summaries {
             assert!(!s.title.is_empty(), "plan {} has empty title", s.name);
@@ -653,8 +814,8 @@ Just patch the file at `src/lib.rs` and move on.
 
     #[test]
     fn rust_rewrite_plan_structure() {
-        let plan_path = std::path::Path::new(env!("HOME"))
-            .join(".claude/plans/orchestrai-rust-rewrite.md");
+        let plan_path =
+            std::path::Path::new(env!("HOME")).join(".claude/plans/orchestrai-rust-rewrite.md");
         if !plan_path.exists() {
             return;
         }
@@ -713,6 +874,345 @@ Just patch the file at `src/lib.rs` and move on.
                 exp_project,
             );
         }
+    }
+
+    // ── YAML parser tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn yaml_basic_plan() {
+        let yaml = "\
+title: My YAML Plan
+context: |
+  Some background.
+phases:
+  - number: 1
+    title: Backend Models
+    description: Set up models
+    tasks:
+      - number: \"1.1\"
+        title: Create model
+        description: Create the model
+        file_paths:
+          - src/model.rs
+        acceptance: Model compiles
+        dependencies: []
+      - number: \"1.2\"
+        title: Add tests
+        description: Write tests for the model.
+        file_paths: []
+        acceptance: Tests pass
+        dependencies:
+          - \"1.1\"
+  - number: 2
+    title: Frontend
+    description: Build UI
+    tasks:
+      - number: \"2.1\"
+        title: Add component
+        description: Build the component.
+        file_paths:
+          - src/App.tsx
+        acceptance: Component renders
+        dependencies:
+          - \"1.1\"
+          - \"1.2\"
+";
+        let plan = parse_plan_yaml(yaml, "test", "/tmp/test.yaml").unwrap();
+
+        assert_eq!(plan.title, "My YAML Plan");
+        assert_eq!(plan.context, "Some background.\n");
+        assert_eq!(plan.phases.len(), 2);
+
+        assert_eq!(plan.phases[0].number, 1);
+        assert_eq!(plan.phases[0].title, "Backend Models");
+        assert_eq!(plan.phases[0].tasks.len(), 2);
+        assert_eq!(plan.phases[0].tasks[0].number, "1.1");
+        assert_eq!(plan.phases[0].tasks[0].title, "Create model");
+        assert!(
+            plan.phases[0].tasks[0]
+                .file_paths
+                .contains(&"src/model.rs".to_string())
+        );
+        assert_eq!(plan.phases[0].tasks[0].acceptance, "Model compiles");
+        assert!(plan.phases[0].tasks[0].dependencies.is_empty());
+
+        assert_eq!(plan.phases[0].tasks[1].number, "1.2");
+        assert_eq!(plan.phases[0].tasks[1].dependencies, vec!["1.1"]);
+
+        assert_eq!(plan.phases[1].number, 2);
+        assert_eq!(plan.phases[1].tasks[0].number, "2.1");
+        assert_eq!(plan.phases[1].tasks[0].dependencies, vec!["1.1", "1.2"]);
+        assert!(
+            plan.phases[1].tasks[0]
+                .file_paths
+                .contains(&"src/App.tsx".to_string())
+        );
+    }
+
+    #[test]
+    fn yaml_with_created_at() {
+        let yaml = "\
+title: Plan With Date
+created_at: \"2025-01-15T10:30:00Z\"
+context: Test
+phases:
+  - number: 0
+    title: Setup
+    description: \"\"
+    tasks:
+      - number: \"0.1\"
+        title: Init
+        description: Initialize
+        file_paths: []
+        acceptance: Done
+";
+        let plan = parse_plan_yaml(yaml, "test", "/tmp/test.yaml").unwrap();
+        assert_eq!(plan.created_at, "2025-01-15T10:30:00Z");
+    }
+
+    #[test]
+    fn yaml_minimal_fields() {
+        let yaml = "\
+title: Minimal Plan
+phases:
+  - number: 0
+    title: Only Phase
+    tasks:
+      - number: \"0.1\"
+        title: Only Task
+";
+        let plan = parse_plan_yaml(yaml, "test", "/tmp/test.yaml").unwrap();
+        assert_eq!(plan.title, "Minimal Plan");
+        assert_eq!(plan.context, "");
+        assert_eq!(plan.project, None);
+        assert_eq!(plan.phases.len(), 1);
+        assert_eq!(plan.phases[0].tasks[0].description, "");
+        assert!(plan.phases[0].tasks[0].file_paths.is_empty());
+        assert_eq!(plan.phases[0].tasks[0].acceptance, "");
+        assert!(plan.phases[0].tasks[0].dependencies.is_empty());
+    }
+
+    #[test]
+    fn yaml_invalid_returns_error() {
+        let bad_yaml = "not: [valid: yaml: plan";
+        let result = parse_plan_yaml(bad_yaml, "test", "/tmp/test.yaml");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn yaml_and_md_produce_same_shape() {
+        let yaml = "\
+title: My Plan
+context: Some background.
+phases:
+  - number: 1
+    title: Backend Models
+    description: \"\"
+    tasks:
+      - number: \"1.1\"
+        title: Create model
+        description: |
+          - **What:** Create the model
+          - **Where:** `src/model.rs`
+          - **Acceptance:** Model compiles
+        file_paths:
+          - src/model.rs
+        acceptance: Model compiles
+";
+        let md = "\
+# My Plan
+
+## Context
+
+Some background.
+
+## Phase 1: Backend Models
+
+### 1.1 Create model
+
+- **What:** Create the model
+- **Where:** `src/model.rs`
+- **Acceptance:** Model compiles
+";
+        let yaml_plan = parse_plan_yaml(yaml, "test", "/tmp/test.yaml").unwrap();
+        let md_plan = parse_plan_markdown(md, "test", "/tmp/test.md");
+
+        assert_eq!(yaml_plan.title, md_plan.title);
+        assert_eq!(yaml_plan.context, md_plan.context);
+        assert_eq!(yaml_plan.phases.len(), md_plan.phases.len());
+        assert_eq!(yaml_plan.phases[0].number, md_plan.phases[0].number);
+        assert_eq!(yaml_plan.phases[0].title, md_plan.phases[0].title);
+        assert_eq!(
+            yaml_plan.phases[0].tasks.len(),
+            md_plan.phases[0].tasks.len()
+        );
+        assert_eq!(
+            yaml_plan.phases[0].tasks[0].number,
+            md_plan.phases[0].tasks[0].number
+        );
+        assert_eq!(
+            yaml_plan.phases[0].tasks[0].title,
+            md_plan.phases[0].tasks[0].title
+        );
+        assert_eq!(
+            yaml_plan.phases[0].tasks[0].acceptance,
+            md_plan.phases[0].tasks[0].acceptance
+        );
+    }
+
+    #[test]
+    fn parse_plan_file_dispatches_on_extension() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write a YAML plan
+        let yaml_path = dir.path().join("test-plan.yaml");
+        std::fs::write(
+            &yaml_path,
+            "\
+title: YAML Plan
+phases:
+  - number: 0
+    title: Setup
+    tasks:
+      - number: \"0.1\"
+        title: Init
+",
+        )
+        .unwrap();
+
+        // Write a markdown plan
+        let md_path = dir.path().join("md-plan.md");
+        std::fs::write(
+            &md_path,
+            "\
+# MD Plan
+
+## Phase 1: Work
+
+### 1.1 Do stuff
+
+Do the thing.
+",
+        )
+        .unwrap();
+
+        let yaml_plan = parse_plan_file(&yaml_path).unwrap();
+        assert_eq!(yaml_plan.title, "YAML Plan");
+        assert_eq!(yaml_plan.name, "test-plan");
+
+        let md_plan = parse_plan_file(&md_path).unwrap();
+        assert_eq!(md_plan.title, "MD Plan");
+        assert_eq!(md_plan.name, "md-plan");
+    }
+
+    #[test]
+    fn find_plan_file_priority() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Only .md exists
+        std::fs::write(dir.path().join("plan-a.md"), "# A").unwrap();
+        let found = find_plan_file(dir.path(), "plan-a").unwrap();
+        assert_eq!(found.extension().unwrap(), "md");
+
+        // Only .yaml exists
+        std::fs::write(dir.path().join("plan-b.yaml"), "title: B\nphases: []").unwrap();
+        let found = find_plan_file(dir.path(), "plan-b").unwrap();
+        assert_eq!(found.extension().unwrap(), "yaml");
+
+        // Both exist — yaml wins
+        std::fs::write(dir.path().join("plan-c.md"), "# C").unwrap();
+        std::fs::write(dir.path().join("plan-c.yaml"), "title: C\nphases: []").unwrap();
+        let found = find_plan_file(dir.path(), "plan-c").unwrap();
+        assert_eq!(found.extension().unwrap(), "yaml");
+
+        // Nothing exists
+        assert!(find_plan_file(dir.path(), "nonexistent").is_none());
+    }
+
+    #[test]
+    fn list_plans_includes_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+
+        std::fs::write(
+            dir.path().join("alpha.md"),
+            "\
+# Alpha Plan
+
+## Phase 1: Work
+
+### 1.1 Task
+
+Do stuff.
+",
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.path().join("beta.yaml"),
+            "\
+title: Beta Plan
+phases:
+  - number: 0
+    title: Setup
+    tasks:
+      - number: \"0.1\"
+        title: Init
+",
+        )
+        .unwrap();
+
+        let summaries = list_plans(dir.path());
+        let names: Vec<&str> = summaries.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"alpha"), "missing alpha: {names:?}");
+        assert!(names.contains(&"beta"), "missing beta: {names:?}");
+    }
+
+    #[test]
+    fn list_plans_deduplicates_yaml_over_md() {
+        let dir = tempfile::tempdir().unwrap();
+
+        std::fs::write(
+            dir.path().join("dup.md"),
+            "\
+# MD Version
+
+## Phase 1: Old
+
+### 1.1 Old task
+
+Old.
+",
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.path().join("dup.yaml"),
+            "\
+title: YAML Version
+phases:
+  - number: 0
+    title: New
+    tasks:
+      - number: \"0.1\"
+        title: New task
+",
+        )
+        .unwrap();
+
+        let summaries = list_plans(dir.path());
+        let dup_plans: Vec<_> = summaries.iter().filter(|s| s.name == "dup").collect();
+        assert_eq!(dup_plans.len(), 1, "expected exactly one 'dup' plan");
+        assert_eq!(dup_plans[0].title, "YAML Version");
+    }
+
+    #[test]
+    fn is_plan_ext_check() {
+        assert!(is_plan_ext(std::path::Path::new("foo.md")));
+        assert!(is_plan_ext(std::path::Path::new("foo.yaml")));
+        assert!(is_plan_ext(std::path::Path::new("foo.yml")));
+        assert!(!is_plan_ext(std::path::Path::new("foo.txt")));
+        assert!(!is_plan_ext(std::path::Path::new("foo.json")));
+        assert!(!is_plan_ext(std::path::Path::new("foo")));
     }
 
     #[test]

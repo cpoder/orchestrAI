@@ -10,7 +10,11 @@ mod state;
 mod static_files;
 mod ws;
 
-use axum::{Router, response::IntoResponse, routing::{delete, get, post}};
+use axum::{
+    Router,
+    response::IntoResponse,
+    routing::{delete, get, post},
+};
 use clap::Parser;
 use config::{Cli, Config};
 use state::AppState;
@@ -62,15 +66,19 @@ async fn main() {
                         "agent_stopped",
                         serde_json::json!({"id": id, "status": "completed", "exit_code": 0}),
                     );
-                    println!("[orchestrAI] Detached agent {} (pid {}) finished", &id[..8.min(id.len())], pid);
+                    println!(
+                        "[orchestrAI] Detached agent {} (pid {}) finished",
+                        &id[..8.min(id.len())],
+                        pid
+                    );
                 }
             }
         }
     });
 
     // Start file watcher
-    let _watcher = file_watcher::start(&config.plans_dir, broadcast_tx)
-        .expect("failed to start file watcher");
+    let _watcher =
+        file_watcher::start(&config.plans_dir, broadcast_tx).expect("failed to start file watcher");
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -85,22 +93,40 @@ async fn main() {
         .route("/terminal", get(agents::terminal_ws::terminal_ws_handler))
         // Agent routes (use registry from AppState)
         .route("/api/agents", get(api::agents::list_agents))
-        .route("/api/agents/{id}/output", get(api::agents::get_agent_output))
+        .route(
+            "/api/agents/{id}/output",
+            get(api::agents::get_agent_output),
+        )
         .route("/api/agents/{id}", delete(api::agents::kill_agent))
         .route("/api/events", get(api::agents::get_events))
         // Plan routes
         .route("/api/plans", get(api::plans::list_plans))
         .route("/api/plans/sync-all", post(api::plans::sync_all))
         .route("/api/plans/{name}", get(api::plans::get_plan))
-        .route("/api/plans/{name}/project", axum::routing::put(api::plans::set_project))
-        .route("/api/plans/{name}/tasks/{task_number}/status", axum::routing::put(api::plans::set_task_status))
+        .route(
+            "/api/plans/{name}/project",
+            axum::routing::put(api::plans::set_project),
+        )
+        .route(
+            "/api/plans/{name}/tasks/{task_number}/status",
+            axum::routing::put(api::plans::set_task_status),
+        )
         .route("/api/plans/{name}/statuses", get(api::plans::get_statuses))
         .route("/api/plans/create", post(api::plans::create_plan))
-        .route("/api/plans/{name}/auto-status", post(api::plans::auto_status))
-        .route("/api/plans/{name}/tasks/{task_number}/check", post(api::plans::check_task))
+        .route(
+            "/api/plans/{name}/auto-status",
+            post(api::plans::auto_status),
+        )
+        .route(
+            "/api/plans/{name}/tasks/{task_number}/check",
+            post(api::plans::check_task),
+        )
         .route("/api/actions/start-task", post(api::plans::start_task))
         // Settings
-        .route("/api/settings", get(api::settings::get_settings).put(api::settings::put_settings))
+        .route(
+            "/api/settings",
+            get(api::settings::get_settings).put(api::settings::put_settings),
+        )
         .route("/api/folders", get(api::settings::list_folders))
         // Static frontend (fallback)
         .fallback(get(static_files::serve_frontend))

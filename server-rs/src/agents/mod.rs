@@ -1,5 +1,5 @@
-pub mod pty_agent;
 pub mod check_agent;
+pub mod pty_agent;
 pub mod terminal_ws;
 
 use std::collections::HashMap;
@@ -67,7 +67,11 @@ impl AgentRegistry {
                     "UPDATE agents SET status = 'failed', finished_at = datetime('now') WHERE id = ?",
                     rusqlite::params![id],
                 ).ok();
-                println!("[orchestrAI] Cleaned stale agent {} (pid {}) — process dead", &id[..8], pid);
+                println!(
+                    "[orchestrAI] Cleaned stale agent {} (pid {}) — process dead",
+                    &id[..8],
+                    pid
+                );
                 continue;
             }
 
@@ -82,7 +86,11 @@ impl AgentRegistry {
                 // Reattach!
                 pty_agent::reattach_agent(self, &id, &tmux_name).await;
             } else {
-                println!("[orchestrAI] Agent {} (pid {}) alive but no tmux session — detached", &id[..8], pid);
+                println!(
+                    "[orchestrAI] Agent {} (pid {}) alive but no tmux session — detached",
+                    &id[..8],
+                    pid
+                );
             }
         }
     }
@@ -95,14 +103,20 @@ impl AgentRegistry {
             if let Some(ref tmux) = agent.tmux_session {
                 std::process::Command::new("tmux")
                     .args(["kill-session", "-t", tmux])
-                    .status().ok();
+                    .status()
+                    .ok();
             }
             let db = self.db.lock().unwrap();
             db.execute(
                 "UPDATE agents SET status = 'killed', finished_at = datetime('now') WHERE id = ?",
                 rusqlite::params![agent_id],
-            ).ok();
-            broadcast_event(&self.broadcast_tx, "agent_stopped", serde_json::json!({"id": agent_id, "status": "killed"}));
+            )
+            .ok();
+            broadcast_event(
+                &self.broadcast_tx,
+                "agent_stopped",
+                serde_json::json!({"id": agent_id, "status": "killed"}),
+            );
             return true;
         }
         drop(agents);
@@ -117,7 +131,8 @@ impl AgentRegistry {
         if tmux_exists {
             std::process::Command::new("tmux")
                 .args(["kill-session", "-t", &tmux_name])
-                .status().ok();
+                .status()
+                .ok();
         } else {
             // Last resort: kill by PID
             let db = self.db.lock().unwrap();
@@ -126,7 +141,9 @@ impl AgentRegistry {
                 rusqlite::params![agent_id],
                 |row| row.get::<_, i64>(0),
             ) {
-                unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
             }
         }
 
@@ -134,8 +151,13 @@ impl AgentRegistry {
         db.execute(
             "UPDATE agents SET status = 'killed', finished_at = datetime('now') WHERE id = ?",
             rusqlite::params![agent_id],
-        ).ok();
-        broadcast_event(&self.broadcast_tx, "agent_stopped", serde_json::json!({"id": agent_id, "status": "killed"}));
+        )
+        .ok();
+        broadcast_event(
+            &self.broadcast_tx,
+            "agent_stopped",
+            serde_json::json!({"id": agent_id, "status": "killed"}),
+        );
         true
     }
 }
