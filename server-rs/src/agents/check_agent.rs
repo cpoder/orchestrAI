@@ -182,19 +182,21 @@ pub async fn start_check_agent(
                         }
                     }
 
-                    // Look for verdict JSON
-                    if let Some(m) = regex::Regex::new(
-                        r#"\{\s*"status"\s*:\s*"(completed|in_progress|pending)"[^}]*\}"#,
-                    )
-                    .ok()
-                    .and_then(|re| re.find(&text))
-                    {
-                        if let Ok(verdict) =
-                            serde_json::from_str::<serde_json::Value>(m.as_str())
-                        {
+                    // Look for verdict JSON — find {"status": "..."} and extract valid JSON
+                    if let Some(start) = text.find(r#""status""#) {
+                        // Walk back to find the opening {
+                        let json_start = text[..start].rfind('{').unwrap_or(start);
+                        // Try progressively longer substrings to find valid JSON
+                        let remainder = &text[json_start..];
+                        let verdict_json = (1..=remainder.len())
+                            .filter(|&i| remainder.as_bytes().get(i - 1) == Some(&b'}'))
+                            .find_map(|i| serde_json::from_str::<serde_json::Value>(&remainder[..i]).ok());
+
+                        if let Some(verdict) = verdict_json {
                             let v_status = verdict
                                 .get("status")
                                 .and_then(|s| s.as_str())
+                                .filter(|s| ["completed", "in_progress", "pending"].contains(s))
                                 .unwrap_or("pending");
                             let v_reason = verdict
                                 .get("reason")
