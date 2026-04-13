@@ -2,6 +2,7 @@ import { useState } from "react";
 import { usePlanStore } from "../stores/plan-store.js";
 import { postJson } from "../api.js";
 import { PhaseColumn } from "./PhaseColumn.js";
+import { EditableText } from "./EditableText.js";
 
 interface SyncResult {
   summary: { total: number; completed: number; in_progress: number; pending: number };
@@ -16,6 +17,7 @@ export function PlanBoard() {
   const [converting, setConverting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fetchPlans = usePlanStore((s) => s.fetchPlans);
+  const savePlan = usePlanStore((s) => s.savePlan);
 
   const isMd = plan?.filePath?.endsWith(".md") ?? false;
 
@@ -71,6 +73,18 @@ export function PlanBoard() {
     }
   }
 
+  async function saveField(patch: Partial<typeof plan>) {
+    if (!plan) return;
+    const updated = { ...plan, ...patch };
+    try {
+      await savePlan(updated);
+      await fetchPlans();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(`Save failed: ${msg}`);
+    }
+  }
+
   async function handleConvert() {
     setConverting(true);
     setError(null);
@@ -110,7 +124,12 @@ export function PlanBoard() {
         </div>
         <div className="flex items-center gap-3">
           <h2 className="text-xl font-bold">
-            {plan.title}
+            <EditableText
+              value={plan.title}
+              onSave={(v) => saveField({ title: v })}
+              className="text-xl font-bold"
+              editClassName="text-xl font-bold"
+            />
             <span className="text-sm font-mono font-normal text-gray-600 ml-2">{plan.name}</span>
           </h2>
           <span className="text-xs text-gray-500 bg-gray-800 px-2 py-0.5 rounded">
@@ -121,12 +140,16 @@ export function PlanBoard() {
           </span>
         </div>
         <div className="flex items-center gap-3 mt-2">
-          {plan.context && (
-            <p className="text-sm text-gray-400 max-w-3xl line-clamp-2 flex-1">
-              {plan.context.slice(0, 300)}
-              {plan.context.length > 300 ? "..." : ""}
-            </p>
-          )}
+          <div className="text-sm text-gray-400 max-w-3xl flex-1">
+            <EditableText
+              value={plan.context}
+              onSave={(v) => saveField({ context: v })}
+              multiline
+              className="line-clamp-2"
+              editClassName="text-sm"
+              placeholder="Add context..."
+            />
+          </div>
           {isMd && (
             <button
               onClick={handleConvert}

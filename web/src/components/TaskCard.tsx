@@ -4,6 +4,7 @@ import { postJson, putJson } from "../api.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
+import { EditableText } from "./EditableText.js";
 
 interface Props {
   task: PlanTask;
@@ -47,8 +48,31 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
   const [showMenu, setShowMenu] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const selectAgent = useAgentStore((s) => s.selectAgent);
+  const plan = usePlanStore((s) => s.selectedPlan);
   const selectPlan = usePlanStore((s) => s.selectPlan);
+  const savePlan = usePlanStore((s) => s.savePlan);
+  const fetchPlans = usePlanStore((s) => s.fetchPlans);
   const effort = useSettingsStore((s) => s.effort);
+
+  async function saveTaskField(patch: Partial<PlanTask>) {
+    if (!plan) return;
+    const updated = {
+      ...plan,
+      phases: plan.phases.map((p) => ({
+        ...p,
+        tasks: p.tasks.map((t) =>
+          t.number === task.number ? { ...t, ...patch } : t
+        ),
+      })),
+    };
+    try {
+      await savePlan(updated);
+      await fetchPlans();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(`Save failed: ${msg}`);
+    }
+  }
 
   const status = task.status ?? "pending";
   const cfg = statusConfig[status] ?? statusConfig.pending;
@@ -177,7 +201,12 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
             )}
           </div>
           <h4 className="text-sm font-medium mt-0.5 leading-tight">
-            {task.title}
+            <EditableText
+              value={task.title}
+              onSave={(v) => saveTaskField({ title: v })}
+              className="text-sm font-medium"
+              editClassName="text-sm font-medium"
+            />
           </h4>
         </div>
 
@@ -257,12 +286,28 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
         </div>
       )}
 
-      {/* Acceptance */}
-      {task.acceptance && (
-        <p className="mt-1.5 text-[11px] text-gray-500 line-clamp-2">
-          {task.acceptance}
-        </p>
-      )}
+      {/* Description — editable */}
+      <div className="mt-1.5 text-[11px] text-gray-400">
+        <EditableText
+          value={task.description}
+          onSave={(v) => saveTaskField({ description: v })}
+          multiline
+          className="line-clamp-2"
+          editClassName="text-[11px]"
+          placeholder="Add description..."
+        />
+      </div>
+
+      {/* Acceptance — editable */}
+      <div className="mt-1 text-[11px] text-gray-500">
+        <EditableText
+          value={task.acceptance}
+          onSave={(v) => saveTaskField({ acceptance: v })}
+          className="line-clamp-1"
+          editClassName="text-[11px]"
+          placeholder="Add acceptance criteria..."
+        />
+      </div>
 
       {/* Error display */}
       {error && (

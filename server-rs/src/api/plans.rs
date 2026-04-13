@@ -899,6 +899,122 @@ pub async fn create_plan(
     .into_response()
 }
 
+// ── PUT /api/plans/:name ────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatePlanBody {
+    title: String,
+    context: String,
+    project: Option<String>,
+    phases: Vec<UpdatePhaseBody>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatePhaseBody {
+    number: u32,
+    title: String,
+    #[serde(default)]
+    description: String,
+    tasks: Vec<UpdateTaskBody>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateTaskBody {
+    number: String,
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    file_paths: Vec<String>,
+    #[serde(default)]
+    acceptance: String,
+    #[serde(default)]
+    dependencies: Vec<String>,
+}
+
+pub async fn update_plan(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<UpdatePlanBody>,
+) -> impl IntoResponse {
+    let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &name) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Build a ParsedPlan from the update body
+    let plan = plan_parser::ParsedPlan {
+        name: name.clone(),
+        file_path: plan_path.to_string_lossy().to_string(),
+        title: body.title,
+        context: body.context,
+        project: body.project,
+        created_at: String::new(),
+        modified_at: String::new(),
+        phases: body
+            .phases
+            .into_iter()
+            .map(|p| plan_parser::PlanPhase {
+                number: p.number,
+                title: p.title,
+                description: p.description,
+                tasks: p
+                    .tasks
+                    .into_iter()
+                    .map(|t| plan_parser::PlanTask {
+                        number: t.number,
+                        title: t.title,
+                        description: t.description,
+                        file_paths: t.file_paths,
+                        acceptance: t.acceptance,
+                        dependencies: t.dependencies,
+                        status: None,
+                        status_updated_at: None,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+
+    // Always write as YAML
+    let yaml = match plan_parser::serialize_plan_yaml(&plan) {
+        Ok(y) => y,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to serialize: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    // Write to .yaml (migrate from .md if needed)
+    let yaml_path = state.plans_dir.join(format!("{name}.yaml"));
+    if let Err(e) = std::fs::write(&yaml_path, &yaml) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to write: {e}")})),
+        )
+            .into_response();
+    }
+
+    // Remove old .md if we just migrated
+    if plan_path.extension().is_some_and(|e| e == "md") {
+        std::fs::remove_file(&plan_path).ok();
+    }
+
+    Json(serde_json::json!({"ok": true, "name": name})).into_response()
+}
+
 // ── POST /api/plans/:name/convert ──────────────────────────────────────────
 
 pub async fn convert_plan(

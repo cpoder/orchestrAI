@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { fetchJson } from "../api.js";
+import { fetchJson, putJson } from "../api.js";
 
 export interface PlanTask {
   number: string;
@@ -7,6 +7,7 @@ export interface PlanTask {
   description: string;
   filePaths: string[];
   acceptance: string;
+  dependencies?: string[];
   status?: string;
   statusUpdatedAt?: string;
   agentId?: string;
@@ -56,6 +57,7 @@ interface PlanStore {
   fetchPlans: () => Promise<void>;
   selectPlan: (name: string) => Promise<void>;
   updatePlan: (plan: ParsedPlan) => void;
+  savePlan: (plan: ParsedPlan) => Promise<void>;
   addWarning: (w: PlanWarning) => void;
   dismissWarning: (name: string) => void;
 }
@@ -83,6 +85,28 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
     if (selectedPlan?.name === plan.name) {
       set({ selectedPlan: plan });
     }
+  },
+
+  savePlan: async (plan: ParsedPlan) => {
+    await putJson(`/api/plans/${plan.name}`, {
+      title: plan.title,
+      context: plan.context,
+      project: plan.project,
+      phases: plan.phases.map((p) => ({
+        number: p.number,
+        title: p.title,
+        description: p.description,
+        tasks: p.tasks.map((t) => ({
+          number: t.number,
+          title: t.title,
+          description: t.description,
+          filePaths: t.filePaths,
+          acceptance: t.acceptance,
+          dependencies: t.dependencies ?? [],
+        })),
+      })),
+    });
+    set({ selectedPlan: plan });
   },
 
   addWarning: (w: PlanWarning) => {

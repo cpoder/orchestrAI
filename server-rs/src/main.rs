@@ -102,7 +102,10 @@ async fn main() {
         // Plan routes
         .route("/api/plans", get(api::plans::list_plans))
         .route("/api/plans/sync-all", post(api::plans::sync_all))
-        .route("/api/plans/{name}", get(api::plans::get_plan))
+        .route(
+            "/api/plans/{name}",
+            get(api::plans::get_plan).put(api::plans::update_plan),
+        )
         .route(
             "/api/plans/{name}/project",
             axum::routing::put(api::plans::set_project),
