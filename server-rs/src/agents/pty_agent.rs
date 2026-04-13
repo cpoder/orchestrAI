@@ -1,10 +1,11 @@
-use std::io::{BufRead, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::process::Command;
 
+use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use rusqlite::params;
 
 use crate::agents::{AgentMode, AgentRegistry, ManagedAgent};
@@ -12,11 +13,7 @@ use crate::config::Effort;
 use crate::ws::broadcast_event;
 
 fn tmux_session_name(agent_id: &str) -> String {
-    format!("oai-{}", &agent_id[..8])
-}
-
-fn pipe_path(agent_id: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("orchestrai-{}.pipe", &agent_id[..8]))
+    format!("oai-{}", &agent_id[..8.min(agent_id.len())])
 }
 
 pub async fn start_pty_agent(
@@ -30,7 +27,6 @@ pub async fn start_pty_agent(
     let id = uuid::Uuid::new_v4().to_string();
     let session_id = uuid::Uuid::new_v4().to_string();
     let tmux_name = tmux_session_name(&id);
-    let pipe = pipe_path(&id);
 
     // Insert into DB
     {
@@ -41,12 +37,6 @@ pub async fn start_pty_agent(
             params![id, session_id, cwd.to_str().unwrap_or(""), plan_name, task_id, prompt],
         ).ok();
     }
-
-    // Create named pipe for output streaming
-    if pipe.exists() {
-        std::fs::remove_file(&pipe).ok();
-    }
-    unsafe { libc::mkfifo(std::ffi::CString::new(pipe.to_str().unwrap()).unwrap().as_ptr(), 0o600); }
 
     // Create tmux session running claude
     let claude_cmd = format!(
@@ -69,7 +59,7 @@ pub async fn start_pty_agent(
         return id;
     }
 
-    // Get the PID of the claude process inside tmux
+    // Get the PID of the process inside tmux
     let pid = get_tmux_pid(&tmux_name).unwrap_or(0);
 
     {
@@ -83,68 +73,44 @@ pub async fn start_pty_agent(
         serde_json::json!({"id": id, "sessionId": session_id, "planName": plan_name, "taskId": task_id, "pid": pid, "mode": "pty"}),
     );
 
-    // Start pipe-pane to stream tmux output to our named pipe
-    Command::new("tmux")
-        .args(["pipe-pane", "-t", &tmux_name, "-o", &format!("cat >> {}", pipe.display())])
-        .status().ok();
-
-    // Register agent
-    let agent = ManagedAgent {
-        id: id.clone(),
-        session_id,
-        plan_name: plan_name.map(|s| s.to_string()),
-        task_id: task_id.map(|s| s.to_string()),
-        mode: AgentMode::Pty,
-        pty: None,
-        pty_writer: None,
-        pty_master: None,
-        tmux_session: Some(tmux_name.clone()),
-        terminals: Vec::new(),
-    };
-    registry.agents.lock().await.insert(id.clone(), agent);
-
-    // Spawn reader thread: reads from named pipe, stores in DB, forwards to terminals
-    spawn_pipe_reader(registry, &id, &pipe);
+    // Attach to the tmux session via a PTY (gives us clean terminal output)
+    let agent = attach_to_tmux(registry, &id, &tmux_name).await;
+    if agent.is_none() {
+        eprintln!("[agent {}] Failed to attach to tmux session", &id[..8]);
+    }
 
     // Send initial prompt once claude is ready
     let prompt_sent = Arc::new(AtomicBool::new(false));
-    let tmux_for_prompt = tmux_name.clone();
-    let prompt_for_send = prompt.clone();
-    let prompt_sent_clone = prompt_sent.clone();
+    let tmux_for_ready = tmux_name.clone();
+    let prompt_for_ready = prompt;
+    let prompt_sent_for_ready = prompt_sent.clone();
 
-    // Watch for ready signal in the output
-    let db_watch = registry.db.clone();
-    let id_watch = id.clone();
-    let tmux_watch = tmux_name.clone();
-    let prompt_watch = prompt;
-    let prompt_sent_watch = prompt_sent.clone();
     tokio::spawn(async move {
-        // Poll tmux pane content for the ready signal
+        // Poll tmux for ready signal
         for _ in 0..80 {
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-            if prompt_sent_watch.load(Ordering::Relaxed) { return; }
+            if prompt_sent_for_ready.load(Ordering::Relaxed) { return; }
 
             if let Ok(output) = Command::new("tmux")
-                .args(["capture-pane", "-t", &tmux_watch, "-p"])
+                .args(["capture-pane", "-t", &tmux_for_ready, "-p"])
                 .output()
             {
                 let text = String::from_utf8_lossy(&output.stdout);
                 if text.contains('❯') || text.contains('\u{276f}') {
-                    if prompt_sent_watch.swap(true, Ordering::Relaxed) { return; }
+                    if prompt_sent_for_ready.swap(true, Ordering::Relaxed) { return; }
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                    send_to_tmux(&tmux_watch, &prompt_watch);
-                    // Second enter for paste confirmation
+                    send_to_tmux(&tmux_for_ready, &prompt_for_ready);
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                    send_to_tmux_raw(&tmux_watch, "Enter");
+                    send_to_tmux_key(&tmux_for_ready, "Enter");
                     return;
                 }
             }
         }
-        // Fallback: 16s timeout, send anyway
-        if !prompt_sent_watch.swap(true, Ordering::Relaxed) {
-            send_to_tmux(&tmux_watch, &prompt_watch);
+        // Fallback after 16s
+        if !prompt_sent_for_ready.swap(true, Ordering::Relaxed) {
+            send_to_tmux(&tmux_for_ready, &prompt_for_ready);
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            send_to_tmux_raw(&tmux_watch, "Enter");
+            send_to_tmux_key(&tmux_for_ready, "Enter");
         }
     });
 
@@ -153,63 +119,63 @@ pub async fn start_pty_agent(
 
 /// Reattach to an existing tmux session (for agents that survived a server restart)
 pub async fn reattach_agent(registry: &AgentRegistry, agent_id: &str, tmux_name: &str) {
-    let pipe = pipe_path(agent_id);
-
-    // Recreate pipe if missing
-    if !pipe.exists() {
-        unsafe { libc::mkfifo(std::ffi::CString::new(pipe.to_str().unwrap()).unwrap().as_ptr(), 0o600); }
-        // Restart pipe-pane
-        Command::new("tmux")
-            .args(["pipe-pane", "-t", tmux_name, "-o", &format!("cat >> {}", pipe.display())])
-            .status().ok();
+    if attach_to_tmux(registry, agent_id, tmux_name).await.is_some() {
+        println!("[orchestrAI] Reattached agent {} to tmux session {}", &agent_id[..8], tmux_name);
+    } else {
+        println!("[orchestrAI] Failed to reattach agent {} to tmux {}", &agent_id[..8], tmux_name);
     }
+}
 
+/// Attach a PTY running `tmux attach -t <session>` and start reading its output.
+/// Returns Some(()) on success.
+async fn attach_to_tmux(
+    registry: &AgentRegistry,
+    agent_id: &str,
+    tmux_name: &str,
+) -> Option<()> {
+    let pty_system = NativePtySystem::default();
+    let pair = pty_system
+        .openpty(PtySize { rows: 40, cols: 120, pixel_width: 0, pixel_height: 0 })
+        .ok()?;
+
+    let mut cmd = CommandBuilder::new("tmux");
+    cmd.arg("attach-session");
+    cmd.arg("-t");
+    cmd.arg(tmux_name);
+    cmd.env("TERM", "xterm-256color");
+
+    let child = pair.slave.spawn_command(cmd).ok()?;
+    let mut reader = pair.master.try_clone_reader().ok()?;
+    let pty_writer = pair.master.take_writer().ok()?;
+    let master = pair.master;
+
+    // Store in agent registry
     let agent = ManagedAgent {
         id: agent_id.to_string(),
         session_id: String::new(),
         plan_name: None,
         task_id: None,
         mode: AgentMode::Pty,
-        pty: None,
-        pty_writer: None,
-        pty_master: None,
+        pty: Some(child),
+        pty_writer: Some(pty_writer),
+        pty_master: Some(master),
         tmux_session: Some(tmux_name.to_string()),
         terminals: Vec::new(),
     };
     registry.agents.lock().await.insert(agent_id.to_string(), agent);
 
-    spawn_pipe_reader(registry, agent_id, &pipe);
-    println!("[orchestrAI] Reattached agent {} to tmux session {}", &agent_id[..8], tmux_name);
-}
-
-fn spawn_pipe_reader(registry: &AgentRegistry, agent_id: &str, pipe: &Path) {
+    // Spawn reader thread
     let db = registry.db.clone();
     let agents = registry.agents.clone();
     let tx = registry.broadcast_tx.clone();
     let id = agent_id.to_string();
-    let pipe = pipe.to_path_buf();
+    let tmux = tmux_name.to_string();
 
     thread::spawn(move || {
-        // Open pipe (blocks until writer connects — tmux pipe-pane)
-        let file = match std::fs::File::open(&pipe) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("[agent {}] Failed to open pipe: {e}", &id[..8]);
-                return;
-            }
-        };
-        let reader = std::io::BufReader::new(file);
         let mut buf = [0u8; 4096];
-
-        // Read chunks
-        use std::io::Read;
-        let mut reader = reader;
         loop {
             match reader.read(&mut buf) {
-                Ok(0) => {
-                    // Pipe closed — tmux session ended
-                    break;
-                }
+                Ok(0) => break,
                 Ok(n) => {
                     let data = &buf[..n];
                     let text = String::from_utf8_lossy(data).to_string();
@@ -223,11 +189,11 @@ fn spawn_pipe_reader(registry: &AgentRegistry, agent_id: &str, pipe: &Path) {
                         ).ok();
                     }
 
-                    // Forward to terminals
-                    let agents_guard = agents.blocking_lock();
-                    if let Some(agent) = agents_guard.get(&id) {
-                        for tx in &agent.terminals {
-                            tx.send(data.to_vec()).ok();
+                    // Forward to connected WebSocket terminals
+                    let guard = agents.blocking_lock();
+                    if let Some(agent) = guard.get(&id) {
+                        for terminal_tx in &agent.terminals {
+                            terminal_tx.send(data.to_vec()).ok();
                         }
                     }
                 }
@@ -235,34 +201,37 @@ fn spawn_pipe_reader(registry: &AgentRegistry, agent_id: &str, pipe: &Path) {
             }
         }
 
-        // Agent exited — update DB
-        {
+        // tmux attach exited — check if the tmux session is gone
+        let session_dead = !Command::new("tmux")
+            .args(["has-session", "-t", &tmux])
+            .status()
+            .is_ok_and(|s| s.success());
+
+        if session_dead {
             let db = db.lock().unwrap();
             db.execute(
                 "UPDATE agents SET status = 'completed', finished_at = datetime('now') WHERE id = ? AND status = 'running'",
                 params![id],
             ).ok();
+            drop(db);
+            agents.blocking_lock().remove(&id);
+            broadcast_event(&tx, "agent_stopped", serde_json::json!({"id": id, "status": "completed", "exit_code": 0}));
         }
-        agents.blocking_lock().remove(&id);
-        broadcast_event(&tx, "agent_stopped", serde_json::json!({"id": id, "status": "completed", "exit_code": 0}));
-
-        // Cleanup pipe
-        std::fs::remove_file(&pipe).ok();
     });
+
+    Some(())
 }
 
 fn send_to_tmux(session: &str, text: &str) {
-    // Use send-keys with literal flag to avoid key interpretation
     Command::new("tmux")
         .args(["send-keys", "-t", session, "-l", text])
         .status().ok();
-    // Send Enter
     Command::new("tmux")
         .args(["send-keys", "-t", session, "Enter"])
         .status().ok();
 }
 
-fn send_to_tmux_raw(session: &str, key: &str) {
+fn send_to_tmux_key(session: &str, key: &str) {
     Command::new("tmux")
         .args(["send-keys", "-t", session, key])
         .status().ok();
@@ -271,10 +240,8 @@ fn send_to_tmux_raw(session: &str, key: &str) {
 fn get_tmux_pid(session: &str) -> Option<u32> {
     let output = Command::new("tmux")
         .args(["list-panes", "-t", session, "-F", "#{pane_pid}"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.trim().parse().ok()
+        .output().ok()?;
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 fn shell_escape(s: &str) -> String {

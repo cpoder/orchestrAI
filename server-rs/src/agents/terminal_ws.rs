@@ -107,41 +107,43 @@ async fn handle_terminal(mut socket: WebSocket, agent_id: String, registry: Agen
                                 if val.get("type").and_then(|t| t.as_str()) == Some("resize") {
                                     let cols = val.get("cols").and_then(|c| c.as_u64()).unwrap_or(120) as u16;
                                     let rows = val.get("rows").and_then(|r| r.as_u64()).unwrap_or(40) as u16;
-                                    let agents = registry.agents.lock().await;
-                                    if let Some(agent) = agents.get(&agent_id) {
-                                        if let Some(ref tmux) = agent.tmux_session {
-                                            let tmux = tmux.clone();
-                                            drop(agents);
-                                            std::process::Command::new("tmux")
-                                                .args(["resize-pane", "-t", &tmux, "-x", &cols.to_string(), "-y", &rows.to_string()])
-                                                .status().ok();
-                                        }
+                                    // Resize both the PTY (our attach client) and the tmux pane
+                                    let tmux_name = {
+                                        let mut agents = registry.agents.lock().await;
+                                        if let Some(agent) = agents.get_mut(&agent_id) {
+                                            if let Some(ref mut master) = agent.pty_master {
+                                                master.resize(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).ok();
+                                            }
+                                            agent.tmux_session.clone()
+                                        } else { None }
+                                    };
+                                    if let Some(tmux) = tmux_name {
+                                        std::process::Command::new("tmux")
+                                            .args(["resize-pane", "-t", &tmux, "-x", &cols.to_string(), "-y", &rows.to_string()])
+                                            .status().ok();
                                     }
                                     continue;
                                 }
                             }
                         }
-                        // Regular input — forward via tmux
-                        let tmux_name = {
-                            let agents = registry.agents.lock().await;
-                            agents.get(&agent_id).and_then(|a| a.tmux_session.clone())
-                        };
-                        if let Some(tmux) = tmux_name {
-                            std::process::Command::new("tmux")
-                                .args(["send-keys", "-t", &tmux, "-l", &*text])
-                                .status().ok();
+                        // Regular input — write to PTY writer (goes to tmux attach stdin)
+                        {
+                            let mut agents = registry.agents.lock().await;
+                            if let Some(agent) = agents.get_mut(&agent_id) {
+                                if let Some(ref mut writer) = agent.pty_writer {
+                                    use std::io::Write;
+                                    writer.write_all(text.as_bytes()).ok();
+                                }
+                            }
                         }
                     }
                     Some(Ok(Message::Binary(data))) => {
-                        let tmux_name = {
-                            let agents = registry.agents.lock().await;
-                            agents.get(&agent_id).and_then(|a| a.tmux_session.clone())
-                        };
-                        if let Some(tmux) = tmux_name {
-                            let text = String::from_utf8_lossy(&data);
-                            std::process::Command::new("tmux")
-                                .args(["send-keys", "-t", &tmux, "-l", &*text])
-                                .status().ok();
+                        let mut agents = registry.agents.lock().await;
+                        if let Some(agent) = agents.get_mut(&agent_id) {
+                            if let Some(ref mut writer) = agent.pty_writer {
+                                use std::io::Write;
+                                writer.write_all(&data).ok();
+                            }
                         }
                     }
                     None | Some(Err(_)) => break,
