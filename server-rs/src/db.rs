@@ -54,6 +54,7 @@ fn migrate(conn: &Connection) {
             finished_at      TEXT,
             last_tool        TEXT,
             last_activity_at TEXT,
+            base_commit      TEXT,
             FOREIGN KEY (parent_agent_id) REFERENCES agents(id)
         );
         CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
@@ -84,6 +85,10 @@ fn migrate(conn: &Connection) {
         ",
     )
     .expect("failed to run schema migration");
+
+    // Add base_commit column for existing databases
+    conn.execute_batch("ALTER TABLE agents ADD COLUMN base_commit TEXT;")
+        .ok(); // ignore error if column already exists
 }
 
 #[cfg(test)]
