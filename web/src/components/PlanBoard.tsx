@@ -16,6 +16,7 @@ export function PlanBoard() {
   const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
   const [converting, setConverting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<string | null>(null);
   const fetchPlans = usePlanStore((s) => s.fetchPlans);
   const savePlan = usePlanStore((s) => s.savePlan);
 
@@ -200,10 +201,34 @@ export function PlanBoard() {
         )}
       </div>
 
+      {/* Status filter */}
+      <div className="flex items-center gap-1 mb-4">
+        <span className="text-[10px] text-gray-600 mr-1">Filter</span>
+        {[
+          { value: null, label: "All" },
+          { value: "pending", label: "Pending", color: "text-gray-400" },
+          { value: "in_progress", label: "Active", color: "text-amber-400" },
+          { value: "completed", label: "Done", color: "text-emerald-400" },
+          { value: "failed", label: "Failed", color: "text-red-400" },
+        ].map((f) => (
+          <button
+            key={f.value ?? "all"}
+            onClick={() => setStatusFilter(f.value)}
+            className={`px-2 py-0.5 text-[10px] rounded transition ${
+              statusFilter === f.value
+                ? `${f.color ?? "text-gray-200"} bg-gray-800 font-semibold`
+                : "text-gray-600 hover:text-gray-400"
+            }`}
+          >
+            {f.label}
+          </button>
+        ))}
+      </div>
+
       {/* Phase columns -- horizontal scroll */}
       <div className="flex gap-4 overflow-x-auto pb-4">
         {plan.phases.map((phase) => (
-          <PhaseColumn key={phase.number} phase={phase} planName={plan.name} />
+          <PhaseColumn key={phase.number} phase={phase} planName={plan.name} statusFilter={statusFilter} />
         ))}
       </div>
     </div>

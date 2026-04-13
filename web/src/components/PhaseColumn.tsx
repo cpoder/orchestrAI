@@ -5,9 +5,10 @@ import { TaskCard } from "./TaskCard.js";
 interface Props {
   phase: PlanPhase;
   planName: string;
+  statusFilter?: string | null;
 }
 
-export function PhaseColumn({ phase, planName }: Props) {
+export function PhaseColumn({ phase, planName, statusFilter }: Props) {
   const total = phase.tasks.length;
   const done = phase.tasks.filter(
     (t) => t.status === "completed" || t.status === "skipped"
@@ -21,10 +22,14 @@ export function PhaseColumn({ phase, planName }: Props) {
   const [collapsed, setCollapsed] = useState(allDone);
   const [showDoneTasks, setShowDoneTasks] = useState(false);
 
-  const activeTasks = phase.tasks.filter(
+  const filteredTasks = statusFilter
+    ? phase.tasks.filter((t) => (t.status ?? "pending") === statusFilter)
+    : phase.tasks;
+
+  const activeTasks = filteredTasks.filter(
     (t) => t.status !== "completed" && t.status !== "skipped"
   );
-  const doneTasks = phase.tasks.filter(
+  const doneTasks = filteredTasks.filter(
     (t) => t.status === "completed" || t.status === "skipped"
   );
 
@@ -110,6 +115,9 @@ export function PhaseColumn({ phase, planName }: Props) {
             </div>
           )}
 
+          {filteredTasks.length === 0 && phase.tasks.length > 0 && (
+            <p className="text-xs text-gray-600 p-2">No matching tasks</p>
+          )}
           {phase.tasks.length === 0 && (
             <p className="text-xs text-gray-600 p-2">No tasks parsed</p>
           )}

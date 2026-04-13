@@ -40,6 +40,7 @@ export function Sidebar({ view, onViewChange }: Props) {
   const [convertingAll, setConvertingAll] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [showDone, setShowDone] = useState<Record<string, boolean>>({});
+  const [search, setSearch] = useState("");
 
   async function handleSyncAll() {
     setSyncingAll(true);
@@ -75,10 +76,20 @@ export function Sidebar({ view, onViewChange }: Props) {
     }
   }
 
-  // Group plans by project, split active vs done within each group
+  // Filter and group plans by project, split active vs done
   const grouped = useMemo(() => {
+    const q = search.toLowerCase().trim();
+    const filtered = q
+      ? plans.filter(
+          (p) =>
+            p.title.toLowerCase().includes(q) ||
+            p.name.toLowerCase().includes(q) ||
+            (p.project ?? "").toLowerCase().includes(q)
+        )
+      : plans;
+
     const groups = new Map<string, { active: PlanSummary[]; done: PlanSummary[] }>();
-    for (const p of plans) {
+    for (const p of filtered) {
       const key = p.project ?? "Unassigned";
       if (!groups.has(key)) groups.set(key, { active: [], done: [] });
       const g = groups.get(key)!;
@@ -93,7 +104,7 @@ export function Sidebar({ view, onViewChange }: Props) {
       if (b[0] === "Unassigned") return -1;
       return a[0].localeCompare(b[0]);
     });
-  }, [plans]);
+  }, [plans, search]);
 
   function renderPlanItem(p: PlanSummary, dimmed = false) {
     const pct = p.taskCount > 0 ? Math.round((p.doneCount / p.taskCount) * 100) : 0;
@@ -207,6 +218,17 @@ export function Sidebar({ view, onViewChange }: Props) {
 
       {/* Effort level */}
       <EffortSelector />
+
+      {/* Search */}
+      <div className="px-2 pb-2">
+        <input
+          type="text"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search plans..."
+          className="w-full px-2 py-1 text-xs bg-gray-800 border border-gray-700 rounded text-gray-300 placeholder-gray-600 outline-none focus:border-indigo-600 transition"
+        />
+      </div>
 
       {/* Plan list grouped by project */}
       <div className="flex-1 overflow-auto p-2">
