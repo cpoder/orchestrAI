@@ -31,7 +31,7 @@ async fn main() {
 
     // Agent registry
     let registry = agents::AgentRegistry::new(db.clone(), broadcast_tx.clone());
-    registry.cleanup_stale();
+    registry.cleanup_and_reattach().await;
 
     let state = AppState::new(&config, db.clone(), broadcast_tx.clone(), registry.clone());
 
