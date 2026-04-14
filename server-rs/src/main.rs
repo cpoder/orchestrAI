@@ -34,10 +34,14 @@ async fn health() -> impl IntoResponse {
 fn main() {
     let mut cli = Cli::parse();
 
-    if let Some(Command::Session(args)) = cli.command.take() {
-        // Must dispatch before any tokio runtime starts — fork() with an
-        // active multi-threaded runtime would leave the child in an
-        // unusable state.
+    // `Session` must be dispatched before any tokio runtime starts — fork()
+    // with an active multi-threaded runtime would leave the child in an
+    // unusable state. So peel it off the enum first, then build the runtime,
+    // then dispatch the remaining variants inside it.
+    if matches!(cli.command, Some(Command::Session(_))) {
+        let Some(Command::Session(args)) = cli.command.take() else {
+            unreachable!();
+        };
         if let Err(e) = agents::supervisor::run_session(args) {
             eprintln!("session daemon error: {e}");
             std::process::exit(1);
@@ -49,7 +53,17 @@ fn main() {
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
-    rt.block_on(run_server(cli));
+
+    match cli.command.take() {
+        Some(Command::Mcp) => {
+            if let Err(e) = rt.block_on(mcp::transport::run_stdio()) {
+                eprintln!("mcp stdio error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Session(_)) => unreachable!("handled above"),
+        None => rt.block_on(run_server(cli)),
+    }
 }
 
 async fn run_server(cli: Cli) {
@@ -225,7 +239,7 @@ async fn run_server(cli: Cli) {
         .with_state(state)
         // MCP server (streamable HTTP transport). Mounted via nest_service so
         // it runs alongside the dashboard API without sharing its AppState.
-        .nest_service("/mcp", mcp::build_service())
+        .nest_service("/mcp", mcp::transport::build_http_service())
         .layer(cors);
 
     let addr = format!("0.0.0.0:{}", config.port);

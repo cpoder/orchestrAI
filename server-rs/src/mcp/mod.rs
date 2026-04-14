@@ -1,10 +1,14 @@
 //! MCP server (hello-world).
 //!
-//! Mounts an MCP streamable-HTTP transport at /mcp on the main axum
-//! listener. MCP clients speak the Model Context Protocol here; the rest
-//! of the server continues to serve the dashboard REST/WS API.
+//! Same handler, two transports:
+//! - `StreamableHttpService` mounted on the main axum listener at `/mcp`
+//!   (see [`transport::build_http_service`]); MCP clients that speak HTTP/SSE
+//!   (e.g. the MCP Inspector in remote mode) connect here.
+//! - stdin/stdout via [`transport::run_stdio`], dispatched from the
+//!   `orchestrai-server mcp` subcommand; MCP clients that spawn the server
+//!   as a child process (e.g. Claude Code) connect here.
 
-use std::sync::Arc;
+pub mod transport;
 
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -13,9 +17,6 @@ use rmcp::{
         CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
     },
     tool, tool_handler, tool_router,
-    transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
-    },
 };
 
 #[derive(Clone)]
@@ -58,14 +59,4 @@ impl ServerHandler for OrchestrAiMcp {
                 "orchestrAI MCP server. Tools: hello (returns a greeting).".to_string(),
             )
     }
-}
-
-pub type McpService = StreamableHttpService<OrchestrAiMcp, LocalSessionManager>;
-
-pub fn build_service() -> McpService {
-    StreamableHttpService::new(
-        || Ok(OrchestrAiMcp::new()),
-        Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
-    )
 }

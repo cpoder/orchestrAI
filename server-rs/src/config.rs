@@ -70,6 +70,13 @@ pub enum Command {
     /// end users invoke directly. Forks + setsid on Unix so the daemon
     /// survives the parent's death.
     Session(SessionArgs),
+
+    /// Serve the orchestrAI MCP server over stdio.
+    ///
+    /// For MCP clients (e.g. Claude Code) that spawn the server as a child
+    /// process and speak JSON-RPC on stdin/stdout. The same MCP handler is
+    /// also mounted at `/mcp` on the HTTP listener when running `serve`.
+    Mcp,
 }
 
 fn default_claude_dir() -> PathBuf {
