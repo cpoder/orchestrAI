@@ -212,6 +212,15 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                 {timeAgo(task.statusUpdatedAt)}
               </span>
             )}
+            {/* Cost */}
+            {task.costUsd != null && task.costUsd > 0 && (
+              <span
+                className="text-[9px] text-amber-400/80 font-mono"
+                title="Total agent cost for this task"
+              >
+                ${task.costUsd.toFixed(task.costUsd >= 1 ? 2 : 4)}
+              </span>
+            )}
           </div>
           <h4 className="text-sm font-medium mt-0.5 leading-tight">
             <EditableText
@@ -277,38 +286,39 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
             </button>
           )}
 
-          {/* Merge — when agent has an unmerged branch */}
-          {branchAgent && (
-            <button
-              onClick={async () => {
-                setMerging(true);
-                setError(null);
-                const result = await mergeAgentBranch(branchAgent.id);
-                if (result.ok) {
-                  await selectPlan(planName);
-                } else {
-                  setError(result.error ?? "Merge failed");
-                }
-                setMerging(false);
-              }}
-              disabled={merging}
-              className="px-2 py-1 text-xs bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white rounded transition"
-              title={`Merge branch ${branchAgent.branch} into ${branchAgent.source_branch ?? "main"}`}
-            >
-              {merging ? "..." : "Merge"}
-            </button>
-          )}
         </div>
       </div>
 
-      {/* Branch indicator */}
+      {/* Branch banner — prominent when there's a pending branch to merge */}
       {branchAgent?.branch && (
-        <div className="mt-1.5 flex items-center gap-1.5 text-[10px]">
-          <span className="text-indigo-400">&#9739;</span>
-          <span className="font-mono text-indigo-400/70 truncate" title={branchAgent.branch}>
-            {branchAgent.branch}
-          </span>
-          <span className="text-gray-600">&#8594; {branchAgent.source_branch ?? "main"}</span>
+        <div className="mt-2 flex items-center gap-2 bg-indigo-950/40 border border-indigo-800/40 rounded px-2 py-1.5">
+          <span className="text-indigo-400 text-[10px]">&#9739;</span>
+          <div className="flex-1 min-w-0">
+            <div className="text-[10px] font-mono text-indigo-300/90 truncate" title={branchAgent.branch}>
+              {branchAgent.branch}
+            </div>
+            <div className="text-[9px] text-gray-600">
+              &#8594; {branchAgent.source_branch ?? "main"}
+            </div>
+          </div>
+          <button
+            onClick={async () => {
+              setMerging(true);
+              setError(null);
+              const result = await mergeAgentBranch(branchAgent.id);
+              if (result.ok) {
+                await selectPlan(planName);
+              } else {
+                setError(result.error ?? "Merge failed");
+              }
+              setMerging(false);
+            }}
+            disabled={merging}
+            className="flex-shrink-0 px-2 py-1 text-xs bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white rounded transition"
+            title={`Merge branch ${branchAgent.branch} into ${branchAgent.source_branch ?? "main"}`}
+          >
+            {merging ? "..." : "Merge"}
+          </button>
         </div>
       )}
 
