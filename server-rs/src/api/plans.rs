@@ -26,6 +26,8 @@ struct PlanListEntry {
     done_count: usize,
     created_at: String,
     modified_at: String,
+    total_cost_usd: f64,
+    max_budget_usd: Option<f64>,
 }
 
 pub async fn list_plans(State(state): State<AppState>) -> impl IntoResponse {
@@ -42,6 +44,31 @@ pub async fn list_plans(State(state): State<AppState>) -> impl IntoResponse {
     {
         for row in rows.flatten() {
             overrides.insert(row.0, row.1);
+        }
+    }
+
+    // Aggregate cost per plan in one query
+    let mut plan_costs: HashMap<String, f64> = HashMap::new();
+    if let Ok(mut stmt) = db.prepare(
+        "SELECT plan_name, COALESCE(SUM(cost_usd), 0) FROM agents \
+         WHERE plan_name IS NOT NULL AND cost_usd IS NOT NULL GROUP BY plan_name",
+    ) && let Ok(rows) = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+    }) {
+        for row in rows.flatten() {
+            plan_costs.insert(row.0, row.1);
+        }
+    }
+
+    // Load all plan budgets
+    let mut plan_budgets: HashMap<String, f64> = HashMap::new();
+    if let Ok(mut stmt) = db.prepare("SELECT plan_name, max_budget_usd FROM plan_budget")
+        && let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })
+    {
+        for row in rows.flatten() {
+            plan_budgets.insert(row.0, row.1);
         }
     }
 
@@ -80,6 +107,8 @@ pub async fn list_plans(State(state): State<AppState>) -> impl IntoResponse {
                 .unwrap_or(0);
 
             let project = overrides.get(&s.name).cloned().or(s.project);
+            let total_cost_usd = plan_costs.get(&s.name).copied().unwrap_or(0.0);
+            let max_budget_usd = plan_budgets.get(&s.name).copied();
 
             PlanListEntry {
                 name: s.name,
@@ -90,6 +119,8 @@ pub async fn list_plans(State(state): State<AppState>) -> impl IntoResponse {
                 done_count,
                 created_at: s.created_at,
                 modified_at: s.modified_at,
+                total_cost_usd,
+                max_budget_usd,
             }
         })
         .collect();
@@ -168,6 +199,46 @@ pub async fn get_plan(
         plan.project = Some(project);
     }
 
+    // Aggregate agent costs per task and total for this plan
+    let mut task_costs: HashMap<String, f64> = HashMap::new();
+    if let Ok(mut stmt) = db.prepare(
+        "SELECT task_id, COALESCE(SUM(cost_usd), 0) FROM agents \
+         WHERE plan_name = ? AND task_id IS NOT NULL AND cost_usd IS NOT NULL GROUP BY task_id",
+    ) && let Ok(rows) = stmt.query_map(params![name], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+    }) {
+        for row in rows.flatten() {
+            task_costs.insert(row.0, row.1);
+        }
+    }
+
+    let plan_total: f64 = db
+        .query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM agents \
+             WHERE plan_name = ? AND cost_usd IS NOT NULL",
+            params![name],
+            |row| row.get::<_, f64>(0),
+        )
+        .unwrap_or(0.0);
+
+    plan.total_cost_usd = Some(plan_total);
+    for phase in &mut plan.phases {
+        for task in &mut phase.tasks {
+            if let Some(c) = task_costs.get(&task.number) {
+                task.cost_usd = Some(*c);
+            }
+        }
+    }
+
+    // Load budget for this plan
+    plan.max_budget_usd = db
+        .query_row(
+            "SELECT max_budget_usd FROM plan_budget WHERE plan_name = ?",
+            params![name],
+            |row| row.get::<_, f64>(0),
+        )
+        .ok();
+
     Json(serde_json::to_value(plan).unwrap()).into_response()
 }
 
@@ -206,6 +277,48 @@ pub async fn set_project(
             "ok": true,
             "plan_name": name,
             "project": body.project,
+        })),
+    )
+}
+
+// ── PUT /api/plans/:name/budget ──────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BudgetBody {
+    /// Set to null to clear the budget.
+    max_budget_usd: Option<f64>,
+}
+
+pub async fn set_budget(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<BudgetBody>,
+) -> impl IntoResponse {
+    let db = state.db.lock().unwrap();
+    match body.max_budget_usd {
+        Some(v) if v > 0.0 => {
+            db.execute(
+                "INSERT INTO plan_budget (plan_name, max_budget_usd, updated_at)
+                 VALUES (?1, ?2, datetime('now'))
+                 ON CONFLICT(plan_name)
+                 DO UPDATE SET max_budget_usd = excluded.max_budget_usd, updated_at = excluded.updated_at",
+                params![name, v],
+            )
+            .ok();
+        }
+        _ => {
+            db.execute("DELETE FROM plan_budget WHERE plan_name = ?", params![name])
+                .ok();
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "planName": name,
+            "maxBudgetUsd": body.max_budget_usd,
         })),
     )
 }
@@ -579,6 +692,46 @@ pub async fn start_task(
         }
     };
 
+    // Compute per-agent budget headroom. If plan has a max budget and it's
+    // already exhausted, block the start. Otherwise pass the remaining budget
+    // to the spawned agent so it self-terminates on overrun.
+    let remaining_budget: Option<f64> = {
+        let db = state.db.lock().unwrap();
+        let budget: Option<f64> = db
+            .query_row(
+                "SELECT max_budget_usd FROM plan_budget WHERE plan_name = ?",
+                params![body.plan_name],
+                |row| row.get::<_, f64>(0),
+            )
+            .ok();
+        match budget {
+            Some(max) => {
+                let spent: f64 = db
+                    .query_row(
+                        "SELECT COALESCE(SUM(cost_usd), 0) FROM agents \
+                         WHERE plan_name = ? AND cost_usd IS NOT NULL",
+                        params![body.plan_name],
+                        |row| row.get::<_, f64>(0),
+                    )
+                    .unwrap_or(0.0);
+                if spent >= max {
+                    return (
+                        StatusCode::PAYMENT_REQUIRED,
+                        Json(serde_json::json!({
+                            "error": "budget_exceeded",
+                            "message": format!("Plan budget of ${max:.2} exhausted (spent ${spent:.2})"),
+                            "spentUsd": spent,
+                            "maxBudgetUsd": max,
+                        })),
+                    )
+                        .into_response();
+                }
+                Some((max - spent).max(0.0))
+            }
+            None => None,
+        }
+    };
+
     let is_continue = body.mode.as_deref() == Some("continue");
     let home = dirs::home_dir().unwrap();
     let work_dir = body.cwd.map(std::path::PathBuf::from).unwrap_or_else(|| {
@@ -660,6 +813,7 @@ pub async fn start_task(
             effort,
             branch: Some(&branch_name),
             is_continue,
+            max_budget_usd: remaining_budget,
         },
     )
     .await;
@@ -914,6 +1068,7 @@ pub async fn create_plan(
             effort,
             branch: None,
             is_continue: false,
+            max_budget_usd: None,
         },
     )
     .await;
@@ -1011,10 +1166,13 @@ pub async fn update_plan(
                         dependencies: t.dependencies,
                         status: None,
                         status_updated_at: None,
+                        cost_usd: None,
                     })
                     .collect(),
             })
             .collect(),
+        total_cost_usd: None,
+        max_budget_usd: None,
     };
 
     // Always write as YAML

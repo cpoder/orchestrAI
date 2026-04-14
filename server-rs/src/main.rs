@@ -120,6 +120,10 @@ async fn main() {
             axum::routing::put(api::plans::set_project),
         )
         .route(
+            "/api/plans/{name}/budget",
+            axum::routing::put(api::plans::set_budget),
+        )
+        .route(
             "/api/plans/{name}/tasks/{task_number}/status",
             axum::routing::put(api::plans::set_task_status),
         )

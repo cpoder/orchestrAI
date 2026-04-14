@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { usePlanStore } from "../stores/plan-store.js";
-import { postJson } from "../api.js";
+import { usePlanStore, type ParsedPlan } from "../stores/plan-store.js";
+import { postJson, putJson } from "../api.js";
 import { PhaseCard } from "./PhaseCard.js";
 import { EditableText } from "./EditableText.js";
 
@@ -139,6 +139,15 @@ export function PlanBoard() {
               <span className="text-amber-400 ml-1"> | {inProgress} in progress</span>
             )}
           </span>
+          {plan.totalCostUsd != null && plan.totalCostUsd > 0 && (
+            <span
+              className="text-xs text-amber-400 bg-amber-900/20 border border-amber-800/30 px-2 py-0.5 rounded"
+              title="Total agent cost for this plan"
+            >
+              Total cost: ${plan.totalCostUsd.toFixed(2)}
+            </span>
+          )}
+          <BudgetBadge plan={plan} />
         </div>
         <div className="flex items-center gap-3 mt-2">
           <div className="text-sm text-gray-400 max-w-3xl flex-1">
@@ -232,5 +241,120 @@ export function PlanBoard() {
         ))}
       </div>
     </div>
+  );
+}
+
+function BudgetBadge({ plan }: { plan: ParsedPlan }) {
+  const selectPlan = usePlanStore((s) => s.selectPlan);
+  const fetchPlans = usePlanStore((s) => s.fetchPlans);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(
+    plan.maxBudgetUsd != null ? String(plan.maxBudgetUsd) : ""
+  );
+  const [saving, setSaving] = useState(false);
+
+  const spent = plan.totalCostUsd ?? 0;
+  const max = plan.maxBudgetUsd ?? null;
+  const pct = max != null && max > 0 ? (spent / max) * 100 : 0;
+  const exceeded = max != null && spent >= max;
+  const approaching = max != null && !exceeded && pct >= 80;
+
+  async function save(value: number | null) {
+    setSaving(true);
+    try {
+      await putJson(`/api/plans/${plan.name}/budget`, {
+        maxBudgetUsd: value,
+      });
+      await selectPlan(plan.name);
+      await fetchPlans();
+      setEditing(false);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (editing) {
+    return (
+      <span className="text-xs bg-gray-800 border border-gray-700 rounded px-2 py-0.5 flex items-center gap-1.5">
+        <span className="text-gray-500">Budget $</span>
+        <input
+          autoFocus
+          type="number"
+          min="0"
+          step="0.01"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              const v = parseFloat(draft);
+              save(Number.isFinite(v) && v > 0 ? v : null);
+            } else if (e.key === "Escape") {
+              setEditing(false);
+            }
+          }}
+          className="bg-gray-900 border border-gray-700 rounded px-1 py-0 w-16 text-xs text-gray-200 outline-none focus:border-indigo-500"
+          disabled={saving}
+        />
+        <button
+          onClick={() => {
+            const v = parseFloat(draft);
+            save(Number.isFinite(v) && v > 0 ? v : null);
+          }}
+          disabled={saving}
+          className="text-emerald-400 hover:text-emerald-300"
+        >
+          save
+        </button>
+        {max != null && (
+          <button
+            onClick={() => save(null)}
+            disabled={saving}
+            className="text-gray-500 hover:text-red-400"
+            title="Clear budget"
+          >
+            clear
+          </button>
+        )}
+      </span>
+    );
+  }
+
+  if (max == null) {
+    return (
+      <button
+        onClick={() => setEditing(true)}
+        className="text-xs text-gray-500 hover:text-indigo-400 bg-gray-800/50 border border-dashed border-gray-700 px-2 py-0.5 rounded"
+        title="Set a maximum budget for this plan"
+      >
+        + Set budget
+      </button>
+    );
+  }
+
+  const classes = exceeded
+    ? "text-red-400 bg-red-900/20 border-red-800/40"
+    : approaching
+    ? "text-amber-300 bg-amber-900/30 border-amber-700/50"
+    : "text-emerald-400 bg-emerald-900/20 border-emerald-800/30";
+
+  return (
+    <button
+      onClick={() => {
+        setDraft(String(max));
+        setEditing(true);
+      }}
+      className={`text-xs px-2 py-0.5 rounded border ${classes}`}
+      title={
+        exceeded
+          ? "Budget exceeded -- new agents are blocked"
+          : approaching
+          ? `Approaching budget limit (${pct.toFixed(0)}%)`
+          : `Under budget (${pct.toFixed(0)}%)`
+      }
+    >
+      {exceeded
+        ? `Budget exceeded: $${spent.toFixed(2)} / $${max.toFixed(2)}`
+        : `Budget: $${spent.toFixed(2)} / $${max.toFixed(2)}`}
+    </button>
   );
 }

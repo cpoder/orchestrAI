@@ -27,6 +27,7 @@ pub struct StartPtyOpts<'a> {
     pub effort: Effort,
     pub branch: Option<&'a str>,
     pub is_continue: bool,
+    pub max_budget_usd: Option<f64>,
 }
 
 pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -> String {
@@ -38,6 +39,7 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
         effort,
         branch,
         is_continue,
+        max_budget_usd,
     } = opts;
     let id = uuid::Uuid::new_v4().to_string();
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -74,11 +76,15 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
     }
 
     // Create tmux session running claude
+    let budget_flag = max_budget_usd
+        .map(|v| format!(" --max-budget-usd {v}"))
+        .unwrap_or_default();
     let claude_cmd = format!(
-        "claude --session-id {} --add-dir {} --verbose --effort {}",
+        "claude --session-id {} --add-dir {} --verbose --effort {}{}",
         session_id,
         shell_escape(cwd.to_str().unwrap_or(".")),
         effort,
+        budget_flag,
     );
 
     let status = Command::new("tmux")
@@ -295,22 +301,107 @@ async fn attach_to_tmux(registry: &AgentRegistry, agent_id: &str, tmux_name: &st
             // Parse cost from recent PTY output (Claude Code prints "Total cost: $X.XX")
             let cost_usd = parse_cost_from_pty_output(&db, &id);
 
-            let db_guard = db.lock().unwrap();
-            db_guard.execute(
-                "UPDATE agents SET status = 'completed', finished_at = datetime('now'), cost_usd = ?2 WHERE id = ?1 AND status = 'running'",
-                params![id, cost_usd],
-            ).ok();
-            drop(db_guard);
+            let over_budget_plan: Option<String> = {
+                let db_guard = db.lock().unwrap();
+                db_guard.execute(
+                    "UPDATE agents SET status = 'completed', finished_at = datetime('now'), cost_usd = ?2 WHERE id = ?1 AND status = 'running'",
+                    params![id, cost_usd],
+                ).ok();
+
+                // If this agent belongs to a plan with a budget, check whether
+                // the plan is now over budget. If so, we'll kill the rest.
+                db_guard
+                    .query_row(
+                        "SELECT a.plan_name FROM agents a \
+                         JOIN plan_budget b ON b.plan_name = a.plan_name \
+                         WHERE a.id = ?1 \
+                           AND (SELECT COALESCE(SUM(cost_usd), 0) FROM agents \
+                                WHERE plan_name = a.plan_name AND cost_usd IS NOT NULL) >= b.max_budget_usd",
+                        params![id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+            };
+
             agents.blocking_lock().remove(&id);
             broadcast_event(
                 &tx,
                 "agent_stopped",
                 serde_json::json!({"id": id, "status": "completed", "exit_code": 0}),
             );
+
+            if let Some(plan) = over_budget_plan {
+                kill_plan_agents(&db, &tx, &plan);
+            }
         }
     });
 
     Some(())
+}
+
+/// Kill all running agents belonging to a plan that has exceeded its budget.
+/// Marks them as 'killed' with reason 'budget_exceeded'.
+fn kill_plan_agents(
+    db: &crate::db::Db,
+    tx: &tokio::sync::broadcast::Sender<String>,
+    plan_name: &str,
+) {
+    let victims: Vec<(String, Option<i64>, Option<String>)> = {
+        let db = db.lock().unwrap();
+        let mut stmt = match db.prepare(
+            "SELECT id, pid, mode FROM agents \
+             WHERE plan_name = ? AND status IN ('running', 'starting')",
+        ) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        stmt.query_map(params![plan_name], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .ok()
+        .map(|rs| rs.flatten().collect())
+        .unwrap_or_default()
+    };
+
+    for (id, pid, _mode) in victims {
+        // Kill tmux session if it exists
+        let tmux_name = tmux_session_name(&id);
+        Command::new("tmux")
+            .args(["kill-session", "-t", &tmux_name])
+            .status()
+            .ok();
+        if let Some(p) = pid {
+            unsafe {
+                libc::kill(p as i32, libc::SIGTERM);
+            }
+        }
+        let db_guard = db.lock().unwrap();
+        db_guard
+            .execute(
+                "UPDATE agents SET status = 'killed', finished_at = datetime('now') WHERE id = ?",
+                params![id],
+            )
+            .ok();
+        drop(db_guard);
+        broadcast_event(
+            tx,
+            "agent_stopped",
+            serde_json::json!({
+                "id": id,
+                "status": "killed",
+                "reason": "budget_exceeded",
+            }),
+        );
+        println!(
+            "[orchestrAI] Killed agent {} -- plan '{}' exceeded budget",
+            &id[..8.min(id.len())],
+            plan_name
+        );
+    }
 }
 
 fn send_to_tmux(session: &str, text: &str) {

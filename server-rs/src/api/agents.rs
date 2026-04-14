@@ -282,10 +282,8 @@ pub async fn merge_agent_branch(
             // Clear branch in DB so the UI hides the Merge button
             {
                 let db = state.db.lock().unwrap();
-                db.execute(
-                    "UPDATE agents SET branch = NULL WHERE id = ?",
-                    params![id],
-                ).ok();
+                db.execute("UPDATE agents SET branch = NULL WHERE id = ?", params![id])
+                    .ok();
             }
 
             // Broadcast so connected dashboards update immediately
@@ -400,10 +398,8 @@ pub async fn discard_agent_branch(
             // Clear branch in DB
             {
                 let db = state.db.lock().unwrap();
-                db.execute(
-                    "UPDATE agents SET branch = NULL WHERE id = ?",
-                    params![id],
-                ).ok();
+                db.execute("UPDATE agents SET branch = NULL WHERE id = ?", params![id])
+                    .ok();
             }
 
             crate::ws::broadcast_event(

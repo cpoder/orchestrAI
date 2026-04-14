@@ -21,6 +21,8 @@ pub struct PlanTask {
     pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +45,10 @@ pub struct ParsedPlan {
     pub created_at: String,
     pub modified_at: String,
     pub phases: Vec<PlanPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_budget_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,6 +295,7 @@ pub fn parse_plan_markdown(raw: &str, name: &str, file_path: &str) -> ParsedPlan
                 dependencies: Vec::new(),
                 status: None,
                 status_updated_at: None,
+                cost_usd: None,
             });
         }
 
@@ -311,6 +318,8 @@ pub fn parse_plan_markdown(raw: &str, name: &str, file_path: &str) -> ParsedPlan
         created_at: String::new(),
         modified_at: String::new(),
         phases,
+        total_cost_usd: None,
+        max_budget_usd: None,
     }
 }
 
@@ -387,6 +396,7 @@ fn parse_tasks_from_headings(body: &str) -> Vec<PlanTask> {
             dependencies: Vec::new(),
             status: None,
             status_updated_at: None,
+            cost_usd: None,
         });
     }
     tasks
@@ -412,6 +422,7 @@ fn parse_tasks_from_bullets(body: &str, phase_num: u32) -> Vec<PlanTask> {
             dependencies: Vec::new(),
             status: None,
             status_updated_at: None,
+            cost_usd: None,
         });
         idx += 1;
     }
@@ -439,6 +450,7 @@ pub fn parse_plan_yaml(raw: &str, name: &str, file_path: &str) -> Result<ParsedP
                     dependencies: t.dependencies,
                     status: None,
                     status_updated_at: None,
+                    cost_usd: None,
                 })
                 .collect();
 
@@ -460,6 +472,8 @@ pub fn parse_plan_yaml(raw: &str, name: &str, file_path: &str) -> Result<ParsedP
         created_at: yaml.created_at.unwrap_or_default(),
         modified_at: String::new(),
         phases,
+        total_cost_usd: None,
+        max_budget_usd: None,
     })
 }
 

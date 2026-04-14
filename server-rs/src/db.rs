@@ -84,6 +84,12 @@ fn migrate(conn: &Connection) {
             updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY (plan_name, task_number)
         );
+
+        CREATE TABLE IF NOT EXISTS plan_budget (
+            plan_name      TEXT PRIMARY KEY,
+            max_budget_usd REAL NOT NULL,
+            updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+        );
         ",
     )
     .expect("failed to run schema migration");
