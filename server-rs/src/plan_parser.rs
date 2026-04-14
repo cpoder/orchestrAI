@@ -921,8 +921,10 @@ Just patch the file at `src/lib.rs` and move on.
 
     #[test]
     fn rust_rewrite_plan_structure() {
-        let plan_path =
-            match dirs::home_dir() { Some(h) => h.join(".claude/plans/orchestrai-rust-rewrite.md"), None => return };
+        let plan_path = match dirs::home_dir() {
+            Some(h) => h.join(".claude/plans/orchestrai-rust-rewrite.md"),
+            None => return,
+        };
         if !plan_path.exists() {
             return;
         }
