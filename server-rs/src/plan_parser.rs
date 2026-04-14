@@ -900,7 +900,9 @@ Just patch the file at `src/lib.rs` and move on.
 
     #[test]
     fn parses_real_plan_files() {
-        let plans_dir = std::path::Path::new(env!("HOME")).join(".claude/plans");
+        let Some(plans_dir) = dirs::home_dir().map(|h| h.join(".claude/plans")) else {
+            return;
+        };
         if !plans_dir.exists() {
             return;
         }
@@ -920,7 +922,7 @@ Just patch the file at `src/lib.rs` and move on.
     #[test]
     fn rust_rewrite_plan_structure() {
         let plan_path =
-            std::path::Path::new(env!("HOME")).join(".claude/plans/orchestrai-rust-rewrite.md");
+            match dirs::home_dir() { Some(h) => h.join(".claude/plans/orchestrai-rust-rewrite.md"), None => return };
         if !plan_path.exists() {
             return;
         }
@@ -960,7 +962,9 @@ Just patch the file at `src/lib.rs` and move on.
             ("witty-wishing-nygaard", None),
         ];
 
-        let plans_dir = std::path::Path::new(env!("HOME")).join(".claude/plans");
+        let Some(plans_dir) = dirs::home_dir().map(|h| h.join(".claude/plans")) else {
+            return;
+        };
         if !plans_dir.exists() {
             return;
         }
@@ -1322,7 +1326,9 @@ phases:
 
     #[test]
     fn project_inference_all_plans() {
-        let plans_dir = std::path::Path::new(env!("HOME")).join(".claude/plans");
+        let Some(plans_dir) = dirs::home_dir().map(|h| h.join(".claude/plans")) else {
+            return;
+        };
         if !plans_dir.exists() {
             return;
         }

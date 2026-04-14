@@ -557,17 +557,16 @@ mod tests {
         #[cfg(windows)]
         {
             for _ in 0..50 {
-                if let Ok(name) = socket_name(socket) {
-                    if ConnectOptions::new()
+                if let Ok(name) = socket_name(socket)
+                    && ConnectOptions::new()
                         .name(name)
                         .connect_tokio()
                         .await
                         .is_ok()
-                    {
-                        // Give the listener a beat to settle; probe stream is dropped.
-                        tokio::time::sleep(Duration::from_millis(40)).await;
-                        return;
-                    }
+                {
+                    // Give the listener a beat to settle; probe stream is dropped.
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    return;
                 }
                 tokio::time::sleep(Duration::from_millis(40)).await;
             }
