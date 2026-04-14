@@ -11,6 +11,7 @@ export interface PlanTask {
   status?: string;
   statusUpdatedAt?: string;
   agentId?: string;
+  costUsd?: number;
 }
 
 export interface PlanPhase {
@@ -29,6 +30,8 @@ export interface ParsedPlan {
   createdAt: string;
   modifiedAt: string;
   phases: PlanPhase[];
+  totalCostUsd?: number;
+  maxBudgetUsd?: number | null;
 }
 
 export interface PlanSummary {
@@ -40,6 +43,8 @@ export interface PlanSummary {
   doneCount: number;
   createdAt: string;
   modifiedAt: string;
+  totalCostUsd?: number;
+  maxBudgetUsd?: number | null;
 }
 
 export interface PlanWarning {
@@ -76,9 +81,18 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
   },
 
   selectPlan: async (name: string) => {
-    set({ loading: true });
-    const plan = await fetchJson<ParsedPlan>(`/api/plans/${name}`);
-    set({ selectedPlan: plan, loading: false });
+    // Only show loading state when switching to a different plan — refreshing
+    // the current plan updates silently to avoid unmount/scroll reset.
+    const { selectedPlan } = get();
+    const isRefresh = selectedPlan?.name === name;
+    if (!isRefresh) set({ loading: true });
+    try {
+      const plan = await fetchJson<ParsedPlan>(`/api/plans/${name}`);
+      set({ selectedPlan: plan, loading: false });
+    } catch (e) {
+      set({ loading: false });
+      throw e;
+    }
   },
 
   updatePlan: (plan: ParsedPlan) => {
