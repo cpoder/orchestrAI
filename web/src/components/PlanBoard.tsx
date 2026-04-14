@@ -4,16 +4,10 @@ import { postJson, putJson } from "../api.js";
 import { PhaseCard } from "./PhaseCard.js";
 import { EditableText } from "./EditableText.js";
 
-interface SyncResult {
-  summary: { total: number; completed: number; in_progress: number; pending: number };
-}
-
 export function PlanBoard() {
   const plan = usePlanStore((s) => s.selectedPlan);
   const loading = usePlanStore((s) => s.loading);
   const selectPlan = usePlanStore((s) => s.selectPlan);
-  const [syncing, setSyncing] = useState(false);
-  const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
   const [converting, setConverting] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [checkingAll, setCheckingAll] = useState(false);
@@ -42,27 +36,6 @@ export function PlanBoard() {
   ).length;
   const inProgress = allTasks.filter((t) => t.status === "in_progress").length;
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-
-  async function handleSync() {
-    setSyncing(true);
-    setSyncResult(null);
-    setError(null);
-    try {
-      const result = await postJson<SyncResult>(
-        `/api/plans/${plan!.name}/auto-status`,
-        {}
-      );
-      setSyncResult(result);
-      // Refresh plan to get updated statuses
-      await selectPlan(plan!.name);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(`Sync failed: ${msg}`);
-      console.error("Sync failed:", e);
-    } finally {
-      setSyncing(false);
-    }
-  }
 
   async function handleReset() {
     if (!plan) return;
@@ -194,14 +167,6 @@ export function PlanBoard() {
             </button>
           )}
           <button
-            onClick={handleSync}
-            disabled={syncing || !plan.project}
-            className="flex-shrink-0 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 hover:border-indigo-600 hover:text-indigo-400 disabled:opacity-50 disabled:hover:border-gray-700 disabled:hover:text-gray-400 text-gray-300 rounded transition"
-            title={plan.project ? "Scan project files and git history to detect task statuses" : "Set a project first to enable auto-detection"}
-          >
-            {syncing ? "Scanning..." : "Sync Status"}
-          </button>
-          <button
             onClick={handleCheckAll}
             disabled={checkingAll || !plan.project}
             className="flex-shrink-0 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 hover:border-emerald-600 hover:text-emerald-400 disabled:opacity-50 disabled:hover:border-gray-700 disabled:hover:text-gray-400 text-gray-300 rounded transition"
@@ -223,17 +188,6 @@ export function PlanBoard() {
           <div className="mt-2 text-xs text-red-400 bg-red-900/20 border border-red-800/30 rounded px-3 py-2 inline-flex items-center gap-2">
             <span>{error}</span>
             <button onClick={() => setError(null)} className="text-red-600 hover:text-red-400 ml-2">
-              dismiss
-            </button>
-          </div>
-        )}
-        {/* Sync result toast */}
-        {syncResult && (
-          <div className="mt-2 text-xs text-gray-400 bg-gray-800/50 border border-gray-700 rounded px-3 py-2 inline-flex items-center gap-3">
-            <span className="text-emerald-400">{syncResult.summary.completed} done</span>
-            <span className="text-amber-400">{syncResult.summary.in_progress} active</span>
-            <span className="text-gray-500">{syncResult.summary.pending} pending</span>
-            <button onClick={() => setSyncResult(null)} className="text-gray-600 hover:text-gray-400 ml-2">
               dismiss
             </button>
           </div>

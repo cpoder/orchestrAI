@@ -37,27 +37,10 @@ export function Sidebar({ view, onViewChange }: Props) {
   const activeCount = agents.filter(
     (a) => a.status === "running" || a.status === "starting"
   ).length;
-  const [syncingAll, setSyncingAll] = useState(false);
   const [convertingAll, setConvertingAll] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [showDone, setShowDone] = useState<Record<string, boolean>>({});
   const [search, setSearch] = useState("");
-
-  async function handleSyncAll() {
-    setSyncingAll(true);
-    setActionError(null);
-    try {
-      await postJson("/api/plans/sync-all", {});
-      await fetchPlans();
-      if (selectedPlan) await selectPlan(selectedPlan.name);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setActionError(`Sync failed: ${msg}`);
-      console.error("Sync all failed:", e);
-    } finally {
-      setSyncingAll(false);
-    }
-  }
 
   const hasMdPlans = plans.some((p) => p.name && !p.name.endsWith(".yaml"));
 
@@ -188,27 +171,20 @@ export function Sidebar({ view, onViewChange }: Props) {
         </button>
       </nav>
 
-      {/* Sync all button */}
+      {/* Global actions */}
       <div className="px-2 pb-2">
-        <button
-          onClick={handleSyncAll}
-          disabled={syncingAll}
-          className="w-full px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 hover:border-indigo-600 hover:text-indigo-400 disabled:opacity-50 text-gray-400 rounded transition"
-        >
-          {syncingAll ? "Scanning projects..." : "Sync All Statuses"}
-        </button>
         {hasMdPlans && (
           <button
             onClick={handleConvertAll}
             disabled={convertingAll}
-            className="w-full px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 hover:border-amber-600 hover:text-amber-400 disabled:opacity-50 text-gray-400 rounded transition mt-1"
+            className="w-full px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 hover:border-amber-600 hover:text-amber-400 disabled:opacity-50 text-gray-400 rounded transition"
           >
             {convertingAll ? "Converting..." : "Convert All to YAML"}
           </button>
         )}
         <button
           onClick={() => onViewChange("new-plan")}
-          className={`w-full px-3 py-1.5 text-xs border rounded transition mt-1 ${
+          className={`w-full px-3 py-1.5 text-xs border rounded transition ${hasMdPlans ? "mt-1" : ""} ${
             view === "new-plan"
               ? "bg-indigo-600 border-indigo-600 text-white"
               : "bg-gray-800 border-gray-700 hover:border-indigo-600 hover:text-indigo-400 text-gray-400"

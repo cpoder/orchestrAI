@@ -1,5 +1,6 @@
 pub mod check_agent;
 pub mod pty_agent;
+pub mod session_protocol;
 pub mod terminal_ws;
 
 use std::collections::HashMap;
