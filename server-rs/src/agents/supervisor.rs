@@ -499,12 +499,15 @@ async fn handle_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(windows))]
     use interprocess::local_socket::ConnectOptions;
+    #[cfg(not(windows))]
     use std::time::Duration;
 
     /// Shell command that works on the current platform. Tests run through
     /// the PTY so we need a real shell; `/bin/sh` on Unix and `cmd.exe` on
     /// Windows are both guaranteed present on their respective CI runners.
+    #[cfg(not(windows))]
     fn shell(body: &str) -> Vec<String> {
         #[cfg(unix)]
         {
@@ -518,6 +521,7 @@ mod tests {
 
     /// Short delay, via shell built-ins. On Unix this is `sleep 0.4`; on
     /// Windows we pipe to `ping` since `timeout` misbehaves under ConPTY.
+    #[cfg(not(windows))]
     fn sleep_fragment_short() -> &'static str {
         #[cfg(unix)]
         {
@@ -530,6 +534,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     fn echo_line(text: &str) -> String {
         #[cfg(unix)]
         {
@@ -541,6 +546,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     async fn wait_for_socket(socket: &Path) {
         // On Unix the socket is a real file path, so `exists()` works. On
         // Windows named pipes aren't file-system visible, so we instead
@@ -573,6 +579,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     async fn connect_client(socket: &Path) -> LocalStream {
         let name = socket_name(socket).expect("socket name");
         ConnectOptions::new()
@@ -582,6 +589,7 @@ mod tests {
             .expect("connect local socket")
     }
 
+    #[cfg(not(windows))]
     fn temp_socket(name: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join(name);
