@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { usePlanStore, type PlanSummary } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { useSettingsStore, type EffortLevel } from "../stores/settings-store.js";
@@ -203,6 +203,9 @@ export function Sidebar({ view, onViewChange }: Props) {
       {/* Effort level */}
       <EffortSelector />
 
+      {/* Driver auth status */}
+      <DriverStatusList />
+
       {/* Search */}
       <div className="px-2 pb-2">
         <input
@@ -316,6 +319,88 @@ function EffortSelector() {
           {l.label}
         </button>
       ))}
+    </div>
+  );
+}
+
+/// Compact driver auth status: one row per installed driver, showing whether
+/// it's ready to spawn agents. Rendered under the effort selector so users
+/// see auth problems without digging into a settings page.
+function DriverStatusList() {
+  const drivers = useSettingsStore((s) => s.drivers);
+  const fetchDrivers = useSettingsStore((s) => s.fetchDrivers);
+  const [expanded, setExpanded] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetchDrivers().catch(() => {
+      // Silently ignore — if /api/drivers is down we fall back to assuming ready.
+    });
+  }, [fetchDrivers]);
+
+  if (drivers.length === 0) return null;
+
+  return (
+    <div className="px-2 pb-2">
+      <div className="text-[9px] uppercase tracking-wider text-gray-600 mb-0.5 px-1">
+        Drivers
+      </div>
+      {drivers.map((d) => {
+        const auth = d.auth_status;
+        // Map auth kind → label + color. `unknown` is intentionally rendered
+        // as green because we assume ready when we can't introspect.
+        const kind = auth?.kind ?? "unknown";
+        const tone =
+          kind === "not_installed" || kind === "unauthenticated"
+            ? "text-red-400"
+            : kind === "api_key" || kind === "oauth" || kind === "cloud_provider"
+              ? "text-emerald-400"
+              : "text-gray-500";
+        const label =
+          kind === "not_installed"
+            ? "not installed"
+            : kind === "unauthenticated"
+              ? "needs auth"
+              : kind === "oauth"
+                ? auth && "account" in auth && auth.account
+                  ? auth.account.toLowerCase()
+                  : "signed in"
+                : kind === "api_key"
+                  ? "API key"
+                  : kind === "cloud_provider"
+                    ? auth && "provider" in auth
+                      ? auth.provider
+                      : "cloud"
+                    : "unknown";
+        const canExpand =
+          auth?.kind === "unauthenticated" || auth?.kind === "not_installed";
+        const isExpanded = expanded === d.name;
+        const help =
+          auth?.kind === "unauthenticated"
+            ? auth.help
+            : auth?.kind === "not_installed"
+              ? `Install the \`${d.binary}\` CLI and make sure it's on your PATH.`
+              : "";
+        return (
+          <div key={d.name} className="text-[10px]">
+            <button
+              onClick={() => canExpand && setExpanded(isExpanded ? null : d.name)}
+              disabled={!canExpand}
+              className={`w-full flex items-center justify-between px-1 py-0.5 rounded transition ${
+                canExpand ? "hover:bg-gray-800 cursor-pointer" : "cursor-default"
+              }`}
+              title={help || undefined}
+            >
+              <span className="text-gray-400">{d.name}</span>
+              <span className={`font-mono ${tone}`}>{label}</span>
+            </button>
+            {isExpanded && help && (
+              <div className="px-1 py-1 mt-0.5 bg-amber-950/30 border border-amber-800/30 rounded text-[10px] text-amber-300/80 whitespace-pre-wrap">
+                {help}
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

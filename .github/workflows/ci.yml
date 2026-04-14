@@ -11,8 +11,13 @@ env:
 
 jobs:
   server:
-    name: Rust — fmt, clippy, test, audit
-    runs-on: ubuntu-latest
+    name: Rust — ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Keep all OSes running even if one fails so we see the full matrix.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     defaults:
       run:
         working-directory: server-rs
@@ -32,26 +37,39 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             server-rs/target
-          key: ci-${{ hashFiles('server-rs/Cargo.lock') }}
-          restore-keys: ci-
+          key: ci-${{ matrix.os }}-${{ hashFiles('server-rs/Cargo.lock') }}
+          restore-keys: ci-${{ matrix.os }}-
 
       # The build embeds web/dist via rust-embed, so it must exist.
-      - name: Create web/dist placeholder
+      - name: Create web/dist placeholder (Unix)
+        if: runner.os != 'Windows'
         run: mkdir -p ../web/dist && touch ../web/dist/index.html
 
+      - name: Create web/dist placeholder (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ../web/dist | Out-Null
+          New-Item -ItemType File -Force -Path ../web/dist/index.html | Out-Null
+
       - name: cargo fmt --check
+        # Rustfmt output is identical across OSes; only run it once to save time.
+        if: runner.os != 'Windows'
         run: cargo fmt --check
 
       - name: cargo clippy
-        run: cargo clippy --release -- -D warnings
+        run: cargo clippy --release --all-targets -- -D warnings
 
       - name: cargo test
         run: cargo test --release
 
       - name: Install cargo-audit
+        # cargo-audit is a pure-Rust audit tool; we only need it once per run.
+        if: runner.os != 'Windows'
         run: cargo install cargo-audit --locked
 
       - name: cargo audit
+        if: runner.os != 'Windows'
         run: cargo audit
 
   web:

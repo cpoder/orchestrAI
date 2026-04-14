@@ -1,11 +1,12 @@
 pub mod check_agent;
+pub mod driver;
 pub mod pty_agent;
 pub mod session_protocol;
 pub mod supervisor;
 pub mod terminal_ws;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -13,8 +14,46 @@ use crate::config::Effort;
 use crate::db::{Db, completed_task_numbers};
 use crate::plan_parser::{self, ParsedPlan, PlanPhase, PlanTask};
 use crate::ws::broadcast_event;
+use driver::DriverRegistry;
+use session_protocol::Message as SessionMessage;
 
 pub type AgentId = String;
+
+/// Cross-platform "is this PID still alive" check.
+///
+/// On Unix we use `kill(pid, 0)` — it sends no signal but succeeds if the
+/// kernel would let us signal the process. On Windows we don't yet have a
+/// cheap PID-liveness primitive wired up, so we conservatively return
+/// `false` and let the caller treat the row as stale (cleanup_and_reattach
+/// will mark the agent `detached` and the operator can restart it).
+pub fn process_alive(pid: i64) -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Cross-platform "politely ask this PID to stop" (SIGTERM on Unix,
+/// `taskkill` on Windows). Best-effort — failures are swallowed.
+pub fn process_terminate(pid: i64) {
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T"])
+            .status();
+    }
+}
 
 /// Get the current HEAD commit SHA in the given directory.
 /// Returns None if the directory is not a git repo or git is unavailable.
@@ -179,16 +218,32 @@ pub struct AgentRegistry {
     /// Optional Slack/webhook URL. When set, agent-completion and phase-advance
     /// events fan out a POST here in addition to the in-process WS broadcast.
     pub webhook_url: Option<String>,
+    /// Directory where per-agent supervisor sockets (and their `.log` / `.pid`
+    /// siblings) live. Created on startup.
+    pub sockets_dir: PathBuf,
+    /// Absolute path to the running server binary. Used to respawn the
+    /// `session` subcommand as a detached daemon.
+    pub server_exe: PathBuf,
+    /// Available agent drivers, keyed by name. Built once at startup with
+    /// [`DriverRegistry::with_defaults`]; clones share the underlying Arc.
+    pub drivers: DriverRegistry,
 }
 
+/// In-process state for a live agent whose PTY runs inside a detached
+/// session daemon. Created during [`pty_agent::start_pty_agent`] and
+/// dropped on kill or PTY exit.
+///
+/// The socket path and daemon PID live in the DB (`agents.supervisor_socket`
+/// / `agents.pid`), not here — reconnect is always DB-driven so there's no
+/// benefit to duplicating them in memory.
 pub struct ManagedAgent {
-    /// Kept alive to prevent the child process from being dropped/killed.
-    #[allow(dead_code)]
-    pub pty: Option<Box<dyn portable_pty::Child + Send>>,
-    pub pty_writer: Option<Box<dyn std::io::Write + Send>>,
-    pub pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
-    pub tmux_session: Option<String>,
-    pub terminals: Vec<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    /// Channel into the writer task that frames messages (`Input`, `Resize`,
+    /// `Kill`) and sends them over the socket. Dropping this closes the
+    /// writer side and terminates the daemon connection.
+    pub command_tx: tokio::sync::mpsc::UnboundedSender<SessionMessage>,
+    /// Broadcast of PTY output bytes received from the supervisor. Each
+    /// attached terminal WebSocket subscribes for its own receiver.
+    pub output_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
 }
 
 impl AgentRegistry {
@@ -196,119 +251,241 @@ impl AgentRegistry {
         db: Db,
         broadcast_tx: tokio::sync::broadcast::Sender<String>,
         webhook_url: Option<String>,
+        sockets_dir: PathBuf,
+        server_exe: PathBuf,
     ) -> Self {
         Self {
             agents: Arc::new(Mutex::new(HashMap::new())),
             db,
             broadcast_tx,
             webhook_url,
+            sockets_dir,
+            server_exe,
+            drivers: DriverRegistry::with_defaults(),
         }
     }
 
-    /// Clean up dead agents and reattach alive ones (from previous server runs)
+    /// Resolve the per-agent socket path `<sockets_dir>/<id>.sock`.
+    pub fn socket_for(&self, agent_id: &str) -> PathBuf {
+        self.sockets_dir.join(format!("{agent_id}.sock"))
+    }
+
+    /// Clean up dead agents and reattach alive ones (from previous server runs).
+    ///
+    /// Three cases per row in `running|starting`:
+    /// 1. Has a `supervisor_socket` and the daemon PID is alive → try to
+    ///    reconnect. If the reconnect succeeds the agent is live again;
+    ///    otherwise it's marked `detached`.
+    /// 2. Has a `supervisor_socket` but the daemon PID is dead → the row
+    ///    is stale; mark `failed`.
+    /// 3. No `supervisor_socket` at all (pre-upgrade tmux row) → mark
+    ///    `detached` so the operator can kill and respawn without us
+    ///    guessing at tmux session names we no longer manage.
     pub async fn cleanup_and_reattach(&self) {
-        let stale: Vec<(String, i64)> = {
+        let rows: Vec<(String, Option<i64>, Option<String>, String)> = {
             let db = self.db.lock().unwrap();
             let mut stmt = db
-                .prepare("SELECT id, pid FROM agents WHERE status IN ('running', 'starting')")
+                .prepare(
+                    "SELECT id, pid, supervisor_socket, mode FROM agents \
+                     WHERE status IN ('running', 'starting')",
+                )
                 .unwrap();
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .flatten()
-                .collect()
+            stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .flatten()
+            .collect()
         };
 
-        for (id, pid) in stale {
-            let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+        for (id, pid, socket, mode) in rows {
+            // Stream-JSON check agents don't use a supervisor — their child
+            // process IS the claude CLI. Keep the old PID-liveness behaviour.
+            if mode != "pty" {
+                let alive = pid.map(process_alive).unwrap_or(false);
+                if !alive {
+                    let db = self.db.lock().unwrap();
+                    db.execute(
+                        "UPDATE agents SET status = 'failed', finished_at = datetime('now') WHERE id = ?",
+                        rusqlite::params![id],
+                    )
+                    .ok();
+                }
+                continue;
+            }
+
+            let socket_path = match socket.as_deref() {
+                Some(s) => PathBuf::from(s),
+                None => {
+                    // Pre-upgrade row — we never had a socket for this agent.
+                    self.mark_detached(&id, "no supervisor socket (pre-upgrade row)");
+                    continue;
+                }
+            };
+
+            let alive = pid.map(process_alive).unwrap_or(false);
             if !alive {
                 let db = self.db.lock().unwrap();
                 db.execute(
                     "UPDATE agents SET status = 'failed', finished_at = datetime('now') WHERE id = ?",
                     rusqlite::params![id],
-                ).ok();
+                )
+                .ok();
                 println!(
-                    "[orchestrAI] Cleaned stale agent {} (pid {}) — process dead",
-                    &id[..8],
+                    "[orchestrAI] Cleaned stale agent {} (pid {:?}) — daemon dead",
+                    &id[..8.min(id.len())],
                     pid
                 );
                 continue;
             }
 
-            // Check if tmux session still exists
-            let tmux_name = format!("oai-{}", &id[..8]);
-            let tmux_exists = std::process::Command::new("tmux")
-                .args(["has-session", "-t", &tmux_name])
-                .status()
-                .is_ok_and(|s| s.success());
-
-            if tmux_exists {
-                // Reattach!
-                pty_agent::reattach_agent(self, &id, &tmux_name).await;
-            } else {
+            if pty_agent::reattach_agent(self, &id, &socket_path, pid.unwrap_or(0) as u32).await {
                 println!(
-                    "[orchestrAI] Agent {} (pid {}) alive but no tmux session — detached",
-                    &id[..8],
-                    pid
+                    "[orchestrAI] Reattached agent {} → socket {}",
+                    &id[..8.min(id.len())],
+                    socket_path.display()
                 );
+            } else {
+                self.mark_detached(&id, "reconnect failed");
             }
         }
     }
 
-    pub async fn kill_agent(&self, agent_id: &str) -> bool {
-        // Try in-memory registry first (live agents)
-        let mut agents = self.agents.lock().await;
-        if let Some(agent) = agents.remove(agent_id) {
-            // Kill tmux session if it exists
-            if let Some(ref tmux) = agent.tmux_session {
-                std::process::Command::new("tmux")
-                    .args(["kill-session", "-t", tmux])
-                    .status()
-                    .ok();
-            }
+    /// Flip an agent to the `detached` status so the UI can offer a kill/
+    /// restart without pretending we still control the session.
+    fn mark_detached(&self, agent_id: &str, reason: &str) {
+        {
             let db = self.db.lock().unwrap();
             db.execute(
-                "UPDATE agents SET status = 'killed', finished_at = datetime('now') WHERE id = ?",
+                "UPDATE agents SET status = 'detached' WHERE id = ? AND status IN ('running', 'starting')",
                 rusqlite::params![agent_id],
             )
             .ok();
+        }
+        broadcast_event(
+            &self.broadcast_tx,
+            "agent_stopped",
+            serde_json::json!({
+                "id": agent_id,
+                "status": "detached",
+                "reason": reason,
+            }),
+        );
+        println!(
+            "[orchestrAI] Agent {} marked detached — {reason}",
+            &agent_id[..8.min(agent_id.len())]
+        );
+    }
+
+    /// Ask the agent's CLI to exit cleanly by sending its driver-specific
+    /// exit sequence (e.g. `/exit\r` for Claude Code) through the PTY.
+    /// Returns true if the sequence was sent; false if the agent is not
+    /// live in-process or the driver doesn't support clean exit.
+    pub async fn graceful_exit(&self, agent_id: &str) -> bool {
+        // Look up the driver for this agent so we know what to send.
+        let driver_name: Option<String> = {
+            let db = self.db.lock().unwrap();
+            db.query_row(
+                "SELECT driver FROM agents WHERE id = ?",
+                rusqlite::params![agent_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        };
+        let driver_name = driver_name.unwrap_or_else(|| driver::DEFAULT_DRIVER.to_string());
+        let exit_bytes: Vec<u8> = match self.drivers.get(&driver_name) {
+            Some(d) => match d.graceful_exit_sequence() {
+                Some(b) => b.to_vec(),
+                None => return false,
+            },
+            None => return false,
+        };
+
+        let agents = self.agents.lock().await;
+        match agents.get(agent_id) {
+            Some(agent) => {
+                let _ = agent.command_tx.send(SessionMessage::Input(exit_bytes));
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub async fn kill_agent(&self, agent_id: &str) -> bool {
+        // Live agent: send Kill over the control channel. The supervisor
+        // propagates the kill to the PTY's child, closes the socket, and
+        // the reader task we spawned in start_pty_agent will update the
+        // DB + broadcast `agent_stopped` when it sees EOF.
+        let maybe_agent = {
+            let mut agents = self.agents.lock().await;
+            agents.remove(agent_id)
+        };
+        if let Some(agent) = maybe_agent {
+            let _ = agent.command_tx.send(SessionMessage::Kill);
+            // Ensure the DB is flipped promptly even if the reader task is
+            // slow to observe EOF. Also clear the branch so a killed agent
+            // doesn't keep advertising itself as mergeable in the UI.
+            {
+                let db = self.db.lock().unwrap();
+                db.execute(
+                    "UPDATE agents SET status = 'killed', finished_at = datetime('now'), branch = NULL WHERE id = ? AND status IN ('running', 'starting')",
+                    rusqlite::params![agent_id],
+                )
+                .ok();
+            }
             broadcast_event(
                 &self.broadcast_tx,
                 "agent_stopped",
                 serde_json::json!({"id": agent_id, "status": "killed"}),
             );
+            // Fall through: also try the PID-based fallback below in case
+            // the daemon's socket is wedged.
+            let pid = {
+                let db = self.db.lock().unwrap();
+                db.query_row(
+                    "SELECT pid FROM agents WHERE id = ?",
+                    rusqlite::params![agent_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .ok()
+                .flatten()
+            };
+            if let Some(p) = pid {
+                process_terminate(p);
+            }
             return true;
         }
-        drop(agents);
 
-        // Fallback: try to find tmux session by naming convention
-        let tmux_name = format!("oai-{}", &agent_id[..8.min(agent_id.len())]);
-        let tmux_exists = std::process::Command::new("tmux")
-            .args(["has-session", "-t", &tmux_name])
-            .status()
-            .is_ok_and(|s| s.success());
-
-        if tmux_exists {
-            std::process::Command::new("tmux")
-                .args(["kill-session", "-t", &tmux_name])
-                .status()
-                .ok();
-        } else {
-            // Last resort: kill by PID
+        // Not in the in-process registry — still try to make sure the
+        // daemon (if any) is dead, and mark the row killed.
+        let (socket, pid) = {
             let db = self.db.lock().unwrap();
-            if let Ok(pid) = db.query_row(
-                "SELECT pid FROM agents WHERE id = ? AND status IN ('running', 'starting')",
+            db.query_row(
+                "SELECT supervisor_socket, pid FROM agents WHERE id = ?",
                 rusqlite::params![agent_id],
-                |row| row.get::<_, i64>(0),
-            ) {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGTERM);
-                }
-            }
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                    ))
+                },
+            )
+            .unwrap_or((None, None))
+        };
+        if let Some(p) = pid {
+            process_terminate(p);
         }
-
+        if let Some(s) = socket.as_deref() {
+            // Clean up stale socket / pidfile / log siblings so a future
+            // restart isn't confused by them. Best-effort only.
+            let socket = Path::new(s);
+            let _ = std::fs::remove_file(socket);
+            let _ = std::fs::remove_file(supervisor::pidfile_path(socket));
+        }
         let db = self.db.lock().unwrap();
         db.execute(
-            "UPDATE agents SET status = 'killed', finished_at = datetime('now') WHERE id = ?",
+            "UPDATE agents SET status = 'killed', finished_at = datetime('now'), branch = NULL WHERE id = ?",
             rusqlite::params![agent_id],
         )
         .ok();
@@ -737,6 +914,7 @@ pub async fn try_auto_advance(
                 branch: Some(&branch_name),
                 is_continue: false,
                 max_budget_usd,
+                driver: None,
             },
         )
         .await;

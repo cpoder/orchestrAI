@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { usePlanStore, type ParsedPlan } from "../stores/plan-store.js";
+import { useSettingsStore } from "../stores/settings-store.js";
 import { postJson, putJson } from "../api.js";
 import { PhaseCard } from "./PhaseCard.js";
 import { EditableText } from "./EditableText.js";
@@ -15,6 +16,7 @@ export function PlanBoard() {
   const [statusFilter, setStatusFilter] = useState<string | null>(null);
   const fetchPlans = usePlanStore((s) => s.fetchPlans);
   const savePlan = usePlanStore((s) => s.savePlan);
+  const driverCapabilities = useSettingsStore((s) => s.driverCapabilities);
 
   const isMd = plan?.filePath?.endsWith(".md") ?? false;
 
@@ -135,7 +137,8 @@ export function PlanBoard() {
               <span className="text-amber-400 ml-1"> | {inProgress} in progress</span>
             )}
           </span>
-          {plan.totalCostUsd != null && plan.totalCostUsd > 0 && (
+          {driverCapabilities((plan as ParsedPlan & { driver?: string }).driver).supports_cost &&
+            plan.totalCostUsd != null && plan.totalCostUsd > 0 && (
             <span
               className="text-xs text-amber-400 bg-amber-900/20 border border-amber-800/30 px-2 py-0.5 rounded"
               title="Total agent cost for this plan"

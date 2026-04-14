@@ -788,6 +788,8 @@ pub struct StartTaskBody {
     cwd: Option<String>,
     mode: Option<String>,
     effort: Option<String>,
+    /// Driver name (e.g. "claude"). Unknown/absent → server default.
+    driver: Option<String>,
 }
 
 fn plan_remaining_budget(
@@ -957,6 +959,7 @@ pub async fn start_task(
             branch: Some(&branch_name),
             is_continue,
             max_budget_usd: remaining_budget,
+            driver: body.driver.as_deref(),
         },
     )
     .await;
@@ -978,6 +981,9 @@ pub struct StartPhaseBody {
     cwd: Option<String>,
     #[serde(default)]
     effort: Option<String>,
+    /// Driver name (e.g. "claude"). Unknown/absent → server default.
+    #[serde(default)]
+    driver: Option<String>,
 }
 
 pub async fn start_phase_tasks(
@@ -1129,6 +1135,7 @@ pub async fn start_phase_tasks(
                 branch: Some(&branch_name),
                 is_continue: false,
                 max_budget_usd: remaining_budget,
+                driver: body.driver.as_deref(),
             },
         )
         .await;
@@ -1442,6 +1449,7 @@ pub async fn create_plan(
             branch: None,
             is_continue: false,
             max_budget_usd: None,
+            driver: None,
         },
     )
     .await;

@@ -5,6 +5,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
 import { useAgentStore, type AgentOutputLine, type AgentDiff } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
+import { useSettingsStore } from "../stores/settings-store.js";
 
 type Tab = "output" | "diff";
 
@@ -12,8 +13,10 @@ export function AgentPanel() {
   const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
   const agents = useAgentStore((s) => s.agents);
   const killAgent = useAgentStore((s) => s.killAgent);
+  const finishAgent = useAgentStore((s) => s.finishAgent);
   const selectAgent = useAgentStore((s) => s.selectAgent);
   const plans = usePlanStore((s) => s.plans);
+  const driverCapabilities = useSettingsStore((s) => s.driverCapabilities);
 
   const [activeTab, setActiveTab] = useState<Tab>("output");
 
@@ -49,7 +52,7 @@ export function AgentPanel() {
             </span>
             <span className="text-[10px] text-gray-600">{agent.status}</span>
             <span className="text-[10px] text-gray-700">{agent.mode}</span>
-            {agent.cost_usd != null && (
+            {driverCapabilities(agent.driver).supports_cost && agent.cost_usd != null && (
               <span className="text-[10px] text-amber-500/80 font-mono">
                 ${agent.cost_usd.toFixed(4)}
               </span>
@@ -69,12 +72,22 @@ export function AgentPanel() {
         </div>
         <div className="flex gap-1 flex-shrink-0">
           {isActive && (
-            <button
-              onClick={() => killAgent(agent.id)}
-              className="px-2 py-1 text-xs bg-red-900/50 text-red-400 hover:bg-red-900 rounded transition"
-            >
-              Kill
-            </button>
+            <>
+              <button
+                onClick={() => finishAgent(agent.id)}
+                className="px-2 py-1 text-xs bg-emerald-900/50 text-emerald-400 hover:bg-emerald-900 rounded transition"
+                title="Ask the agent to exit cleanly (sends /exit for Claude Code)"
+              >
+                Finish
+              </button>
+              <button
+                onClick={() => killAgent(agent.id)}
+                className="px-2 py-1 text-xs bg-red-900/50 text-red-400 hover:bg-red-900 rounded transition"
+                title="Force-kill the agent process"
+              >
+                Kill
+              </button>
+            </>
           )}
           <button
             onClick={() => selectAgent(null)}

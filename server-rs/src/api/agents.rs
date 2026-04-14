@@ -12,7 +12,7 @@ use crate::state::AppState;
 pub async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
     let db = state.db.lock().unwrap();
     let mut stmt = db
-        .prepare("SELECT id, session_id, pid, parent_agent_id, plan_name, task_id, cwd, status, mode, prompt, started_at, finished_at, last_tool, last_activity_at, base_commit, branch, source_branch, cost_usd FROM agents ORDER BY started_at DESC LIMIT 50")
+        .prepare("SELECT id, session_id, pid, parent_agent_id, plan_name, task_id, cwd, status, mode, prompt, started_at, finished_at, last_tool, last_activity_at, base_commit, branch, source_branch, cost_usd, driver FROM agents ORDER BY started_at DESC LIMIT 50")
         .unwrap();
 
     let rows: Vec<serde_json::Value> = stmt
@@ -36,6 +36,7 @@ pub async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
                 "branch": row.get::<_, Option<String>>(15)?,
                 "source_branch": row.get::<_, Option<String>>(16)?,
                 "cost_usd": row.get::<_, Option<f64>>(17)?,
+                "driver": row.get::<_, Option<String>>(18)?,
             }))
         })
         .unwrap()
@@ -94,6 +95,25 @@ pub async fn kill_agent(
         (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Agent not found"})),
+        )
+    }
+}
+
+/// `POST /api/agents/:id/finish` — send the CLI's graceful-exit sequence
+/// (e.g. `/exit` for Claude Code) so the agent shuts down cleanly. Unlike
+/// Kill this preserves any in-flight commit/cleanup the agent wants to do.
+pub async fn finish_agent(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if state.registry.graceful_exit(&id).await {
+        (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "Agent not found or driver does not support graceful exit"
+            })),
         )
     }
 }
@@ -297,11 +317,15 @@ pub async fn merge_agent_branch(
             // Capture merged SHA for CI tracking before we kick off side work
             let merged_sha = crate::agents::git_head_sha(std::path::Path::new(&cwd));
 
-            // Clear branch in DB so the UI hides the Merge button
+            // Clear branch in DB for ALL agents with this branch — siblings
+            // (killed retries, check agents) shouldn't keep advertising it.
             {
                 let db = state.db.lock().unwrap();
-                db.execute("UPDATE agents SET branch = NULL WHERE id = ?", params![id])
-                    .ok();
+                db.execute(
+                    "UPDATE agents SET branch = NULL WHERE branch = ?",
+                    params![task_branch],
+                )
+                .ok();
             }
 
             // Broadcast so connected dashboards update immediately
@@ -431,11 +455,14 @@ pub async fn discard_agent_branch(
 
     match delete {
         Ok(output) if output.status.success() => {
-            // Clear branch in DB
+            // Clear branch in DB for ALL agents with this branch
             {
                 let db = state.db.lock().unwrap();
-                db.execute("UPDATE agents SET branch = NULL WHERE id = ?", params![id])
-                    .ok();
+                db.execute(
+                    "UPDATE agents SET branch = NULL WHERE branch = ?",
+                    params![task_branch],
+                )
+                .ok();
             }
 
             crate::ws::broadcast_event(
@@ -472,6 +499,44 @@ pub async fn discard_agent_branch(
         )
             .into_response(),
     }
+}
+
+/// `GET /api/drivers` — list agent drivers the server knows about.
+///
+/// Response: `{ drivers: [{ name, binary }], default: "claude" }`. The
+/// first entry is always [`crate::agents::driver::DEFAULT_DRIVER`] so UIs
+/// have a stable fallback to pre-select.
+pub async fn list_drivers(State(state): State<AppState>) -> impl IntoResponse {
+    let reg = &state.registry.drivers;
+    let entries: Vec<serde_json::Value> = reg
+        .names()
+        .into_iter()
+        .map(|name| {
+            let driver = reg.get(&name);
+            let binary = driver
+                .as_ref()
+                .map(|d| d.binary().to_string())
+                .unwrap_or_default();
+            let caps = driver
+                .as_ref()
+                .map(|d| d.capabilities())
+                .unwrap_or_default();
+            let auth = driver
+                .as_ref()
+                .map(|d| d.auth_status())
+                .unwrap_or(crate::agents::driver::AuthStatus::Unknown);
+            serde_json::json!({
+                "name": name,
+                "binary": binary,
+                "capabilities": caps,
+                "auth_status": auth,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "drivers": entries,
+        "default": crate::agents::driver::DEFAULT_DRIVER,
+    }))
 }
 
 pub async fn get_events(State(state): State<AppState>) -> impl IntoResponse {

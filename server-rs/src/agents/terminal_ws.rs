@@ -6,9 +6,9 @@ use axum::{
     response::IntoResponse,
 };
 use serde::Deserialize;
-use tokio::sync::mpsc;
 
 use crate::agents::AgentRegistry;
+use crate::agents::session_protocol::Message as SessionMessage;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -25,14 +25,15 @@ pub async fn terminal_ws_handler(
 }
 
 async fn handle_terminal(mut socket: WebSocket, agent_id: String, registry: AgentRegistry) {
-    // Create a channel for PTY output → WebSocket
-    let (output_tx, mut output_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-
-    // Load buffered output from DB first (before locking agents)
+    // Load buffered output from DB first. Users always want the historical
+    // transcript, even when the live agent is still going.
     let buffered_rows: Vec<String> = {
         let db = registry.db.lock().unwrap();
         let mut stmt = db
-            .prepare("SELECT content FROM agent_output WHERE agent_id = ? AND message_type = 'pty' ORDER BY id")
+            .prepare(
+                "SELECT content FROM agent_output \
+                 WHERE agent_id = ? AND message_type = 'pty' ORDER BY id",
+            )
             .unwrap();
         stmt.query_map(rusqlite::params![agent_id], |row| row.get(0))
             .unwrap()
@@ -40,18 +41,16 @@ async fn handle_terminal(mut socket: WebSocket, agent_id: String, registry: Agen
             .collect()
     };
 
-    // Try to attach to a live agent
-    let attached = {
-        let mut agents = registry.agents.lock().await;
-        if let Some(agent) = agents.get_mut(&agent_id) {
-            agent.terminals.push(output_tx);
-            true
-        } else {
-            false
-        }
+    // Subscribe to the live output broadcast (if the agent is still live).
+    // `command_tx` is what lets us write keystrokes + resize into the
+    // daemon's PTY.
+    let subscription = {
+        let agents = registry.agents.lock().await;
+        agents
+            .get(&agent_id)
+            .map(|agent| (agent.output_tx.subscribe(), agent.command_tx.clone()))
     };
 
-    // Send buffered output
     for row in &buffered_rows {
         if socket
             .send(Message::Text(row.clone().into()))
@@ -62,92 +61,76 @@ async fn handle_terminal(mut socket: WebSocket, agent_id: String, registry: Agen
         }
     }
 
-    if !attached {
-        // Check if agent is still running but detached (server restarted)
-        let is_running = {
-            let db = registry.db.lock().unwrap();
-            db.query_row(
-                "SELECT status FROM agents WHERE id = ?",
-                rusqlite::params![agent_id],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-            .is_some_and(|s| s == "running" || s == "starting")
-        };
-
-        if is_running {
-            socket
-                .send(Message::Text(
-                    "\r\n\x1b[33m--- terminal detached (server restarted while agent was running) ---\x1b[0m\r\n\
-                     \x1b[33m--- agent is still alive — use Kill to stop it, or wait for it to finish ---\x1b[0m\r\n".into(),
-                ))
-                .await
-                .ok();
-        } else {
-            socket
-                .send(Message::Text(
-                    "\r\n\x1b[90m--- session ended ---\x1b[0m\r\n".into(),
-                ))
-                .await
-                .ok();
+    let (mut output_rx, command_tx) = match subscription {
+        Some(s) => s,
+        None => {
+            // Not live in-process — figure out whether it's still running
+            // (detached / server restarted mid-agent) or truly finished.
+            let status = {
+                let db = registry.db.lock().unwrap();
+                db.query_row(
+                    "SELECT status FROM agents WHERE id = ?",
+                    rusqlite::params![agent_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+            };
+            let is_running = matches!(status.as_deref(), Some("running") | Some("starting"));
+            if is_running {
+                socket
+                    .send(Message::Text(
+                        "\r\n\x1b[33m--- terminal detached (server restarted while agent was running) ---\x1b[0m\r\n\
+                         \x1b[33m--- agent is still alive — use Kill to stop it, or wait for it to finish ---\x1b[0m\r\n".into(),
+                    ))
+                    .await
+                    .ok();
+            } else {
+                socket
+                    .send(Message::Text(
+                        "\r\n\x1b[90m--- session ended ---\x1b[0m\r\n".into(),
+                    ))
+                    .await
+                    .ok();
+            }
+            return;
         }
-        return;
-    }
+    };
 
-    // Bidirectional: PTY output → WS, WS input → PTY
+    // Live bidirectional proxy: supervisor → browser, browser → supervisor.
     loop {
         tokio::select! {
-            // PTY output → send to browser
-            Some(data) = output_rx.recv() => {
-                let text = String::from_utf8_lossy(&data).to_string();
-                if socket.send(Message::Text(text.into())).await.is_err() {
-                    break;
+            // Live PTY output from the daemon → browser
+            recv = output_rx.recv() => {
+                match recv {
+                    Ok(bytes) => {
+                        let text = String::from_utf8_lossy(&bytes).to_string();
+                        if socket.send(Message::Text(text.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Broadcast buffer overflow: skip the lag and keep going.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
-            // Browser input → send to PTY
+            // Browser → supervisor. Text frames may carry resize JSON or
+            // literal keystrokes; binary frames are always keystrokes.
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        // Check for resize messages
                         if text.starts_with('{')
                             && let Ok(val) = serde_json::from_str::<serde_json::Value>(&text)
-                                && val.get("type").and_then(|t| t.as_str()) == Some("resize") {
-                                    let cols = val.get("cols").and_then(|c| c.as_u64()).unwrap_or(120) as u16;
-                                    let rows = val.get("rows").and_then(|r| r.as_u64()).unwrap_or(40) as u16;
-                                    // Resize both the PTY (our attach client) and the tmux pane
-                                    let tmux_name = {
-                                        let mut agents = registry.agents.lock().await;
-                                        if let Some(agent) = agents.get_mut(&agent_id) {
-                                            if let Some(ref mut master) = agent.pty_master {
-                                                master.resize(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).ok();
-                                            }
-                                            agent.tmux_session.clone()
-                                        } else { None }
-                                    };
-                                    if let Some(tmux) = tmux_name {
-                                        std::process::Command::new("tmux")
-                                            .args(["resize-pane", "-t", &tmux, "-x", &cols.to_string(), "-y", &rows.to_string()])
-                                            .status().ok();
-                                    }
-                                    continue;
-                                }
-                        // Regular input — write to PTY writer (goes to tmux attach stdin)
+                            && val.get("type").and_then(|t| t.as_str()) == Some("resize")
                         {
-                            let mut agents = registry.agents.lock().await;
-                            if let Some(agent) = agents.get_mut(&agent_id)
-                                && let Some(ref mut writer) = agent.pty_writer {
-                                    use std::io::Write;
-                                    writer.write_all(text.as_bytes()).ok();
-                                }
+                            let cols = val.get("cols").and_then(|c| c.as_u64()).unwrap_or(120) as u16;
+                            let rows = val.get("rows").and_then(|r| r.as_u64()).unwrap_or(40) as u16;
+                            let _ = command_tx.send(SessionMessage::Resize { cols, rows });
+                            continue;
                         }
+                        let _ = command_tx.send(SessionMessage::Input(text.as_bytes().to_vec()));
                     }
                     Some(Ok(Message::Binary(data))) => {
-                        let mut agents = registry.agents.lock().await;
-                        if let Some(agent) = agents.get_mut(&agent_id)
-                            && let Some(ref mut writer) = agent.pty_writer {
-                                use std::io::Write;
-                                writer.write_all(&data).ok();
-                            }
+                        let _ = command_tx.send(SessionMessage::Input(data.to_vec()));
                     }
                     None | Some(Err(_)) => break,
                     _ => {}

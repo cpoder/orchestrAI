@@ -7,23 +7,37 @@
 //! - The standalone `session_daemon` binary in `src/bin/session_daemon.rs`.
 //!
 //! On Unix we fork + setsid so the daemon is re-parented to init and keeps
-//! running after the server process (its parent) dies. Windows detachment
-//! is handled separately in task 0.3.
+//! running after the server process (its parent) dies. On Windows we rely on
+//! the parent spawning us with `CREATE_NO_WINDOW | DETACHED_PROCESS` (see
+//! [`spawn_detached`]); no in-process detach step is required.
+//!
+//! The local IPC layer is abstracted through the `interprocess` crate's
+//! `local_socket` module: Unix domain sockets on Unix, named pipes
+//! (`\\.\pipe\oai-<stem>`) on Windows. The same framed protocol runs over
+//! both.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use clap::Args;
+use interprocess::local_socket::tokio::prelude::*;
+use interprocess::local_socket::{
+    GenericFilePath, ListenerOptions, Name,
+    tokio::{Listener as LocalListener, Stream as LocalStream},
+};
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
-use tokio::net::UnixStream;
 use tokio::sync::broadcast;
 
 use super::session_protocol::{self, Message};
 
 #[derive(Args, Debug, Clone)]
 pub struct SessionArgs {
-    /// Path to the Unix socket (or named pipe, on Windows) the daemon listens on.
+    /// Path to the local socket (or named pipe, on Windows) the daemon listens on.
+    ///
+    /// On Unix the path itself is the socket file. On Windows we derive a
+    /// named-pipe name (`\\.\pipe\<file-stem>`) from the basename and use the
+    /// original path for the on-disk transcript (`<path>.log`).
     #[arg(long)]
     pub socket: PathBuf,
 
@@ -95,9 +109,146 @@ fn detach_from_parent() -> io::Result<()> {
 
 #[cfg(windows)]
 fn detach_from_parent() -> io::Result<()> {
-    // Task 0.3 handles DETACHED_PROCESS at CreateProcess time; the daemon
-    // itself has nothing to do once it's already been spawned detached.
+    // The parent is responsible for passing CREATE_NO_WINDOW | DETACHED_PROCESS
+    // to CreateProcess (see [`spawn_detached`]). Once we're here the OS has
+    // already severed the console association.
     Ok(())
+}
+
+/// Turn a socket `PathBuf` into an `interprocess` local-socket [`Name`] that
+/// can be handed to `ListenerOptions` / `ConnectOptions`.
+///
+/// On Unix the path is used as-is (Unix domain socket). On Windows we derive
+/// a named-pipe name of the form `\\.\pipe\<file-stem>`; the supplied path
+/// itself is only used by callers that want a matching on-disk log file.
+pub fn socket_name(socket: &Path) -> io::Result<Name<'static>> {
+    #[cfg(windows)]
+    {
+        let stem = socket.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "socket path has no basename")
+        })?;
+        let pipe = format!(r"\\.\pipe\{stem}");
+        Ok(pipe.to_fs_name::<GenericFilePath>()?.into_owned())
+    }
+    #[cfg(unix)]
+    {
+        Ok(socket
+            .to_path_buf()
+            .to_fs_name::<GenericFilePath>()?
+            .into_owned())
+    }
+}
+
+/// Spawn the session daemon (or any helper binary) detached from the calling
+/// process. On Windows this sets `CREATE_NO_WINDOW | DETACHED_PROCESS` so the
+/// child has no console and survives when the parent exits. On Unix the
+/// daemon itself calls [`detach_from_parent`] so nothing extra is needed
+/// here.
+///
+/// Returns the PID of the directly spawned process. Note: on Unix the
+/// daemon forks inside [`run_session`], so the returned PID is the
+/// short-lived fork-parent's; the real daemon PID appears later in the
+/// pidfile written by [`write_pidfile`]. Callers that need the durable
+/// PID should prefer [`spawn_session_daemon`], which waits for the
+/// pidfile.
+// Dead in the standalone `session_daemon` binary (which `#[path]`-includes
+// this file), used from the main `orchestrai-server` binary. Silence the
+// dual-binary dead-code warning.
+#[allow(dead_code)]
+pub fn spawn_detached(exe: &Path, args: &[&str]) -> io::Result<u32> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW = 0x0800_0000, DETACHED_PROCESS = 0x0000_0008
+        cmd.creation_flags(0x0800_0000 | 0x0000_0008);
+    }
+    let child = cmd.spawn()?;
+    Ok(child.id())
+}
+
+/// Path of the pidfile sibling to `socket`. The daemon writes its own PID
+/// here after detaching so the spawner can discover the real PID (on Unix
+/// the `spawn()` PID belongs to the fork-parent that `_exit`s immediately).
+pub fn pidfile_path(socket: &Path) -> PathBuf {
+    socket.with_extension("pid")
+}
+
+/// Path of the transcript-log sibling to `socket`.
+pub fn log_path(socket: &Path) -> PathBuf {
+    socket.with_extension("log")
+}
+
+/// Spawn `orchestrai-server session …` detached, then block (async) until the
+/// daemon has written its pidfile and the listener is accepting connections.
+/// Returns the durable daemon PID.
+///
+/// `cmd` is the command (argv[0] + args) to run inside the PTY, e.g.
+/// `["claude", "--session-id", …]`.
+// See `spawn_detached` — used from the main binary, unused in the
+// standalone session_daemon binary.
+#[allow(dead_code)]
+pub async fn spawn_session_daemon(
+    exe: &Path,
+    socket: &Path,
+    cwd: &Path,
+    cols: u16,
+    rows: u16,
+    cmd: &[String],
+) -> io::Result<u32> {
+    // Clear any stale pidfile from a previous crashed daemon.
+    let pid_path = pidfile_path(socket);
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(&pid_path);
+
+    let socket_str = socket.to_string_lossy().to_string();
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let cols_str = cols.to_string();
+    let rows_str = rows.to_string();
+
+    let mut args: Vec<&str> = vec![
+        "session",
+        "--socket",
+        &socket_str,
+        "--cwd",
+        &cwd_str,
+        "--cols",
+        &cols_str,
+        "--rows",
+        &rows_str,
+        "--",
+    ];
+    for a in cmd {
+        args.push(a.as_str());
+    }
+    let _ = spawn_detached(exe, &args)?;
+
+    // Wait (up to ~5s) for the daemon to write its pidfile.
+    for _ in 0..50 {
+        if let Ok(contents) = std::fs::read_to_string(&pid_path)
+            && let Ok(pid) = contents.trim().parse::<u32>()
+        {
+            return Ok(pid);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "session daemon did not write pidfile at {}",
+            pid_path.display()
+        ),
+    ))
+}
+
+/// Write the current process's PID to `socket`'s sibling `.pid` file.
+/// Called by the daemon itself once it's finished detaching so the spawner
+/// can discover it.
+fn write_pidfile(socket: &Path) -> io::Result<()> {
+    let pid_path = pidfile_path(socket);
+    std::fs::write(&pid_path, std::process::id().to_string())
 }
 
 async fn run_daemon(args: SessionArgs) -> io::Result<()> {
@@ -115,9 +266,27 @@ async fn run_daemon(args: SessionArgs) -> io::Result<()> {
         ));
     }
 
-    // A stale socket from a previous crash would make bind() fail with EADDRINUSE.
+    // Stale socket files from a previous crash would make bind() fail with
+    // EADDRINUSE on Unix. Windows named pipes aren't file-backed so there's
+    // nothing to clean up there; `ListenerOptions::try_overwrite(true)` is
+    // documented as a no-op on Windows.
+    #[cfg(unix)]
     let _ = std::fs::remove_file(&socket);
-    let listener = tokio::net::UnixListener::bind(&socket)?;
+
+    let name = socket_name(&socket)?;
+    let listener: LocalListener = ListenerOptions::new()
+        .name(name)
+        .try_overwrite(true)
+        .create_tokio()?;
+
+    // Record our own PID so the spawning server can discover the real daemon
+    // (on Unix, `spawn()` returned the fork-parent, which has already exited).
+    if let Err(e) = write_pidfile(&socket) {
+        eprintln!(
+            "[session daemon] failed to write pidfile {}: {e}",
+            pidfile_path(&socket).display()
+        );
+    }
 
     let pty_system = NativePtySystem::default();
     let pair = pty_system
@@ -154,13 +323,14 @@ async fn run_daemon(args: SessionArgs) -> io::Result<()> {
     let child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>> = Arc::new(Mutex::new(child));
 
     // Every byte the PTY emits gets appended to this log, so a client that
-    // reconnects after a crash still has the full transcript on disk.
-    let log_path = socket.with_extension("log");
+    // reconnects after a crash still has the full transcript on disk. The
+    // `.log` sibling path is valid on both Unix and Windows.
+    let log = log_path(&socket);
     let log_file = Arc::new(Mutex::new(
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&log_path)?,
+            .open(&log)?,
     ));
 
     let (out_tx, _) = broadcast::channel::<Vec<u8>>(1024);
@@ -213,7 +383,7 @@ async fn run_daemon(args: SessionArgs) -> io::Result<()> {
         tokio::select! {
             _ = shutdown_rx.recv() => break,
             accept = listener.accept() => match accept {
-                Ok((stream, _)) => {
+                Ok(stream) => {
                     let out_rx = out_tx.subscribe();
                     let in_tx = in_tx.clone();
                     let master = master.clone();
@@ -228,25 +398,27 @@ async fn run_daemon(args: SessionArgs) -> io::Result<()> {
         }
     }
 
-    // Best-effort cleanup: kill the child, remove the socket. The log file
-    // is already flushed on every chunk.
+    // Best-effort cleanup: kill the child, drop the pidfile, and on Unix
+    // unlink the socket file. The log file is already flushed on every chunk.
     {
         let mut c = child.lock().unwrap();
         let _ = c.kill();
     }
+    let _ = std::fs::remove_file(pidfile_path(&socket));
+    #[cfg(unix)]
     let _ = std::fs::remove_file(&socket);
     Ok(())
 }
 
 async fn handle_client(
-    stream: UnixStream,
+    stream: LocalStream,
     mut out_rx: broadcast::Receiver<Vec<u8>>,
     in_tx: std::sync::mpsc::Sender<Vec<u8>>,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
     shutdown_tx: broadcast::Sender<()>,
 ) {
-    let (read_half, write_half) = stream.into_split();
+    let (read_half, write_half) = stream.split();
     let write_half = Arc::new(tokio::sync::Mutex::new(write_half));
 
     let mut reader_task = {
@@ -327,21 +499,99 @@ async fn handle_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use interprocess::local_socket::ConnectOptions;
     use std::time::Duration;
 
-    async fn wait_for_socket(path: &std::path::Path) {
-        for _ in 0..50 {
-            if path.exists() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(40)).await;
+    /// Shell command that works on the current platform. Tests run through
+    /// the PTY so we need a real shell; `/bin/sh` on Unix and `cmd.exe` on
+    /// Windows are both guaranteed present on their respective CI runners.
+    fn shell(body: &str) -> Vec<String> {
+        #[cfg(unix)]
+        {
+            vec!["/bin/sh".into(), "-c".into(), body.into()]
         }
+        #[cfg(windows)]
+        {
+            vec!["cmd.exe".into(), "/c".into(), body.into()]
+        }
+    }
+
+    /// Short delay, via shell built-ins. On Unix this is `sleep 0.4`; on
+    /// Windows we pipe to `ping` since `timeout` misbehaves under ConPTY.
+    fn sleep_fragment_short() -> &'static str {
+        #[cfg(unix)]
+        {
+            "sleep 0.4"
+        }
+        #[cfg(windows)]
+        {
+            // `ping -n 2` issues 2 pings spaced ~1s apart (≈1s total delay).
+            "ping -n 2 127.0.0.1 > NUL"
+        }
+    }
+
+    fn echo_line(text: &str) -> String {
+        #[cfg(unix)]
+        {
+            format!("printf '{text}\\n'")
+        }
+        #[cfg(windows)]
+        {
+            format!("echo {text}")
+        }
+    }
+
+    async fn wait_for_socket(socket: &Path) {
+        // On Unix the socket is a real file path, so `exists()` works. On
+        // Windows named pipes aren't file-system visible, so we instead
+        // probe by attempting a connect; the first success unblocks us.
+        #[cfg(unix)]
+        {
+            for _ in 0..50 {
+                if socket.exists() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        }
+        #[cfg(windows)]
+        {
+            for _ in 0..50 {
+                if let Ok(name) = socket_name(socket) {
+                    if ConnectOptions::new()
+                        .name(name)
+                        .connect_tokio()
+                        .await
+                        .is_ok()
+                    {
+                        // Give the listener a beat to settle; probe stream is dropped.
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        }
+    }
+
+    async fn connect_client(socket: &Path) -> LocalStream {
+        let name = socket_name(socket).expect("socket name");
+        ConnectOptions::new()
+            .name(name)
+            .connect_tokio()
+            .await
+            .expect("connect local socket")
+    }
+
+    fn temp_socket(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(name);
+        (dir, path)
     }
 
     #[tokio::test]
     async fn daemon_proxies_pty_output_to_client() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let socket = dir.path().join("test.sock");
+        let (_dir, socket) = temp_socket("oai-proxy.sock");
         let args = SessionArgs {
             socket: socket.clone(),
             cwd: std::env::temp_dir(),
@@ -350,19 +600,20 @@ mod tests {
             // Delay the print so the client has time to connect and subscribe
             // to the broadcast. Output emitted before anyone's listening is
             // intentionally dropped (the on-disk log is the historical record).
-            cmd: vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "sleep 0.4; printf 'hello-from-pty\\n'; sleep 0.2".into(),
-            ],
+            cmd: shell(&format!(
+                "{sleep}; {echo}; {sleep2}",
+                sleep = sleep_fragment_short(),
+                echo = echo_line("hello-from-pty"),
+                sleep2 = sleep_fragment_short(),
+            )),
         };
 
         let daemon = tokio::spawn(async move { run_daemon(args).await });
 
         wait_for_socket(&socket).await;
-        let mut client = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let mut client = connect_client(&socket).await;
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut buf: Vec<u8> = Vec::new();
         while std::time::Instant::now() < deadline {
             match tokio::time::timeout(
@@ -384,7 +635,7 @@ mod tests {
             }
         }
         drop(client);
-        let _ = tokio::time::timeout(Duration::from_secs(5), daemon).await;
+        let _ = tokio::time::timeout(Duration::from_secs(10), daemon).await;
 
         assert!(
             buf.windows(b"hello-from-pty".len())
@@ -396,19 +647,14 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_writes_to_log_file() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let socket = dir.path().join("log.sock");
-        let log_path = socket.with_extension("log");
+        let (_dir, socket) = temp_socket("oai-log.sock");
+        let log = log_path(&socket);
         let args = SessionArgs {
             socket: socket.clone(),
             cwd: std::env::temp_dir(),
             cols: 80,
             rows: 24,
-            cmd: vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "printf 'logged-line\\n'".into(),
-            ],
+            cmd: shell(&echo_line("logged-line")),
         };
         let daemon = tokio::spawn(async move { run_daemon(args).await });
 
@@ -416,9 +662,9 @@ mod tests {
 
         // Let the PTY run to completion (child exits → reader sees EOF →
         // daemon shuts down).
-        let _ = tokio::time::timeout(Duration::from_secs(5), daemon).await;
+        let _ = tokio::time::timeout(Duration::from_secs(10), daemon).await;
 
-        let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let contents = std::fs::read_to_string(&log).unwrap_or_default();
         assert!(
             contents.contains("logged-line"),
             "expected log to contain 'logged-line', got: {contents:?}",
@@ -427,8 +673,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_accepts_reconnect_after_client_drops() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let socket = dir.path().join("reconnect.sock");
+        let (_dir, socket) = temp_socket("oai-reconnect.sock");
         let args = SessionArgs {
             socket: socket.clone(),
             cwd: std::env::temp_dir(),
@@ -436,17 +681,19 @@ mod tests {
             rows: 24,
             // Long-running: two prints spaced out, so the second one arrives
             // only after the first client has dropped.
-            cmd: vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "printf 'first\\n'; sleep 0.4; printf 'second\\n'; sleep 0.2".into(),
-            ],
+            cmd: shell(&format!(
+                "{echo1}; {sleep}; {echo2}; {sleep2}",
+                echo1 = echo_line("first"),
+                echo2 = echo_line("second"),
+                sleep = sleep_fragment_short(),
+                sleep2 = sleep_fragment_short(),
+            )),
         };
         let daemon = tokio::spawn(async move { run_daemon(args).await });
 
         wait_for_socket(&socket).await;
         {
-            let mut c1 = tokio::net::UnixStream::connect(&socket).await.unwrap();
+            let mut c1 = connect_client(&socket).await;
             // Drain a couple of frames so the broadcast receiver is exercised,
             // then drop.
             let _ = tokio::time::timeout(
@@ -457,8 +704,8 @@ mod tests {
         }
 
         // Second connection must still work.
-        let mut c2 = tokio::net::UnixStream::connect(&socket).await.unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut c2 = connect_client(&socket).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut buf: Vec<u8> = Vec::new();
         while std::time::Instant::now() < deadline {
             match tokio::time::timeout(
@@ -477,12 +724,24 @@ mod tests {
             }
         }
         drop(c2);
-        let _ = tokio::time::timeout(Duration::from_secs(5), daemon).await;
+        let _ = tokio::time::timeout(Duration::from_secs(10), daemon).await;
 
         assert!(
             buf.windows(6).any(|w| w == b"second"),
             "expected reconnect to see live output; got: {:?}",
             String::from_utf8_lossy(&buf),
         );
+    }
+
+    #[test]
+    fn socket_name_roundtrip() {
+        // Stems with hyphens and digits should parse on both platforms.
+        let p = PathBuf::from(if cfg!(windows) {
+            r"C:\Users\oai\oai-abc123.sock"
+        } else {
+            "/tmp/oai/oai-abc123.sock"
+        });
+        let name = socket_name(&p).expect("socket name");
+        assert!(name.is_path());
     }
 }

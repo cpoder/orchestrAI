@@ -6,6 +6,7 @@ mod config;
 mod db;
 mod file_watcher;
 mod hooks;
+mod mcp;
 mod notifications;
 mod plan_parser;
 mod state;
@@ -56,9 +57,31 @@ async fn run_server(cli: Cli) {
     let db = db::init(&config.db_path);
     let (broadcast_tx, _rx) = ws::create_broadcast();
 
+    // Session daemons live under <claude_dir>/sessions/. Create on startup
+    // so start_pty_agent doesn't have to per-spawn.
+    let sockets_dir = config.claude_dir.join("sessions");
+    std::fs::create_dir_all(&sockets_dir).expect("failed to create sessions directory");
+
+    // Resolve our own binary path so we can respawn ourselves as the
+    // `session` subcommand. Falls back to the clap-provided arg0 if
+    // `current_exe()` isn't available for some reason.
+    let server_exe = std::env::current_exe().unwrap_or_else(|e| {
+        eprintln!("[orchestrAI] current_exe() failed: {e} — falling back to argv[0]");
+        std::path::PathBuf::from(
+            std::env::args()
+                .next()
+                .unwrap_or_else(|| "orchestrai-server".into()),
+        )
+    });
+
     // Agent registry
-    let registry =
-        agents::AgentRegistry::new(db.clone(), broadcast_tx.clone(), config.webhook_url.clone());
+    let registry = agents::AgentRegistry::new(
+        db.clone(),
+        broadcast_tx.clone(),
+        config.webhook_url.clone(),
+        sockets_dir,
+        server_exe,
+    );
     registry.cleanup_and_reattach().await;
 
     let state = AppState::new(&config, db.clone(), broadcast_tx.clone(), registry.clone());
@@ -79,7 +102,7 @@ async fn run_server(cli: Cli) {
                 .flatten()
                 .collect();
             for (id, pid) in agents {
-                let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+                let alive = agents::process_alive(pid);
                 if !alive {
                     db.execute(
                         "UPDATE agents SET status = 'completed', finished_at = datetime('now') WHERE id = ?",
@@ -138,6 +161,8 @@ async fn run_server(cli: Cli) {
             post(api::agents::discard_agent_branch),
         )
         .route("/api/agents/{id}", delete(api::agents::kill_agent))
+        .route("/api/agents/{id}/finish", post(api::agents::finish_agent))
+        .route("/api/drivers", get(api::agents::list_drivers))
         .route("/api/events", get(api::agents::get_events))
         // Plan routes
         .route("/api/plans", get(api::plans::list_plans))
@@ -198,6 +223,9 @@ async fn run_server(cli: Cli) {
         // Static frontend (fallback)
         .fallback(get(static_files::serve_frontend))
         .with_state(state)
+        // MCP server (streamable HTTP transport). Mounted via nest_service so
+        // it runs alongside the dashboard API without sharing its AppState.
+        .nest_service("/mcp", mcp::build_service())
         .layer(cors);
 
     let addr = format!("0.0.0.0:{}", config.port);

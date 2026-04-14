@@ -3,7 +3,11 @@ import type { PlanTask } from "../stores/plan-store.js";
 import { postJson, putJson } from "../api.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
-import { useSettingsStore } from "../stores/settings-store.js";
+import {
+  isDriverReady,
+  useSettingsStore,
+  type AuthStatus,
+} from "../stores/settings-store.js";
 import { EditableText } from "./EditableText.js";
 
 interface Props {
@@ -37,6 +41,20 @@ const statusConfig: Record<
   skipped: { label: "Skipped", bg: "bg-gray-600/20 text-gray-500", dot: "bg-gray-500" },
   checking: { label: "Checking...", bg: "bg-blue-600/20 text-blue-400", dot: "bg-blue-400 animate-pulse" },
 };
+
+/// Short human-readable label for the auth blocker — used as a button
+/// tooltip so users know why Start is disabled without opening settings.
+function authStatusLabel(auth: AuthStatus | undefined): string {
+  if (!auth) return "driver status unknown";
+  switch (auth.kind) {
+    case "not_installed":
+      return "CLI not installed";
+    case "unauthenticated":
+      return auth.help;
+    default:
+      return "ready";
+  }
+}
 
 function timeAgo(iso?: string): string {
   if (!iso) return "";
@@ -78,6 +96,15 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
   const savePlan = usePlanStore((s) => s.savePlan);
   const fetchPlans = usePlanStore((s) => s.fetchPlans);
   const effort = useSettingsStore((s) => s.effort);
+  const drivers = useSettingsStore((s) => s.drivers);
+  const defaultDriver = useSettingsStore((s) => s.defaultDriver);
+  const driverCapabilities = useSettingsStore((s) => s.driverCapabilities);
+  const driverAuth = useSettingsStore((s) => s.driverAuth);
+  // Per-card override. Initial value comes from plan metadata (when we add
+  // `driver:` to the YAML schema) or the server default.
+  const planDriver = (plan as { driver?: string } | null)?.driver;
+  const [driver, setDriver] = useState<string>(planDriver ?? defaultDriver);
+  const caps = driverCapabilities(driver);
 
   async function saveTaskField(patch: Partial<PlanTask>) {
     if (!plan) return;
@@ -112,6 +139,10 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
   const unmetDeps = (task.dependencies ?? []).filter((d) => !completedSet.has(d));
   const blocked = unmetDeps.length > 0;
 
+  // Auth gate: selected driver must be installed + authenticated.
+  const auth = driverAuth(driver);
+  const authReady = isDriverReady(auth);
+
   async function handleStart(mode: "start" | "continue" = "start") {
     setStarting(true);
     setError(null);
@@ -122,6 +153,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
         taskNumber: task.number,
         mode,
         effort,
+        driver,
       });
       setAgentId(res.agentId);
       selectAgent(res.agentId);
@@ -234,8 +266,8 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                 {timeAgo(task.statusUpdatedAt)}
               </span>
             )}
-            {/* Cost */}
-            {task.costUsd != null && task.costUsd > 0 && (
+            {/* Cost — hidden for drivers that don't report spend */}
+            {caps.supports_cost && task.costUsd != null && task.costUsd > 0 && (
               <span
                 className="text-[9px] text-amber-400/80 font-mono"
                 title="Total agent cost for this task"
@@ -280,7 +312,25 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
         </div>
 
         {/* Actions */}
-        <div className="flex-shrink-0 flex gap-1">
+        <div className="flex-shrink-0 flex gap-1 items-center">
+          {/* Driver selector — only show when a start action is possible, and
+              only when the server advertises more than one driver. */}
+          {drivers.length > 1 &&
+            !agentId &&
+            (status === "pending" || status === "in_progress" || status === "failed") && (
+              <select
+                value={driver}
+                onChange={(e) => setDriver(e.target.value)}
+                className="text-[10px] bg-gray-800 border border-gray-700 text-gray-300 rounded px-1 py-0.5 focus:outline-none focus:border-gray-500"
+                title="Agent driver to use when starting this task"
+              >
+                {drivers.map((d) => (
+                  <option key={d.name} value={d.name}>
+                    {d.name}
+                  </option>
+                ))}
+              </select>
+            )}
           {/* Check button — always available */}
           <button
             onClick={handleCheck}
@@ -295,9 +345,13 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
           {status === "pending" && !agentId && (
             <button
               onClick={() => handleStart("start")}
-              disabled={starting || blocked}
+              disabled={starting || blocked || !authReady}
               title={
-                blocked ? `Blocked by ${unmetDeps.join(", ")}` : undefined
+                !authReady
+                  ? `${driver} not ready: ${authStatusLabel(auth)}`
+                  : blocked
+                    ? `Blocked by ${unmetDeps.join(", ")}`
+                    : undefined
               }
               className="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded transition"
             >
@@ -309,8 +363,9 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
           {status === "in_progress" && !agentId && (
             <button
               onClick={() => handleStart("continue")}
-              disabled={starting}
-              className="px-2 py-1 text-xs bg-amber-600 hover:bg-amber-500 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded transition"
+              disabled={starting || !authReady}
+              title={!authReady ? `${driver} not ready: ${authStatusLabel(auth)}` : undefined}
+              className="px-2 py-1 text-xs bg-amber-600 hover:bg-amber-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded transition"
             >
               {starting ? "..." : "Continue"}
             </button>
@@ -320,8 +375,9 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
           {status === "failed" && !agentId && (
             <button
               onClick={() => handleStart("continue")}
-              disabled={starting}
-              className="px-2 py-1 text-xs bg-red-700 hover:bg-red-600 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded transition"
+              disabled={starting || !authReady}
+              title={!authReady ? `${driver} not ready: ${authStatusLabel(auth)}` : undefined}
+              className="px-2 py-1 text-xs bg-red-700 hover:bg-red-600 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded transition"
             >
               {starting ? "..." : "Retry"}
             </button>

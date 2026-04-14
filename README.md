@@ -31,9 +31,9 @@ A control plane for Claude Code agents. Visualize plans, track task progress, sp
 - **Plan creation**: Describe what you want, pick a folder, an agent creates the plan
 
 ### Agent Orchestration
-- **Interactive terminals**: Start/Continue/Retry tasks via real Claude Code sessions (tmux + xterm.js)
+- **Interactive terminals**: Start/Continue/Retry tasks via real Claude Code sessions (built-in supervisor + xterm.js)
 - **Check agents**: One-click verification — spawns a read-only agent to check if a task is done
-- **Agent persistence**: Agents survive server restarts (tmux sessions auto-reattach)
+- **Agent persistence**: Agents survive server restarts — each session runs in a detached supervisor daemon and auto-reattaches on reconnect
 - **Effort control**: Global effort level (Low/Med/High/Max) applied to all spawned agents
 
 ### Git Integration
@@ -50,7 +50,7 @@ A control plane for Claude Code agents. Visualize plans, track task progress, sp
 
 ## Build from source
 
-Requires Rust 1.85+, Node.js 20+, pnpm, and tmux.
+Requires Rust 1.85+, Node.js 20+, and pnpm.
 
 ```sh
 # Build frontend
@@ -78,14 +78,24 @@ Open `http://localhost:3100` in your browser.
 
 ### Prerequisites
 
-- **tmux** — used for persistent agent terminal sessions
 - **claude** CLI — Claude Code must be installed and authenticated
+
+### Agent supervisor
+
+Each interactive agent runs inside a supervisor daemon spawned by the server as
+`orchestrai-server session --socket <path>`. The daemon forks+setsids to detach
+from the server, owns the PTY, and exposes the session over a local socket
+(Unix domain socket on Linux/macOS, named pipe on Windows). The dashboard
+attaches to that socket for live I/O and reattaches automatically after a
+server restart. PTY output is mirrored to `<socket>.log` so reconnecting
+clients see historical output. No external process supervisor (tmux, screen,
+systemd) is required.
 
 ## Project structure
 
 ```
 orchestrAI/
-  server-rs/      Rust server (Axum, rusqlite, portable-pty, tmux)
+  server-rs/      Rust server (Axum, rusqlite, portable-pty, interprocess)
   web/            React frontend (Vite, Tailwind, xterm.js, Zustand)
   screenshots/    Dashboard screenshots (Playwright)
 ```

@@ -20,6 +20,7 @@ export interface Agent {
   branch: string | null;
   source_branch: string | null;
   cost_usd: number | null;
+  driver: string | null;
 }
 
 export interface AgentDiff {
@@ -49,6 +50,7 @@ interface AgentStore {
   selectAgent: (agentId: string | null) => void;
   sendMessage: (agentId: string, message: string) => Promise<void>;
   killAgent: (agentId: string) => Promise<void>;
+  finishAgent: (agentId: string) => Promise<void>;
   mergeAgentBranch: (agentId: string) => Promise<{ ok?: boolean; error?: string }>;
   discardAgentBranch: (agentId: string) => Promise<{ ok?: boolean; error?: string }>;
   addAgent: (agent: Agent) => void;
@@ -91,6 +93,10 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
 
   killAgent: async (agentId) => {
     await deleteJson(`/api/agents/${agentId}`);
+  },
+
+  finishAgent: async (agentId) => {
+    await postJson(`/api/agents/${agentId}/finish`, {});
   },
 
   mergeAgentBranch: async (agentId) => {

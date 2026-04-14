@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { useAgentStore, type Agent } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
+import { useSettingsStore } from "../stores/settings-store.js";
 
 export function AgentTree() {
   const agents = useAgentStore((s) => s.agents);
   const plans = usePlanStore((s) => s.plans);
+  const driverCapabilities = useSettingsStore((s) => s.driverCapabilities);
   const planTitles = new Map(plans.map((p) => [p.name, p.title]));
   const fetchAgents = useAgentStore((s) => s.fetchAgents);
   const selectAgent = useAgentStore((s) => s.selectAgent);
@@ -73,7 +75,7 @@ export function AgentTree() {
                 ? `Task ${agent.task_id}`
                 : `Agent ${agent.id.slice(0, 8)}`}
             </span>
-            {agent.cost_usd != null && (
+            {driverCapabilities(agent.driver).supports_cost && agent.cost_usd != null && (
               <span className="text-[10px] text-amber-500/80 font-mono flex-shrink-0">
                 ${agent.cost_usd.toFixed(4)}
               </span>

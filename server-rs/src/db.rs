@@ -71,23 +71,25 @@ fn migrate(conn: &Connection) {
         CREATE INDEX IF NOT EXISTS idx_hook_type    ON hook_events(hook_type);
 
         CREATE TABLE IF NOT EXISTS agents (
-            id               TEXT PRIMARY KEY,
-            session_id       TEXT,
-            pid              INTEGER,
-            parent_agent_id  TEXT,
-            plan_name        TEXT,
-            task_id          TEXT,
-            cwd              TEXT NOT NULL,
-            status           TEXT NOT NULL DEFAULT 'starting',
-            mode             TEXT NOT NULL DEFAULT 'pty',
-            prompt           TEXT,
-            started_at       TEXT NOT NULL DEFAULT (datetime('now')),
-            finished_at      TEXT,
-            last_tool        TEXT,
-            last_activity_at TEXT,
-            base_commit      TEXT,
-            branch           TEXT,
-            source_branch    TEXT,
+            id                TEXT PRIMARY KEY,
+            session_id        TEXT,
+            pid               INTEGER,
+            parent_agent_id   TEXT,
+            plan_name         TEXT,
+            task_id           TEXT,
+            cwd               TEXT NOT NULL,
+            status            TEXT NOT NULL DEFAULT 'starting',
+            mode              TEXT NOT NULL DEFAULT 'pty',
+            prompt            TEXT,
+            started_at        TEXT NOT NULL DEFAULT (datetime('now')),
+            finished_at       TEXT,
+            last_tool         TEXT,
+            last_activity_at  TEXT,
+            base_commit       TEXT,
+            branch            TEXT,
+            source_branch     TEXT,
+            supervisor_socket TEXT,
+            driver            TEXT DEFAULT 'claude',
             FOREIGN KEY (parent_agent_id) REFERENCES agents(id)
         );
         CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
@@ -166,6 +168,16 @@ fn migrate(conn: &Connection) {
     conn.execute_batch("ALTER TABLE agents ADD COLUMN source_branch TEXT;")
         .ok();
     conn.execute_batch("ALTER TABLE agents ADD COLUMN cost_usd REAL;")
+        .ok();
+    // Path to the session-daemon's local socket / named pipe. NULL for legacy
+    // rows written before the tmux → supervisor switch; those are treated as
+    // `detached` on first boot post-upgrade.
+    conn.execute_batch("ALTER TABLE agents ADD COLUMN supervisor_socket TEXT;")
+        .ok();
+    // Name of the AgentDriver that spawned this agent (e.g. "claude").
+    // NULL on rows written before driver selection existed; readers treat
+    // NULL as the default driver.
+    conn.execute_batch("ALTER TABLE agents ADD COLUMN driver TEXT DEFAULT 'claude';")
         .ok();
 }
 
@@ -305,6 +317,59 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "completed");
+    }
+
+    #[test]
+    fn agents_table_has_driver_column() {
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, cwd, status, driver) VALUES (?1, ?2, ?3, ?4)",
+            params!["a1", "/tmp", "running", "claude"],
+        )
+        .unwrap();
+        let drv: Option<String> = conn
+            .query_row(
+                "SELECT driver FROM agents WHERE id = ?1",
+                params!["a1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(drv.as_deref(), Some("claude"));
+
+        // Default when not specified
+        conn.execute(
+            "INSERT INTO agents (id, cwd, status) VALUES (?1, ?2, ?3)",
+            params!["a2", "/tmp", "running"],
+        )
+        .unwrap();
+        let drv2: Option<String> = conn
+            .query_row(
+                "SELECT driver FROM agents WHERE id = ?1",
+                params!["a2"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(drv2.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn agents_table_has_supervisor_socket_column() {
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, cwd, status, supervisor_socket) VALUES (?1, ?2, ?3, ?4)",
+            params!["a1", "/tmp", "running", "/tmp/a1.sock"],
+        )
+        .unwrap();
+        let sock: Option<String> = conn
+            .query_row(
+                "SELECT supervisor_socket FROM agents WHERE id = ?1",
+                params!["a1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sock.as_deref(), Some("/tmp/a1.sock"));
     }
 
     #[test]

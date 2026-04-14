@@ -22,12 +22,14 @@ export function App() {
   const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
 
   const fetchSettings = useSettingsStore((s) => s.fetchSettings);
+  const fetchDrivers = useSettingsStore((s) => s.fetchDrivers);
 
   useEffect(() => {
     connect();
     fetchPlans().catch(() => {});
     fetchAgents().catch(() => {});
     fetchSettings().catch(() => {});
+    fetchDrivers().catch(() => {});
   }, []);
 
   return (
