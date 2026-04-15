@@ -1353,6 +1353,153 @@ pub async fn check_task(
     .into_response()
 }
 
+// ── POST /api/plans/:name/check ─────────────────────────────────────────────
+//
+// Plan-level Check agent. Builds a prompt from the plan's `verification` block
+// plus a done/pending task summary, spawns a read-only check agent against the
+// project, and persists the verdict to `plan_verdicts` + broadcasts
+// `plan_checked` via WebSocket.
+
+pub async fn check_plan(
+    State(state): State<AppState>,
+    Path(plan_name): Path<String>,
+) -> impl IntoResponse {
+    let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &plan_name) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    };
+    let plan = match plan_parser::parse_plan_file(&plan_path) {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    let verification = match plan.verification.as_deref() {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({"error": "Plan has no verification block to check against"}),
+                ),
+            )
+                .into_response();
+        }
+    };
+
+    let project = match plan.project.as_deref() {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Plan has no associated project"})),
+            )
+                .into_response();
+        }
+    };
+
+    let home = dirs::home_dir().unwrap();
+    let project_dir = home.join(project);
+
+    let statuses: HashMap<String, String> = {
+        let db = state.db.lock().unwrap();
+        let mut stmt = db
+            .prepare("SELECT task_number, status FROM task_status WHERE plan_name = ?")
+            .unwrap();
+        stmt.query_map(params![plan_name], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .flatten()
+        .collect()
+    };
+
+    let prompt = build_plan_check_prompt(&plan, verification, &statuses, &project_dir);
+
+    let effort = *state.effort.lock().unwrap();
+    let agent_id = check_agent::start_check_agent(
+        &state.registry,
+        prompt,
+        &project_dir,
+        Some(&plan_name),
+        None,
+        effort,
+    )
+    .await;
+
+    Json(serde_json::json!({
+        "agentId": agent_id,
+        "planName": plan_name,
+    }))
+    .into_response()
+}
+
+fn build_plan_check_prompt(
+    plan: &plan_parser::ParsedPlan,
+    verification: &str,
+    statuses: &HashMap<String, String>,
+    project_dir: &std::path::Path,
+) -> String {
+    let mut done: Vec<String> = Vec::new();
+    let mut pending: Vec<String> = Vec::new();
+    for phase in &plan.phases {
+        for task in &phase.tasks {
+            let status = statuses
+                .get(&task.number)
+                .map(|s| s.as_str())
+                .unwrap_or("pending");
+            let line = format!("- {}: {}", task.number, task.title);
+            if matches!(status, "completed" | "skipped") {
+                done.push(line);
+            } else {
+                pending.push(line);
+            }
+        }
+    }
+
+    let done_section = if done.is_empty() {
+        "Done tasks: (none)".to_string()
+    } else {
+        format!("Done tasks:\n{}", done.join("\n"))
+    };
+    let pending_section = if pending.is_empty() {
+        "Pending tasks: (none)".to_string()
+    } else {
+        format!("Pending tasks:\n{}", pending.join("\n"))
+    };
+
+    format!(
+        "You are verifying whether a plan's overall verification criteria are satisfied by the current state of the project.\n\
+         Answer with ONLY a JSON object, no other text: {{\"status\": \"completed\"|\"in_progress\"|\"pending\", \"reason\": \"brief explanation\"}}\n\n\
+         Project directory: {project_dir}\n\
+         Plan: {plan_title}\n\n\
+         Verification criteria:\n{verification}\n\n\
+         Task summary:\n{done_section}\n\n{pending_section}\n\n\
+         Check the project at {project_dir}. Read the relevant files and run the git commands you need to confirm each verification bullet.\n\n\
+         Status values:\n\
+         - \"completed\": every verification bullet is demonstrably satisfied in the code\n\
+         - \"in_progress\": some criteria are met but not all\n\
+         - \"pending\": little to no evidence the verification criteria hold\n\n\
+         Respond with ONLY the JSON object.",
+        project_dir = project_dir.display(),
+        plan_title = plan.title,
+        verification = verification.trim(),
+        done_section = done_section,
+        pending_section = pending_section,
+    )
+}
+
 // ── POST /api/plans/create ──────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -2427,5 +2574,61 @@ mod check_prompt_tests {
             std::path::Path::new("/tmp/proj"),
         );
         assert!(prompt.contains("Run `git log orchestrai/myplan/2.1`"));
+    }
+
+    #[test]
+    fn plan_check_prompt_includes_verification_and_task_split() {
+        let mut plan = sample_plan();
+        plan.verification = Some("1. The endpoint returns 200.\n2. The verdict is stored.".into());
+        plan.phases = vec![
+            plan_parser::PlanPhase {
+                number: 1,
+                title: "P1".into(),
+                description: String::new(),
+                tasks: vec![sample_task("1.1", vec![]), sample_task("1.2", vec![])],
+            },
+            plan_parser::PlanPhase {
+                number: 2,
+                title: "P2".into(),
+                description: String::new(),
+                tasks: vec![sample_task("2.1", vec![])],
+            },
+        ];
+
+        let mut statuses: HashMap<String, String> = HashMap::new();
+        statuses.insert("1.1".into(), "completed".into());
+        statuses.insert("1.2".into(), "skipped".into());
+        // 2.1 intentionally left out to exercise the default "pending" path.
+
+        let prompt = build_plan_check_prompt(
+            &plan,
+            plan.verification.as_deref().unwrap(),
+            &statuses,
+            std::path::Path::new("/tmp/proj"),
+        );
+
+        assert!(prompt.contains("The endpoint returns 200."));
+        assert!(prompt.contains("Done tasks:"));
+        assert!(prompt.contains("- 1.1: A task"));
+        assert!(prompt.contains("- 1.2: A task"));
+        assert!(prompt.contains("Pending tasks:"));
+        assert!(prompt.contains("- 2.1: A task"));
+        assert!(prompt.contains("Respond with ONLY the JSON object."));
+    }
+
+    #[test]
+    fn plan_check_prompt_handles_empty_task_sections() {
+        let mut plan = sample_plan();
+        plan.verification = Some("nothing".into());
+        plan.phases = vec![];
+        let statuses: HashMap<String, String> = HashMap::new();
+        let prompt = build_plan_check_prompt(
+            &plan,
+            plan.verification.as_deref().unwrap(),
+            &statuses,
+            std::path::Path::new("/tmp/proj"),
+        );
+        assert!(prompt.contains("Done tasks: (none)"));
+        assert!(prompt.contains("Pending tasks: (none)"));
     }
 }

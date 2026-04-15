@@ -277,6 +277,7 @@ async fn run_server(cli: Cli) {
             "/api/plans/{name}/branches/stale/purge",
             post(api::plans::purge_stale_branches),
         )
+        .route("/api/plans/{name}/check", post(api::plans::check_plan))
         .route("/api/plans/{name}/check-all", post(api::plans::check_all))
         .route(
             "/api/plans/{name}/tasks/{task_number}/check",

@@ -190,8 +190,10 @@ pub async fn start_check_agent(
             .ok();
         }
 
-        // Parse verdict
-        if let Some(ref task_id) = task_id_owned {
+        // Parse verdict. Per-task checks have Some(task_id); plan-level checks
+        // have task_id == None and plan_name == Some, and write to plan_verdicts
+        // / broadcast `plan_checked` instead of the task-scoped equivalents.
+        if plan_name_owned.is_some() {
             let db_guard = db.lock().unwrap();
             let mut stmt = db_guard
                 .prepare("SELECT content FROM agent_output WHERE agent_id = ? ORDER BY id")
@@ -242,25 +244,49 @@ pub async fn start_check_agent(
                             let v_reason =
                                 verdict.get("reason").and_then(|s| s.as_str()).unwrap_or("");
 
-                            db_guard.execute(
-                                "INSERT INTO task_status (plan_name, task_number, status, updated_at)
-                                 VALUES (?1, ?2, ?3, datetime('now'))
-                                 ON CONFLICT(plan_name, task_number)
-                                 DO UPDATE SET status = excluded.status, updated_at = datetime('now')",
-                                params![plan_name_owned, task_id, v_status],
-                            ).ok();
+                            if let Some(ref task_id) = task_id_owned {
+                                db_guard.execute(
+                                    "INSERT INTO task_status (plan_name, task_number, status, updated_at)
+                                     VALUES (?1, ?2, ?3, datetime('now'))
+                                     ON CONFLICT(plan_name, task_number)
+                                     DO UPDATE SET status = excluded.status, updated_at = datetime('now')",
+                                    params![plan_name_owned, task_id, v_status],
+                                ).ok();
 
-                            broadcast_event(
-                                &tx,
-                                "task_checked",
-                                serde_json::json!({
-                                    "plan_name": plan_name_owned,
-                                    "task_number": task_id,
-                                    "status": v_status,
-                                    "reason": v_reason,
-                                    "agent_id": id_clone,
-                                }),
-                            );
+                                broadcast_event(
+                                    &tx,
+                                    "task_checked",
+                                    serde_json::json!({
+                                        "plan_name": plan_name_owned,
+                                        "task_number": task_id,
+                                        "status": v_status,
+                                        "reason": v_reason,
+                                        "agent_id": id_clone,
+                                    }),
+                                );
+                            } else {
+                                db_guard.execute(
+                                    "INSERT INTO plan_verdicts (plan_name, verdict, reason, agent_id, checked_at)
+                                     VALUES (?1, ?2, ?3, ?4, datetime('now'))
+                                     ON CONFLICT(plan_name) DO UPDATE SET
+                                       verdict = excluded.verdict,
+                                       reason = excluded.reason,
+                                       agent_id = excluded.agent_id,
+                                       checked_at = datetime('now')",
+                                    params![plan_name_owned, v_status, v_reason, id_clone],
+                                ).ok();
+
+                                broadcast_event(
+                                    &tx,
+                                    "plan_checked",
+                                    serde_json::json!({
+                                        "plan_name": plan_name_owned,
+                                        "verdict": v_status,
+                                        "reason": v_reason,
+                                        "agent_id": id_clone,
+                                    }),
+                                );
+                            }
                             break;
                         }
                     }

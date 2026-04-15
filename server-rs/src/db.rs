@@ -118,6 +118,14 @@ fn migrate(conn: &Connection) {
             PRIMARY KEY (plan_name, task_number)
         );
 
+        CREATE TABLE IF NOT EXISTS plan_verdicts (
+            plan_name   TEXT PRIMARY KEY,
+            verdict     TEXT NOT NULL,
+            reason      TEXT,
+            agent_id    TEXT,
+            checked_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
         CREATE TABLE IF NOT EXISTS plan_budget (
             plan_name      TEXT PRIMARY KEY,
             max_budget_usd REAL NOT NULL,
@@ -249,6 +257,47 @@ mod tests {
         assert!(tables.contains(&"task_learnings".to_string()));
         assert!(tables.contains(&"users".to_string()));
         assert!(tables.contains(&"sessions".to_string()));
+        assert!(tables.contains(&"plan_verdicts".to_string()));
+    }
+
+    #[test]
+    fn insert_and_replace_plan_verdict() {
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+
+        conn.execute(
+            "INSERT INTO plan_verdicts (plan_name, verdict, reason, agent_id)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(plan_name) DO UPDATE SET
+               verdict = excluded.verdict,
+               reason = excluded.reason,
+               agent_id = excluded.agent_id,
+               checked_at = datetime('now')",
+            params!["p1", "in_progress", "halfway", "agent-a"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO plan_verdicts (plan_name, verdict, reason, agent_id)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(plan_name) DO UPDATE SET
+               verdict = excluded.verdict,
+               reason = excluded.reason,
+               agent_id = excluded.agent_id,
+               checked_at = datetime('now')",
+            params!["p1", "completed", "all done", "agent-b"],
+        )
+        .unwrap();
+
+        let (verdict, reason, agent_id): (String, String, String) = conn
+            .query_row(
+                "SELECT verdict, reason, agent_id FROM plan_verdicts WHERE plan_name = ?1",
+                params!["p1"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(verdict, "completed");
+        assert_eq!(reason, "all done");
+        assert_eq!(agent_id, "agent-b");
     }
 
     #[test]
