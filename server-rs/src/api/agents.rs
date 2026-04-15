@@ -276,11 +276,7 @@ pub async fn merge_agent_branch(
     // real problem (the agent did no work). Return 409 so the UI can tell
     // the user to retry or commit manually.
     let revlist = std::process::Command::new("git")
-        .args([
-            "rev-list",
-            "--count",
-            &format!("{target}..{task_branch}"),
-        ])
+        .args(["rev-list", "--count", &format!("{target}..{task_branch}")])
         .current_dir(&cwd)
         .output();
 
