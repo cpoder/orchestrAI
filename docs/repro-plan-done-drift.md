@@ -45,3 +45,17 @@ Server-side is correct: `GET /api/plans` returns `doneCount=10/11` and
   (`web/src/components/Sidebar.tsx:19-21`,
   `web/src/components/ProjectDashboard.tsx:17-19`), so any upward drift
   immediately flips the plan into the done group.
+
+## Task 0.3 — server-side confirmation
+
+With `0.1 completed`, `0.2 completed`, `0.3 in_progress`, and all other
+tasks `skipped` (10 effective done out of 11), `curl /api/plans` returns:
+
+```json
+{ "name": "fix-plan-done-in-progress", "taskCount": 11, "doneCount": 10 }
+```
+
+`doneCount < taskCount` holds — `GET /api/plans` is authoritative and
+correctly reports the in_progress task as not done. The bug is isolated
+to the frontend's optimistic `patchTaskStatus`; the backend never claims
+the plan is complete in this state.
