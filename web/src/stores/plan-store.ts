@@ -161,11 +161,27 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
   patchTaskStatus: (planName, taskNumber, status) => {
     const { selectedPlan, plans } = get();
 
+    // Look up the prior status BEFORE mutating so we can compute a signed delta.
+    // Only the selected plan has per-task data in the store; for other plans we
+    // fall back to the unsigned +1/0 heuristic and rely on the server refetch
+    // in ws-store (task 2.2) to reconcile.
+    const isSelected = selectedPlan?.name === planName;
+    let prevStatus: string | undefined;
+    if (isSelected) {
+      for (const phase of selectedPlan!.phases) {
+        const task = phase.tasks.find((t) => t.number === taskNumber);
+        if (task) {
+          prevStatus = task.status;
+          break;
+        }
+      }
+    }
+
     // Patch the selected plan in-place (no refetch)
-    if (selectedPlan?.name === planName) {
+    if (isSelected) {
       const patched = {
-        ...selectedPlan,
-        phases: selectedPlan.phases.map((p) => ({
+        ...selectedPlan!,
+        phases: selectedPlan!.phases.map((p) => ({
           ...p,
           tasks: p.tasks.map((t) =>
             t.number === taskNumber
@@ -178,11 +194,23 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
     }
 
     // Patch doneCount in the plan list
+    const isDone = status === "completed" || status === "skipped";
     const updatedPlans = plans.map((p) => {
       if (p.name !== planName) return p;
-      const delta =
-        status === "completed" || status === "skipped" ? 1 : 0;
-      // We don't know the previous status precisely, so just refetch later
+      let delta: number;
+      if (isSelected) {
+        // Signed delta handles all 4 transitions: pending→done (+1),
+        // done→pending/in_progress/failed (-1), completed↔skipped (0),
+        // repeated done→done (0).
+        const wasDone =
+          prevStatus === "completed" || prevStatus === "skipped";
+        delta = (isDone ? 1 : 0) - (wasDone ? 1 : 0);
+      } else {
+        // Non-selected plan: store has no per-task data, so fall back to the
+        // unsigned heuristic. Task 2.2 reconciles via a server refetch on
+        // task_status_changed events.
+        delta = isDone ? 1 : 0;
+      }
       return { ...p, doneCount: p.doneCount + delta };
     });
     set({ plans: updatedPlans });
