@@ -1589,6 +1589,7 @@ pub async fn update_plan(
                     .collect(),
             })
             .collect(),
+        verification: None,
         total_cost_usd: None,
         max_budget_usd: None,
     };
@@ -2008,6 +2009,7 @@ mod check_prompt_tests {
             created_at: String::new(),
             modified_at: String::new(),
             phases: vec![],
+            verification: None,
             total_cost_usd: None,
             max_budget_usd: None,
         }

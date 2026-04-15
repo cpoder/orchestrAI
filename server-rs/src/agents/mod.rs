@@ -1370,6 +1370,7 @@ mod tests {
             created_at: String::new(),
             modified_at: String::new(),
             phases: vec![phase.clone()],
+            verification: None,
             total_cost_usd: None,
             max_budget_usd: None,
         };

@@ -47,6 +47,8 @@ pub struct ParsedPlan {
     pub created_at: String,
     pub modified_at: String,
     pub phases: Vec<PlanPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_cost_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -100,6 +102,8 @@ struct YamlPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     created_at: Option<String>,
     phases: Vec<YamlPlanPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verification: Option<String>,
 }
 
 // ── File-path extraction ─────────────────────────────────────────────────────
@@ -249,6 +253,13 @@ pub fn parse_plan_markdown(raw: &str, name: &str, file_path: &str) -> ParsedPlan
         .map(|s| s.body.join("\n").trim().to_string())
         .unwrap_or_default();
 
+    // Verification section (optional)
+    let verification = sections
+        .iter()
+        .find(|s| s.heading.to_lowercase().starts_with("verification"))
+        .map(|s| s.body.join("\n").trim().to_string())
+        .filter(|v| !v.is_empty());
+
     // Phase regex patterns
     let phase_re = Regex::new(r"(?i)^(?:Phase|Step)\s+(\d+\w?)[:\s.—\-]+(.+)").unwrap();
     let numbered_re = Regex::new(r"^(\d+)[.)]\s+(.+)").unwrap();
@@ -321,6 +332,7 @@ pub fn parse_plan_markdown(raw: &str, name: &str, file_path: &str) -> ParsedPlan
         created_at: String::new(),
         modified_at: String::new(),
         phases,
+        verification,
         total_cost_usd: None,
         max_budget_usd: None,
     }
@@ -459,6 +471,7 @@ fn parse_tasks_from_bullets(body: &str, phase_num: u32) -> Vec<PlanTask> {
 pub fn parse_plan_yaml(raw: &str, name: &str, file_path: &str) -> Result<ParsedPlan, String> {
     let yaml: YamlPlan = serde_yaml::from_str(raw).map_err(|e| e.to_string())?;
 
+    let verification = yaml.verification.clone();
     let phases = yaml
         .phases
         .into_iter()
@@ -498,6 +511,7 @@ pub fn parse_plan_yaml(raw: &str, name: &str, file_path: &str) -> Result<ParsedP
         created_at: yaml.created_at.unwrap_or_default(),
         modified_at: String::new(),
         phases,
+        verification,
         total_cost_usd: None,
         max_budget_usd: None,
     })
@@ -535,6 +549,7 @@ pub fn serialize_plan_yaml(plan: &ParsedPlan) -> Result<String, String> {
                     .collect(),
             })
             .collect(),
+        verification: plan.verification.clone(),
     };
     serde_yaml::to_string(&yaml).map_err(|e| e.to_string())
 }
@@ -1324,6 +1339,78 @@ phases:
         assert!(!is_plan_ext(std::path::Path::new("foo.txt")));
         assert!(!is_plan_ext(std::path::Path::new("foo.json")));
         assert!(!is_plan_ext(std::path::Path::new("foo")));
+    }
+
+    #[test]
+    fn yaml_verification_round_trip() {
+        let yaml = "\
+title: Plan With Verification
+phases:
+  - number: 0
+    title: Setup
+    tasks:
+      - number: \"0.1\"
+        title: Init
+verification: |-
+  1. Step one
+  2. Step two
+";
+        let plan = parse_plan_yaml(yaml, "test", "/tmp/test.yaml").unwrap();
+        assert_eq!(
+            plan.verification.as_deref(),
+            Some("1. Step one\n2. Step two")
+        );
+
+        let serialized = serialize_plan_yaml(&plan).unwrap();
+        assert!(
+            serialized.contains("verification:"),
+            "serialized YAML should contain verification key: {serialized}"
+        );
+
+        let reparsed = parse_plan_yaml(&serialized, "test", "/tmp/test.yaml").unwrap();
+        assert_eq!(reparsed.verification, plan.verification);
+    }
+
+    #[test]
+    fn markdown_extracts_verification_section() {
+        let md = "\
+# Plan
+
+## Context
+
+Background.
+
+## Phase 1: Work
+
+### 1.1 Do it
+
+Do stuff.
+
+## Verification
+
+1. Run the tests
+2. Check the output
+";
+        let plan = parse_plan_markdown(md, "test", "/tmp/test.md");
+        assert_eq!(
+            plan.verification.as_deref(),
+            Some("1. Run the tests\n2. Check the output")
+        );
+    }
+
+    #[test]
+    fn markdown_without_verification_is_none() {
+        let md = "\
+# Plan
+
+## Phase 1: Work
+
+### 1.1 Do it
+
+Do stuff.
+";
+        let plan = parse_plan_markdown(md, "test", "/tmp/test.md");
+        assert_eq!(plan.verification, None);
     }
 
     #[test]
