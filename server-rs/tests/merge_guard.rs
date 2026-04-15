@@ -38,28 +38,21 @@ fn seed_agent(
     .unwrap();
 }
 
-fn minimal_plan(name: &str) -> String {
+/// Plan YAML with an absolute `project` path — Windows' `dirs::home_dir()`
+/// ignores env overrides, so we can't rely on `$HOME/<name>`. Absolute
+/// paths work on both platforms.
+fn minimal_plan(name: &str, project_dir: &std::path::Path) -> String {
     format!(
-        r#"title: {name}
-context: ''
-project: project
-phases:
-  - number: 1
-    title: Phase 1
-    description: ''
-    tasks:
-      - number: '1.1'
-        title: Task 1.1
-        description: ''
-        acceptance: ''
-"#
+        "title: {name}\ncontext: ''\nproject: {project}\nphases:\n  - number: 1\n    title: Phase 1\n    description: ''\n    tasks:\n      - number: '1.1'\n        title: Task 1.1\n        description: ''\n        acceptance: ''\n",
+        name = name,
+        project = project_dir.display()
     )
 }
 
 #[test]
 fn empty_branch_merge_returns_409_not_500() {
     let d = TestDashboard::new();
-    d.create_plan("mp-a", &minimal_plan("mp-a"));
+    d.create_plan("mp-a", &minimal_plan("mp-a", &d.project));
 
     // A branch with no commits ahead of master — the classic "agent
     // exited without committing" failure mode. Before the guard this
@@ -89,7 +82,7 @@ fn empty_branch_merge_returns_409_not_500() {
 #[test]
 fn merge_with_real_commits_succeeds() {
     let d = TestDashboard::new();
-    d.create_plan("mp-b", &minimal_plan("mp-b"));
+    d.create_plan("mp-b", &minimal_plan("mp-b", &d.project));
 
     let br = "orchestrai/mp-b/1.1";
     d.create_task_branch(br, /* with_commit */ true);
@@ -112,7 +105,7 @@ fn self_referencing_source_branch_does_not_cause_500() {
     // The fix (3fea12d) stores NULL when source == task_branch and
     // degrades permissively when rev-list errors.
     let d = TestDashboard::new();
-    d.create_plan("mp-c", &minimal_plan("mp-c"));
+    d.create_plan("mp-c", &minimal_plan("mp-c", &d.project));
 
     let br = "orchestrai/mp-c/1.1";
     d.create_task_branch(br, /* with_commit */ true);
@@ -139,7 +132,7 @@ fn merge_with_nonexistent_source_branch_does_not_500() {
     // Now it logs and falls through to `git merge` which has its own
     // clearer error handling.
     let d = TestDashboard::new();
-    d.create_plan("mp-d", &minimal_plan("mp-d"));
+    d.create_plan("mp-d", &minimal_plan("mp-d", &d.project));
 
     let br = "orchestrai/mp-d/1.1";
     d.create_task_branch(br, /* with_commit */ true);

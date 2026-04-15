@@ -11,37 +11,30 @@ use support::TestDashboard;
 
 /// Plan YAML matching the orchestrAI YamlPlan schema.
 ///
-/// `project` is the relative directory under `$HOME` where the project
-/// lives. The test harness sets `HOME=tempdir` and creates the project
-/// at `$HOME/project`, so `project: project` is the right value.
-fn minimal_plan(name: &str) -> String {
-    // Raw block style — YAML is indent-sensitive and multi-line format
-    // macros with `\n\` continuations are too easy to get wrong.
+/// `project` is the absolute path to the scratch repo. We use an
+/// absolute path here instead of a relative-to-HOME one because on
+/// Windows `dirs::home_dir()` reads from the Win32 API
+/// (`GetUserProfileDirectoryW`) and ignores the `HOME`/`USERPROFILE`
+/// env vars we set for the child process — so a relative path would
+/// join to the real runner's profile, not our tempdir. Absolute paths
+/// sidestep this: `Path::join` returns the absolute RHS unchanged.
+fn minimal_plan(name: &str, project_dir: &std::path::Path) -> String {
     format!(
-        r#"title: {name}
-context: ''
-project: project
-phases:
-  - number: 1
-    title: Phase 1
-    description: ''
-    tasks:
-      - number: '1.1'
-        title: Task 1.1
-        description: ''
-        acceptance: ''
-      - number: '1.2'
-        title: Task 1.2
-        description: ''
-        acceptance: ''
-"#
+        "title: {name}\ncontext: ''\nproject: {project}\nphases:\n  - number: 1\n    title: Phase 1\n    description: ''\n    tasks:\n      - number: '1.1'\n        title: Task 1.1\n        description: ''\n        acceptance: ''\n      - number: '1.2'\n        title: Task 1.2\n        description: ''\n        acceptance: ''\n",
+        name = name,
+        // Quote because on Windows the path contains backslashes which
+        // YAML treats as escape chars in double-quoted strings. Single
+        // quotes + doubled internal single-quotes would be safer, but
+        // Windows paths can't contain single quotes so plain-unquoted
+        // works. Emit the path as-is; serde_yaml accepts it as a scalar.
+        project = project_dir.display()
     )
 }
 
 #[test]
 fn reset_task_status_is_idempotent_and_broadcasts_null() {
     let d = TestDashboard::new();
-    let plan = d.create_plan("plan-a", &minimal_plan("plan-a"));
+    let plan = d.create_plan("plan-a", &minimal_plan("plan-a", &d.project));
 
     // Set a status, then reset it. status endpoint is PUT.
     let (s, _) = d.put(
@@ -69,7 +62,7 @@ fn reset_task_status_is_idempotent_and_broadcasts_null() {
 #[test]
 fn list_stale_branches_distinguishes_empty_from_populated() {
     let d = TestDashboard::new();
-    let plan = d.create_plan("plan-b", &minimal_plan("plan-b"));
+    let plan = d.create_plan("plan-b", &minimal_plan("plan-b", &d.project));
 
     // An empty branch (no commits ahead of master) — classic "agent exited
     // without committing" leftover.
@@ -103,7 +96,7 @@ fn list_stale_branches_distinguishes_empty_from_populated() {
 #[test]
 fn purge_refuses_unique_commits_without_force_then_accepts() {
     let d = TestDashboard::new();
-    let plan = d.create_plan("plan-c", &minimal_plan("plan-c"));
+    let plan = d.create_plan("plan-c", &minimal_plan("plan-c", &d.project));
 
     let empty_br = format!("orchestrai/{plan}/1.1");
     let full_br = format!("orchestrai/{plan}/1.2");
@@ -144,7 +137,7 @@ fn purge_refuses_unique_commits_without_force_then_accepts() {
 #[test]
 fn purge_rejects_out_of_scope_branch_names() {
     let d = TestDashboard::new();
-    let plan = d.create_plan("plan-d", &minimal_plan("plan-d"));
+    let plan = d.create_plan("plan-d", &minimal_plan("plan-d", &d.project));
 
     // Pre-create a branch outside this plan's prefix.
     d.create_task_branch("other/work", false);
@@ -164,7 +157,7 @@ fn purge_rejects_out_of_scope_branch_names() {
 #[test]
 fn dismiss_ci_run_hides_it_from_latest() {
     let d = TestDashboard::new();
-    let plan = d.create_plan("plan-e", &minimal_plan("plan-e"));
+    let plan = d.create_plan("plan-e", &minimal_plan("plan-e", &d.project));
 
     // Seed a ci_runs row directly via the status-changed path — we don't
     // have a public endpoint to insert arbitrary runs, so use the server's
