@@ -680,7 +680,7 @@ pub fn build_task_prompt(
     // to a curl against the HTTP API, which is always live as a backstop.
     let status_step = if mcp_available {
         format!(
-            "3. Mark the task status by calling the `update_task_status` MCP tool \
+            "4. Mark the task status by calling the `update_task_status` MCP tool \
              (from the `orchestrai` server) with {{\"plan\": \"{plan_name}\", \
              \"task\": \"{task_num}\", \"status\": \"completed\"}}",
             plan_name = plan.name,
@@ -688,7 +688,7 @@ pub fn build_task_prompt(
         )
     } else {
         format!(
-            "3. Mark the task status by running: curl -s -X PUT \
+            "4. Mark the task status by running: curl -s -X PUT \
              http://localhost:{port}/api/plans/{plan_name}/tasks/{task_num}/status \
              -H \"Content-Type: application/json\" -d '{{\"status\":\"completed\"}}'",
             port = port,
@@ -709,9 +709,10 @@ pub fn build_task_prompt(
          IMPORTANT: When you think you are done, do NOT stop. Instead:\n\
          1. Summarize what you did\n\
          2. Record one short learning other tasks in this project should know (file paths established, key decisions, gotchas) by running: curl -s -X POST http://localhost:{port}/api/plans/{plan_name}/tasks/{task_num}/learnings -H \"Content-Type: application/json\" -d '{{\"learning\":\"...\"}}'\n\
+         3. Commit your changes with `git add -A && git commit -m '<short summary>'`. You MUST do this before marking the task completed — merges only carry committed work, and uncommitted changes are silently dropped when the next agent checks out the task branch.\n\
          {status_step}\n\
-         4. Ask the user if they need anything else\n\
-         5. Only stop when the user explicitly says they are done",
+         5. Ask the user if they need anything else\n\
+         6. Only stop when the user explicitly says they are done",
         intro = if is_continue {
             "You are continuing work on a partially implemented task. Some parts may already exist — check the current state of the code before making changes."
         } else {
@@ -1296,5 +1297,25 @@ mod tests {
             !prompt.contains("update_task_status"),
             "MCP tool should not be mentioned when unavailable: {prompt}"
         );
+    }
+
+    #[test]
+    fn build_task_prompt_mandates_commit_before_status_update() {
+        let (plan, phase, task) = sample_plan_for_prompt();
+        for mcp in [true, false] {
+            let prompt = build_task_prompt(&plan, &phase, &task, false, 3100, None, mcp);
+            assert!(
+                prompt.contains("git add -A && git commit"),
+                "expected commit mandate (mcp={mcp}): {prompt}"
+            );
+            let commit_idx = prompt.find("git add -A && git commit").unwrap();
+            let status_idx = prompt
+                .find("Mark the task status")
+                .expect("status step present");
+            assert!(
+                commit_idx < status_idx,
+                "commit step must precede status step (mcp={mcp})"
+            );
+        }
     }
 }
