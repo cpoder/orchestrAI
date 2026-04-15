@@ -1647,16 +1647,24 @@ mod tests {
         for id in ["check-alive", "check-dead"] {
             let (status, reason) = agent_status(&db, id);
             assert_eq!(status, "failed", "{id}: expected failed");
-            assert_eq!(reason.as_deref(), Some("orphaned"), "{id}: expected orphaned");
+            assert_eq!(
+                reason.as_deref(),
+                Some("orphaned"),
+                "{id}: expected orphaned"
+            );
         }
 
         let events = drain_events(&mut rx);
         assert!(
-            events.iter().any(|e| e.contains("check-alive") && e.contains("orphaned")),
+            events
+                .iter()
+                .any(|e| e.contains("check-alive") && e.contains("orphaned")),
             "missing orphan broadcast for check-alive: {events:?}"
         );
         assert!(
-            events.iter().any(|e| e.contains("check-dead") && e.contains("orphaned")),
+            events
+                .iter()
+                .any(|e| e.contains("check-dead") && e.contains("orphaned")),
             "missing orphan broadcast for check-dead: {events:?}"
         );
     }
@@ -1685,7 +1693,9 @@ mod tests {
 
         let events = drain_events(&mut rx);
         assert!(
-            events.iter().any(|e| e.contains("pty-dead") && e.contains("orphaned")),
+            events
+                .iter()
+                .any(|e| e.contains("pty-dead") && e.contains("orphaned")),
             "missing orphan broadcast: {events:?}"
         );
     }
@@ -1707,7 +1717,8 @@ mod tests {
         // that neither completed nor killed got touched.
         let events = drain_events(&mut rx);
         assert!(
-            !events.iter().any(|e| (e.contains("\"id\":\"done\"") || e.contains("\"id\":\"killed\""))
+            !events.iter().any(|e| (e.contains("\"id\":\"done\"")
+                || e.contains("\"id\":\"killed\""))
                 && e.contains("agent_stopped")),
             "terminal rows re-broadcast: {events:?}"
         );
