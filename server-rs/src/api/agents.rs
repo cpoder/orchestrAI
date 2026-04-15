@@ -270,6 +270,59 @@ pub async fn merge_agent_branch(
 
     let target = source_branch.unwrap_or_else(|| "main".to_string());
 
+    // Guard: refuse to merge a branch with no commits ahead of its source.
+    // Agents that exit before committing leave a branch that points at the
+    // same SHA as the source — merging it is a silent no-op that hides the
+    // real problem (the agent did no work). Return 409 so the UI can tell
+    // the user to retry or commit manually.
+    let revlist = std::process::Command::new("git")
+        .args([
+            "rev-list",
+            "--count",
+            &format!("{target}..{task_branch}"),
+        ])
+        .current_dir(&cwd)
+        .output();
+
+    match revlist {
+        Ok(output) if output.status.success() => {
+            let count: u64 = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            if count == 0 {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "task branch has no commits — agent exited without committing",
+                        "branch": task_branch,
+                        "target": target,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Failed to inspect branch commits: {stderr}")
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Failed to run git rev-list: {e}")
+                })),
+            )
+                .into_response();
+        }
+    }
+
     // Checkout the target branch
     let checkout = std::process::Command::new("git")
         .args(["checkout", &target])
