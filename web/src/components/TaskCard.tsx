@@ -82,6 +82,9 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
   const agents = useAgentStore((s) => s.agents);
   const selectAgent = useAgentStore((s) => s.selectAgent);
   const mergeAgentBranch = useAgentStore((s) => s.mergeAgentBranch);
+  const discardAgentBranch = useAgentStore((s) => s.discardAgentBranch);
+  const [discarding, setDiscarding] = useState(false);
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
 
   // Find a completed agent with an unmerged branch for this task
   const branchAgent = agents.find(
@@ -501,24 +504,67 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
               &#8594; {branchAgent.source_branch ?? "main"}
             </div>
           </div>
-          <button
-            onClick={async () => {
-              setMerging(true);
-              setError(null);
-              const result = await mergeAgentBranch(branchAgent.id);
-              if (result.ok) {
-                await selectPlan(planName);
-              } else {
-                setError(result.error ?? "Merge failed");
-              }
-              setMerging(false);
-            }}
-            disabled={merging}
-            className="flex-shrink-0 px-2 py-1 text-xs bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white rounded transition"
-            title={`Merge branch ${branchAgent.branch} into ${branchAgent.source_branch ?? "main"}`}
-          >
-            {merging ? "..." : "Merge"}
-          </button>
+          <div className="flex-shrink-0 flex items-center gap-1">
+            {confirmDiscard ? (
+              <>
+                <span className="text-[10px] text-red-400 mr-1">Delete branch?</span>
+                <button
+                  onClick={async () => {
+                    setDiscarding(true);
+                    setError(null);
+                    const result = await discardAgentBranch(branchAgent.id);
+                    if (result.ok) {
+                      await selectPlan(planName);
+                    } else {
+                      setError(result.error ?? "Discard failed");
+                    }
+                    setDiscarding(false);
+                    setConfirmDiscard(false);
+                  }}
+                  disabled={discarding}
+                  className="px-2 py-1 text-xs bg-red-700 hover:bg-red-600 disabled:opacity-50 text-white rounded transition"
+                >
+                  {discarding ? "..." : "Yes"}
+                </button>
+                <button
+                  onClick={() => setConfirmDiscard(false)}
+                  disabled={discarding}
+                  className="px-2 py-1 text-xs text-gray-400 hover:text-gray-200 disabled:opacity-50 transition"
+                >
+                  No
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  onClick={() => setConfirmDiscard(true)}
+                  disabled={merging}
+                  className="px-2 py-1 text-xs text-red-400/80 hover:text-red-300 hover:bg-red-950/40 disabled:opacity-50 rounded transition"
+                  title={`Delete branch ${branchAgent.branch} without merging`}
+                >
+                  Discard
+                </button>
+                <button
+                  onClick={async () => {
+                    setMerging(true);
+                    setError(null);
+                    const result = await mergeAgentBranch(branchAgent.id);
+                    if (result.ok) {
+                      await selectPlan(planName);
+                    } else {
+                      setError(result.error ?? "Merge failed");
+                    }
+                    setMerging(false);
+                  }}
+                  disabled={merging}
+                  className="px-2 py-1 text-xs bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white rounded transition"
+                  title={`Merge branch ${branchAgent.branch} into ${branchAgent.source_branch ?? "main"}`}
+                >
+                  {merging ? "..." : "Merge"}
+                </button>
+              </>
+            )}
+          </div>
         </div>
       )}
 
