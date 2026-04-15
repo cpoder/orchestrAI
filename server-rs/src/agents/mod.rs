@@ -286,15 +286,18 @@ impl AgentRegistry {
 
     /// Clean up dead agents and reattach alive ones (from previous server runs).
     ///
-    /// Three cases per row in `running|starting`:
-    /// 1. Has a `supervisor_socket` and the daemon PID is alive → try to
-    ///    reconnect. If the reconnect succeeds the agent is live again;
-    ///    otherwise it's marked `detached`.
-    /// 2. Has a `supervisor_socket` but the daemon PID is dead → the row
-    ///    is stale; mark `failed`.
-    /// 3. No `supervisor_socket` at all (pre-upgrade tmux row) → mark
-    ///    `detached` so the operator can kill and respawn without us
-    ///    guessing at tmux session names we no longer manage.
+    /// Every row in `running|starting` is either reattached or marked orphaned:
+    /// - **PTY mode**: if we have a `supervisor_socket`, the daemon PID is
+    ///   alive, and we can reconnect, the agent is live again. Any other
+    ///   outcome (no socket recorded, PID dead, connect refused) → orphaned.
+    /// - **Stream-JSON mode** (check agents): the server held the child's
+    ///   stdin/stdout; those handles are gone after a crash and there is no
+    ///   reattach path. Always orphaned.
+    ///
+    /// Broadcasting `agent_stopped` for each orphan is what lets the frontend
+    /// unlock task cards — without it, a server crash mid-run leaves
+    /// `taskLocked` true forever because the agent row never leaves the
+    /// `running`/`starting` set.
     pub async fn cleanup_and_reattach(&self) {
         let rows: Vec<(String, Option<i64>, Option<String>, String)> = {
             let db = self.db.lock().unwrap();
@@ -313,21 +316,19 @@ impl AgentRegistry {
         };
 
         for (id, pid, socket, mode) in rows {
-            // Stream-JSON check agents don't use a supervisor — their child
-            // process IS the claude CLI. Keep the old PID-liveness behaviour.
+            // Stream-JSON agents have no supervisor: the server itself held
+            // their stdin/stdout. After a restart those handles are gone —
+            // even if the PID happens to still be alive (or has been reused)
+            // we cannot talk to it. Orphan every row unconditionally.
             if mode != "pty" {
-                let alive = pid.map(process_alive).unwrap_or(false);
-                if !alive {
-                    self.mark_orphaned(&id, "stream-json child PID dead on boot");
-                }
+                self.mark_orphaned(&id, "stream-json agent: IO handles lost on server restart");
                 continue;
             }
 
             let socket_path = match socket.as_deref() {
                 Some(s) => PathBuf::from(s),
                 None => {
-                    // Pre-upgrade row — we never had a socket for this agent.
-                    self.mark_detached(&id, "no supervisor socket (pre-upgrade row)");
+                    self.mark_orphaned(&id, "no supervisor socket recorded");
                     continue;
                 }
             };
@@ -345,7 +346,10 @@ impl AgentRegistry {
                     socket_path.display()
                 );
             } else {
-                self.mark_detached(&id, "reconnect failed");
+                self.mark_orphaned(
+                    &id,
+                    &format!("supervisor socket unreachable: {}", socket_path.display()),
+                );
             }
         }
 
@@ -556,32 +560,6 @@ impl AgentRegistry {
         );
         println!(
             "[orchestrAI] Agent {} marked orphaned — {detail}",
-            &agent_id[..8.min(agent_id.len())]
-        );
-    }
-
-    /// Flip an agent to the `detached` status so the UI can offer a kill/
-    /// restart without pretending we still control the session.
-    fn mark_detached(&self, agent_id: &str, reason: &str) {
-        {
-            let db = self.db.lock().unwrap();
-            db.execute(
-                "UPDATE agents SET status = 'detached' WHERE id = ? AND status IN ('running', 'starting')",
-                rusqlite::params![agent_id],
-            )
-            .ok();
-        }
-        broadcast_event(
-            &self.broadcast_tx,
-            "agent_stopped",
-            serde_json::json!({
-                "id": agent_id,
-                "status": "detached",
-                "reason": reason,
-            }),
-        );
-        println!(
-            "[orchestrAI] Agent {} marked detached — {reason}",
             &agent_id[..8.min(agent_id.len())]
         );
     }
@@ -1570,5 +1548,168 @@ mod tests {
                 "commit step must precede status step (mcp={mcp})"
             );
         }
+    }
+
+    /// Build a registry wired to a fresh DB + an in-memory broadcast channel
+    /// so cleanup_and_reattach has everything it needs to run without
+    /// touching the filesystem or network.
+    fn test_registry(db: Db) -> (AgentRegistry, tokio::sync::broadcast::Receiver<String>) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(32);
+        let registry = AgentRegistry::new(
+            db,
+            tx,
+            None,
+            PathBuf::from("/tmp/orchestrai-test-sockets"),
+            PathBuf::from("/nonexistent/orchestrai-server"),
+            3100,
+        );
+        (registry, rx)
+    }
+
+    fn insert_agent(
+        db: &Db,
+        id: &str,
+        mode: &str,
+        status: &str,
+        pid: Option<i64>,
+        socket: Option<&str>,
+    ) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, cwd, status, mode, pid, supervisor_socket) \
+             VALUES (?1, '/tmp', ?2, ?3, ?4, ?5)",
+            params![id, status, mode, pid, socket],
+        )
+        .unwrap();
+    }
+
+    fn agent_status(db: &Db, id: &str) -> (String, Option<String>) {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT status, stop_reason FROM agents WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .unwrap()
+    }
+
+    fn drain_events(rx: &mut tokio::sync::broadcast::Receiver<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            out.push(msg);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn cleanup_orphans_pty_row_without_supervisor_socket() {
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        // PTY agent that never recorded a socket (pre-upgrade / crashed mid-spawn).
+        insert_agent(&db, "agent-no-sock", "pty", "running", Some(1), None);
+        registry.cleanup_and_reattach().await;
+
+        let (status, reason) = agent_status(&db, "agent-no-sock");
+        assert_eq!(status, "failed", "expected status=failed");
+        assert_eq!(reason.as_deref(), Some("orphaned"));
+
+        let events = drain_events(&mut rx);
+        assert!(
+            events.iter().any(|e| e.contains("agent_stopped")
+                && e.contains("agent-no-sock")
+                && e.contains("orphaned")),
+            "expected agent_stopped/orphaned broadcast, got: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_orphans_stream_json_agent_regardless_of_pid() {
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        // Use PID 1 (init) so process_alive returns true on Unix — we want to
+        // prove stream-json rows are orphaned even when the PID is alive,
+        // because the server lost the stdin/stdout handles.
+        insert_agent(&db, "check-alive", "stream-json", "running", Some(1), None);
+        // And a starting row with a dead PID, for good measure.
+        insert_agent(
+            &db,
+            "check-dead",
+            "stream-json",
+            "starting",
+            Some(0x7fff_ffff),
+            None,
+        );
+
+        registry.cleanup_and_reattach().await;
+
+        for id in ["check-alive", "check-dead"] {
+            let (status, reason) = agent_status(&db, id);
+            assert_eq!(status, "failed", "{id}: expected failed");
+            assert_eq!(reason.as_deref(), Some("orphaned"), "{id}: expected orphaned");
+        }
+
+        let events = drain_events(&mut rx);
+        assert!(
+            events.iter().any(|e| e.contains("check-alive") && e.contains("orphaned")),
+            "missing orphan broadcast for check-alive: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e.contains("check-dead") && e.contains("orphaned")),
+            "missing orphan broadcast for check-dead: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_orphans_pty_row_with_dead_supervisor_pid() {
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        // Socket present but PID very unlikely to be alive. i32::MAX is above
+        // the typical pid_max; kill(0) will return ESRCH.
+        insert_agent(
+            &db,
+            "pty-dead",
+            "pty",
+            "running",
+            Some(i32::MAX as i64),
+            Some("/tmp/orchestrai-test-sockets/does-not-exist.sock"),
+        );
+
+        registry.cleanup_and_reattach().await;
+
+        let (status, reason) = agent_status(&db, "pty-dead");
+        assert_eq!(status, "failed");
+        assert_eq!(reason.as_deref(), Some("orphaned"));
+
+        let events = drain_events(&mut rx);
+        assert!(
+            events.iter().any(|e| e.contains("pty-dead") && e.contains("orphaned")),
+            "missing orphan broadcast: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_leaves_non_running_rows_alone() {
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        // Rows already in a terminal state must not be rewritten.
+        insert_agent(&db, "done", "pty", "completed", Some(1), None);
+        insert_agent(&db, "killed", "pty", "killed", Some(1), None);
+
+        registry.cleanup_and_reattach().await;
+
+        assert_eq!(agent_status(&db, "done").0, "completed");
+        assert_eq!(agent_status(&db, "killed").0, "killed");
+        // reconcile passes run and may emit unrelated events; what matters is
+        // that neither completed nor killed got touched.
+        let events = drain_events(&mut rx);
+        assert!(
+            !events.iter().any(|e| (e.contains("\"id\":\"done\"") || e.contains("\"id\":\"killed\""))
+                && e.contains("agent_stopped")),
+            "terminal rows re-broadcast: {events:?}"
+        );
     }
 }
