@@ -202,6 +202,16 @@ function handleWsMessage(msg: { type: string; data: unknown }) {
         );
       }
       planStore.patchTaskStatus(d2.plan_name, d2.task_number, d2.status);
+      // Debounced authoritative refetch — guarantees convergence to server
+      // truth (doneCount, statuses for non-selected plans, MCP/agent-driven
+      // transitions) even when the signed-delta in patchTaskStatus can't see
+      // the prior value. Shares planRefreshTimer so bursts collapse with
+      // plan_updated events.
+      if (planRefreshTimer) clearTimeout(planRefreshTimer);
+      planRefreshTimer = setTimeout(() => {
+        planStore.fetchPlans();
+        planRefreshTimer = null;
+      }, 2000);
       break;
     }
     case "ci_status_changed": {
