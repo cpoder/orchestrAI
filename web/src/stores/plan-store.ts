@@ -50,6 +50,7 @@ export interface ParsedPlan {
   createdAt: string;
   modifiedAt: string;
   phases: PlanPhase[];
+  verification?: string | null;
   totalCostUsd?: number;
   maxBudgetUsd?: number | null;
 }

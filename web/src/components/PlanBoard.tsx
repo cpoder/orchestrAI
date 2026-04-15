@@ -237,6 +237,31 @@ export function PlanBoard() {
           <PhaseCard key={phase.number} phase={phase} planName={plan.name} statusFilter={statusFilter} />
         ))}
       </div>
+
+      <VerificationSection verification={plan.verification ?? null} />
+    </div>
+  );
+}
+
+function VerificationSection({ verification }: { verification: string | null }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!verification) return null;
+  return (
+    <div className="mt-6 pt-4 border-t border-gray-800">
+      <button
+        onClick={() => setExpanded((v) => !v)}
+        className="w-full flex items-center gap-2 text-left text-xs text-gray-500 hover:text-gray-300 transition"
+      >
+        <span className={`text-[10px] text-gray-600 transition-transform ${expanded ? "rotate-90" : ""}`}>
+          &#9654;
+        </span>
+        <span className="uppercase tracking-wide font-semibold">Verification</span>
+      </button>
+      {expanded && (
+        <div className="mt-3 text-sm text-gray-400 whitespace-pre-wrap max-w-3xl">
+          {verification}
+        </div>
+      )}
     </div>
   );
 }
