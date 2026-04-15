@@ -154,9 +154,34 @@ pub async fn fix_ci(
             .await
             .unwrap_or_else(|| "(no failure log available — check the CI run URL)".to_string());
 
-    // 5. Pre-create the recovery branch pointing at the failing SHA. The
-    //    spawn path's `git_checkout_branch(..., is_continue=true)` will
-    //    then just check it out.
+    // 5. Capture the current branch BEFORE we switch — start_pty_agent
+    //    derives source_branch from `git_current_branch()`, so without this
+    //    it would record the fix branch itself as the merge target and the
+    //    merge guard (`git rev-list --count <target>..<fix>`) would hit 0
+    //    and 409 legitimate fix commits. We write the correct value over
+    //    start_pty_agent's record once the row exists.
+    //
+    //    Best-effort: if a previous Fix CI attempt left the working tree
+    //    on a stale `orchestrai/fix/...` branch, try to land on the repo's
+    //    default trunk first so the captured value is a real merge target.
+    //    Ignored on failure (dirty tree, etc) — we fall back to whatever
+    //    git_current_branch reports.
+    for target in ["master", "main"] {
+        let ok = std::process::Command::new("git")
+            .args(["checkout", target])
+            .current_dir(&cwd)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            break;
+        }
+    }
+    let original_branch = crate::agents::git_current_branch(&cwd);
+
+    // Pre-create the recovery branch pointing at the failing SHA. The
+    // spawn path's `git_checkout_branch(..., is_continue=true)` will
+    // then just check it out.
     let fix_branch = format!(
         "orchestrai/fix/{plan}/{task}/{run}",
         plan = body.plan_name,
@@ -248,6 +273,19 @@ pub async fn fix_ci(
         },
     )
     .await;
+
+    // Overwrite the source_branch recorded by start_pty_agent — it saw the
+    // already-checked-out fix branch and wrote that as the target. The
+    // correct target is whatever was checked out before we stepped onto
+    // the fix branch (typically master/main).
+    if let Some(orig) = original_branch {
+        let conn = state.db.lock().unwrap();
+        conn.execute(
+            "UPDATE agents SET source_branch = ?1 WHERE id = ?2",
+            rusqlite::params![orig, agent_id],
+        )
+        .ok();
+    }
 
     Json(serde_json::json!({
         "agentId": agent_id,
