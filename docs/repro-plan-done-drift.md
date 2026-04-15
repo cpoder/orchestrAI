@@ -46,6 +46,42 @@ Server-side is correct: `GET /api/plans` returns `doneCount=10/11` and
   `web/src/components/ProjectDashboard.tsx:17-19`), so any upward drift
   immediately flips the plan into the done group.
 
+## Task 1.1 — root decision point confirmed
+
+`isPlanDone` is the sole gate that moves a plan into the "Done" section,
+in both the sidebar and the project dashboard. Both copies are
+byte-identical:
+
+```ts
+function isPlanDone(p: PlanSummary): boolean {
+  return p.taskCount > 0 && p.doneCount >= p.taskCount;
+}
+```
+
+(`web/src/components/Sidebar.tsx:19-21`,
+`web/src/components/ProjectDashboard.tsx:17-19`.)
+
+Decision is purely arithmetic on `PlanSummary`:
+
+- `Sidebar.tsx:80` — `if (isPlanDone(p)) g.done.push(p) else g.active.push(p)`.
+  No other status comparison exists in the grouping loop.
+- `ProjectDashboard.tsx:77-78` —
+  `activePlans: sortedPlans.filter((p) => !isPlanDone(p))` /
+  `donePlans: sortedPlans.filter(isPlanDone)`. All downstream uses of
+  `donePlans` (lines 215, 269, 275-276) consume that filtered array
+  without re-checking task statuses.
+
+`PlanSummary` (`web/src/stores/plan-store.ts:67-78`) carries
+`doneCount` and `taskCount` as flat numbers; neither file inspects
+`PlanTask.status` (e.g. `in_progress`, `failed`) when deciding
+done-ness. So once `doneCount` drifts above `taskCount` (per Task 0.2),
+the plan flips into "Done" regardless of any task being visibly
+`in_progress`.
+
+Confirms the acceptance criterion: `isPlanDone(p)` depends solely on
+`p.doneCount >= p.taskCount` (with the `taskCount > 0` guard); there is
+no per-status check.
+
 ## Task 0.3 — server-side confirmation
 
 With `0.1 completed`, `0.2 completed`, `0.3 in_progress`, and all other
