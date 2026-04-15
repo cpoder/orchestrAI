@@ -95,3 +95,40 @@ tasks `skipped` (10 effective done out of 11), `curl /api/plans` returns:
 correctly reports the in_progress task as not done. The bug is isolated
 to the frontend's optimistic `patchTaskStatus`; the backend never claims
 the plan is complete in this state.
+
+## Task 1.2 — drifting mutation pinpointed
+
+Root cause confirmed in `patchTaskStatus`
+(`web/src/stores/plan-store.ts:161-189`):
+
+```ts
+const delta =
+  status === "completed" || status === "skipped" ? 1 : 0;
+// We don't know the previous status precisely, so just refetch later
+return { ...p, doneCount: p.doneCount + delta };
+```
+
+Three independent failure modes follow from this delta:
+
+1. **One-way / never decrements.** `delta` is `+1` or `0` only. A
+   transition out of `completed`/`skipped` (e.g. `completed → in_progress`
+   in step 2 of the repro) leaves `doneCount` untouched. The cached
+   number can only grow.
+2. **Double-counts re-entry.** No comparison against the prior task
+   status, so any duplicate `task_status_changed` for an already-done
+   task (e.g. `completed → completed`, or `skipped → completed`) adds
+   another `+1`. The repro hits this on step 3 when `0.1` (already
+   completed server-side) is re-marked.
+3. **No refetch safety net.** The inline comment promises a "refetch
+   later" but no caller schedules one. The `task_status_changed` handler
+   (`web/src/stores/ws-store.ts:195-206`) only invokes
+   `planStore.patchTaskStatus(...)`; the debounced `fetchPlans()` in
+   `ws-store.ts:128-132` is wired to `plan_updated` exclusively, so the
+   drift is never reconciled against the server's authoritative
+   `doneCount`.
+
+These three effects compose exactly into the table at the top of this
+doc (server `doneCount = 10/11`, frontend `doneCount = 12/11`).
+
+**Acceptance**: `patchTaskStatus` applies an unsigned `+1` delta, never
+decrements, and `task_status_changed` has no refetch safety net.
