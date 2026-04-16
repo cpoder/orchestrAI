@@ -3,6 +3,9 @@
 # Plans can be written in YAML (.yaml/.yml) or Markdown (.md).
 # YAML is the preferred format for new plans. Both produce identical
 # results in the dashboard.
+#
+# Tasks that don't produce a commit (e.g. investigation, reproduction)
+# should set `produces_commit: false` to hide the Merge button.
 
 title: "Plan Title"
 context: |
@@ -26,6 +29,7 @@ phases:
           - path/to/another/file.ts
         acceptance: "Success criteria for this task."
         dependencies: []
+        # produces_commit: false  # set on investigation/repro tasks to hide Merge
 
       - number: "0.2"
         title: "Second Task"
