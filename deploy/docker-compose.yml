@@ -17,7 +17,7 @@ services:
       - ORCHESTRAI_WEBHOOK_URL=${ORCHESTRAI_WEBHOOK_URL:-}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3100/health"]
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3100/health"]
       interval: 15s
       timeout: 5s
       retries: 3
