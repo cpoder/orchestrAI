@@ -1,4 +1,4 @@
-.PHONY: build build-web build-server dev dev-web dev-server test test-web clean
+.PHONY: build build-web build-server dev dev-web dev-server test test-web e2e clean
 
 # Build everything: frontend first (so Rust can embed it), then server
 build: build-web build-server
@@ -23,6 +23,9 @@ test: test-web
 
 test-web:
 	cd web && pnpm test
+
+e2e:
+	./tests/e2e/run.sh
 
 clean:
 	rm -rf web/dist
