@@ -141,3 +141,88 @@ Single-task plan, auto-inferred as "completed" because `nfa.rs` exists.
 1. Cap `infer_status` at "in_progress" — never auto-complete
 2. Add `source` column to `task_status` (auto vs manual vs agent)
 3. Clean up stale auto-inferred "completed" rows
+
+---
+
+## Task 0.2 — Trigger auto-status and observe the heuristic
+
+### Method
+
+Cleared the `task_status` DB rows for both plans (scheduler: all 7,
+portable-agents-and-mcp: 3 sample tasks), then called
+`POST /api/plans/{name}/auto-status` to force `infer_status` to run
+fresh instead of returning `"existing (kept)"`.
+
+### scheduler auto-status response (all 7 tasks re-inferred)
+
+```json
+{
+    "plan": "scheduler",
+    "project": "orchestrAI",
+    "projectDir": "/home/cpo/orchestrAI",
+    "results": [
+        {"taskNumber": "1.1", "status": "completed", "reason": "2/2 files exist",
+         "title": "Conflict check in `start_task`"},
+        {"taskNumber": "1.2", "status": "completed", "reason": "2/2 files exist",
+         "title": "Frontend surfaces the 409 clearly"},
+        {"taskNumber": "1.3", "status": "completed", "reason": "4/4 files exist",
+         "title": "Opt-in auto-queue instead of hard 409"},
+        {"taskNumber": "2.1", "status": "completed", "reason": "1/1 files exist",
+         "title": "Task card shows \"blocked by\" reasons"},
+        {"taskNumber": "2.2", "status": "completed", "reason": "2/2 files exist",
+         "title": "Plan-level \"Ready to start\" summary"},
+        {"taskNumber": "3.1", "status": "completed", "reason": "3/3 files exist",
+         "title": "Per-plan auto-advance flag"},
+        {"taskNumber": "3.2", "status": "completed", "reason": "2/2 files exist",
+         "title": "\"Run Plan\" button"}
+    ],
+    "summary": {"completed": 7, "in_progress": 0, "pending": 0, "total": 7}
+}
+```
+
+**Every task marked "completed" solely because files exist.** None has a
+single agent run or manual status update — the heuristic is the only signal.
+
+### portable-agents-and-mcp auto-status (3 tasks re-inferred)
+
+Cleared tasks 0.5, 2.1, 3.7 and re-triggered:
+
+```json
+{"taskNumber": "0.5", "status": "completed", "reason": "1/1 files exist",
+ "title": "Remove tmux as a dependency"}
+{"taskNumber": "2.1", "status": "completed", "reason": "1/1 files exist",
+ "title": "Choose MCP implementation — Rust SDK"}
+{"taskNumber": "3.7", "status": "completed", "reason": "3/3 files exist",
+ "title": "Deployment artifacts"}
+```
+
+These tasks happen to be genuinely complete (agents ran), but
+`infer_status` produces the identical result for any plan whose tasks
+reference existing files.
+
+### The heuristic code path
+
+```
+POST /api/plans/:name/auto-status
+  → api/plans.rs:771-827  (auto_status_plan handler)
+    → for each task: check if task_status row exists
+      → YES: return "existing (kept)", skip
+      → NO:  call auto_status::infer_status(project_dir, file_paths, _)
+        → auto_status.rs:100-126
+          → count files found via find_file_in_project
+          → ≥80% exist → "completed", "N/N files exist"
+          → INSERT INTO task_status
+```
+
+### Confirmed root cause
+
+The file-existence heuristic (`auto_status.rs:113`, `ratio >= 0.8`)
+is the sole source of false positives. It:
+
+1. Treats file *existence* as proof of task *completion*
+2. Has no concept of file creation time vs plan creation time
+3. Has no concept of agent work — tasks are "completed" without
+   any agent ever running
+4. Persists the inferred status to DB, where it is never re-evaluated
+5. Once persisted, `isPlanDone` in `Sidebar.tsx:19` consumes the
+   false `doneCount` and misclassifies the plan as Done
