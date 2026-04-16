@@ -15,7 +15,7 @@ use axum::{
 };
 use rusqlite::params;
 use serde::Deserialize;
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, mpsc};
 
 use crate::db::Db;
 use crate::state::AppState;

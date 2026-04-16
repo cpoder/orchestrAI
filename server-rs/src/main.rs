@@ -10,6 +10,7 @@ mod hooks;
 mod mcp;
 mod notifications;
 mod plan_parser;
+mod saas;
 mod state;
 mod static_files;
 mod templates;
@@ -320,6 +321,17 @@ async fn run_server(cli: Cli) {
         .route(
             "/api/orgs/{slug}/members/{user_id}/role",
             axum::routing::put(auth::orgs::update_member_role),
+        )
+        // Remote runners (SaaS)
+        .route("/ws/runner", get(saas::runner_ws::runner_ws_handler))
+        .route(
+            "/api/runners/tokens",
+            post(saas::runner_ws::create_runner_token),
+        )
+        .route("/api/runners", get(saas::runner_ws::list_runners))
+        .route(
+            "/api/runners/{runner_id}/commands",
+            post(saas::runner_ws::send_runner_command),
         )
         // Populate AuthUser on every request. Protected handlers opt in by
         // taking `AuthUser` as an extractor; public routes (health, login,

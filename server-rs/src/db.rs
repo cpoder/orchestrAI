@@ -212,9 +212,36 @@ fn migrate(conn: &Connection) {
             FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_plan_org_org ON plan_org(org_id);
+
+        -- Remote runners (SaaS foundation)
+        CREATE TABLE IF NOT EXISTS runners (
+            id           TEXT PRIMARY KEY,
+            name         TEXT,
+            org_id       TEXT NOT NULL DEFAULT 'default-org',
+            status       TEXT NOT NULL DEFAULT 'offline',
+            hostname     TEXT,
+            version      TEXT,
+            last_seen_at TEXT,
+            created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_runners_org ON runners(org_id);
+
+        CREATE TABLE IF NOT EXISTS runner_tokens (
+            token_hash   TEXT PRIMARY KEY,
+            runner_name  TEXT NOT NULL,
+            org_id       TEXT NOT NULL DEFAULT 'default-org',
+            created_by   TEXT NOT NULL,
+            created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (created_by) REFERENCES users(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_runner_tokens_org ON runner_tokens(org_id);
         ",
     )
     .expect("failed to run schema migration");
+
+    // Server-side outbox + seq tracker for runner communication.
+    crate::saas::outbox::init_server_inbox(conn);
+    crate::saas::outbox::init_seq_tracker(conn);
 
     // Add columns for existing databases
     conn.execute_batch("ALTER TABLE agents ADD COLUMN base_commit TEXT;")

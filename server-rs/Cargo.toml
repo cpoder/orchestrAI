@@ -29,6 +29,12 @@ rmcp = { version = "1.4", default-features = false, features = ["server", "macro
 schemars = "1"
 bcrypt = "0.19"
 rand = "0.9"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+
+[[bin]]
+name = "orchestrai-runner"
+path = "src/bin/orchestrai_runner.rs"
 
 [dev-dependencies]
 tempfile = "3"

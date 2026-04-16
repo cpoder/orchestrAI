@@ -6,6 +6,7 @@ use tokio::sync::broadcast;
 use crate::agents::AgentRegistry;
 use crate::config::{Config, Effort};
 use crate::db::Db;
+use crate::saas::runner_ws::RunnerRegistry;
 
 /// Shared application state, cheaply cloneable via Arc.
 #[derive(Clone)]
@@ -16,6 +17,8 @@ pub struct AppState {
     pub effort: Arc<std::sync::Mutex<Effort>>,
     pub broadcast_tx: broadcast::Sender<String>,
     pub registry: AgentRegistry,
+    /// In-memory registry of currently connected remote runners.
+    pub runners: RunnerRegistry,
 }
 
 impl AppState {
@@ -32,6 +35,7 @@ impl AppState {
             effort: Arc::new(std::sync::Mutex::new(config.effort)),
             broadcast_tx,
             registry,
+            runners: crate::saas::runner_ws::new_runner_registry(),
         }
     }
 

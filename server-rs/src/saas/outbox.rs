@@ -8,6 +8,8 @@
 //! This module is **self-contained** — no `crate::` dependencies — so it
 //! can be `#[path]`-included by the standalone `orchestrai_runner` binary.
 
+#![allow(dead_code)] // Both binaries include this module but each uses a different subset.
+
 use rusqlite::{Connection, params};
 
 // ── Table names ─────────────────────────────────────────────────────────────
