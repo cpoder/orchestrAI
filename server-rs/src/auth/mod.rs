@@ -1,5 +1,6 @@
 pub mod orgs;
 pub mod sessions;
+pub mod sso;
 
 use axum::{
     Json,

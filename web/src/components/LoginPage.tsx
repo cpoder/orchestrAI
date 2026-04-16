@@ -1,5 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useAuthStore } from "../stores/auth-store.js";
+import type { SsoLoginOption } from "../stores/auth-store.js";
+import { fetchJson } from "../api.js";
 
 type Mode = "login" | "signup";
 
@@ -9,11 +11,19 @@ const ERROR_MESSAGES: Record<string, string> = {
   invalid_email: "Please enter a valid email address.",
   password_too_short: "Password must be at least 8 characters.",
   password_too_long: "Password must be 72 characters or fewer.",
+  // SSO errors (set as ?sso_error= query param by the server callback)
+  idp_error: "Your identity provider returned an error.",
+  invalid_state: "SSO session expired. Please try again.",
+  invalid_token: "Identity verification failed.",
+  missing_email: "Your identity provider did not return an email address.",
+  provisioning_failed: "Failed to create your account. Please contact an admin.",
+  issuer_mismatch: "Identity provider mismatch.",
+  saml_not_success: "SAML authentication was not successful.",
 };
 
 function humanize(code: string | null): string | null {
   if (!code) return null;
-  return ERROR_MESSAGES[code] ?? code;
+  return ERROR_MESSAGES[code] ?? code.replace(/_/g, " ");
 }
 
 export function LoginPage() {
@@ -21,9 +31,40 @@ export function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [ssoProviders, setSsoProviders] = useState<SsoLoginOption[]>([]);
   const error = useAuthStore((s) => s.error);
   const login = useAuthStore((s) => s.login);
   const signup = useAuthStore((s) => s.signup);
+
+  // Check for SSO error from callback redirect.
+  const [ssoError] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    const err = params.get("sso_error");
+    if (err) {
+      // Clean up the URL so the error doesn't persist on refresh.
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+    return err;
+  });
+
+  // Discover SSO providers when the user enters an email with a domain.
+  useEffect(() => {
+    if (!email.includes("@") || mode !== "login") {
+      setSsoProviders([]);
+      return;
+    }
+    const timer = setTimeout(async () => {
+      try {
+        const providers = await fetchJson<SsoLoginOption[]>(
+          `/api/auth/sso/providers?email=${encodeURIComponent(email)}`
+        );
+        setSsoProviders(providers);
+      } catch {
+        setSsoProviders([]);
+      }
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [email, mode]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -47,6 +88,8 @@ export function LoginPage() {
   const submitLabel = mode === "login" ? "Sign in" : "Sign up";
   const toggleLabel =
     mode === "login" ? "Need an account? Sign up" : "Already have an account? Sign in";
+
+  const displayError = ssoError || error;
 
   return (
     <div className="flex h-screen items-center justify-center bg-gray-950 text-gray-100">
@@ -84,9 +127,9 @@ export function LoginPage() {
           placeholder="********"
         />
 
-        {error && (
+        {displayError && (
           <div className="mb-3 text-xs text-red-400 bg-red-900/20 border border-red-900/40 rounded px-2 py-1.5">
-            {humanize(error)}
+            {humanize(displayError)}
           </div>
         )}
 
@@ -95,8 +138,27 @@ export function LoginPage() {
           disabled={submitting || !email || !password}
           className="w-full bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-800 disabled:text-gray-400 text-white text-sm font-medium rounded py-2 transition"
         >
-          {submitting ? "…" : submitLabel}
+          {submitting ? "\u2026" : submitLabel}
         </button>
+
+        {ssoProviders.length > 0 && (
+          <div className="mt-4 space-y-2">
+            <div className="flex items-center gap-2">
+              <div className="flex-1 border-t border-gray-800" />
+              <span className="text-xs text-gray-600">or</span>
+              <div className="flex-1 border-t border-gray-800" />
+            </div>
+            {ssoProviders.map((p) => (
+              <a
+                key={p.id}
+                href={p.loginUrl}
+                className="block w-full bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-200 text-sm font-medium rounded py-2 text-center transition"
+              >
+                Sign in with {p.name}
+              </a>
+            ))}
+          </div>
+        )}
 
         <button
           type="button"

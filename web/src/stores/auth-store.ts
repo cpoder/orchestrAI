@@ -7,6 +7,13 @@ export interface AuthUser {
   orgId?: string;
 }
 
+export interface SsoLoginOption {
+  id: string;
+  name: string;
+  protocol: string;
+  loginUrl: string;
+}
+
 interface AuthStore {
   user: AuthUser | null;
   /// `true` until the first /api/auth/me completes. UI should avoid deciding

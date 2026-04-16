@@ -29,6 +29,11 @@ pub mod actions {
     pub const PLAN_UPDATE: &str = "plan.update";
     pub const AUTH_SIGNUP: &str = "auth.signup";
     pub const AUTH_LOGIN: &str = "auth.login";
+    pub const SSO_LOGIN: &str = "sso.login";
+    pub const SSO_JIT_PROVISION: &str = "sso.jit_provision";
+    pub const SSO_PROVIDER_CREATE: &str = "sso.provider_create";
+    pub const SSO_PROVIDER_UPDATE: &str = "sso.provider_update";
+    pub const SSO_PROVIDER_DELETE: &str = "sso.provider_delete";
 }
 
 /// Resource types for audit entries.
@@ -40,6 +45,7 @@ pub mod resources {
     pub const ORG: &str = "org";
     pub const USER: &str = "user";
     pub const CONFIG: &str = "config";
+    pub const SSO_PROVIDER: &str = "sso_provider";
 }
 
 /// A single audit log entry as returned by the API.

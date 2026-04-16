@@ -288,6 +288,52 @@ fn migrate(conn: &Connection) {
         CREATE INDEX IF NOT EXISTS idx_audit_org_created ON audit_logs(org_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action);
         CREATE INDEX IF NOT EXISTS idx_audit_resource ON audit_logs(resource_type, resource_id);
+
+        -- ── SSO (SAML/OIDC) ─────────────────────────────────────────────────
+        CREATE TABLE IF NOT EXISTS sso_providers (
+            id              TEXT PRIMARY KEY,
+            org_id          TEXT NOT NULL,
+            protocol        TEXT NOT NULL CHECK(protocol IN ('oidc', 'saml')),
+            name            TEXT NOT NULL,
+            enabled         INTEGER NOT NULL DEFAULT 1,
+            email_domains   TEXT,
+            issuer_url      TEXT,
+            client_id       TEXT,
+            client_secret   TEXT,
+            idp_entity_id   TEXT,
+            idp_sso_url     TEXT,
+            idp_certificate TEXT,
+            sp_entity_id    TEXT,
+            groups_claim    TEXT DEFAULT 'groups',
+            group_role_mapping TEXT,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_sso_providers_org ON sso_providers(org_id);
+
+        CREATE TABLE IF NOT EXISTS sso_accounts (
+            id          TEXT PRIMARY KEY,
+            user_id     TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            external_id TEXT NOT NULL,
+            email       TEXT NOT NULL,
+            groups      TEXT,
+            last_login_at TEXT,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (provider_id) REFERENCES sso_providers(id) ON DELETE CASCADE,
+            UNIQUE (provider_id, external_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_sso_accounts_user ON sso_accounts(user_id);
+
+        CREATE TABLE IF NOT EXISTS sso_auth_state (
+            state       TEXT PRIMARY KEY,
+            provider_id TEXT NOT NULL,
+            pkce_verifier TEXT,
+            nonce       TEXT,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
         ",
     )
     .expect("failed to run schema migration");

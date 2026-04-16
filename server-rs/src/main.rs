@@ -323,6 +323,37 @@ async fn run_server(cli: Cli) {
             "/api/orgs/{slug}/members/{user_id}/role",
             axum::routing::put(auth::orgs::update_member_role),
         )
+        // SSO admin (per-org provider management)
+        .route(
+            "/api/orgs/{slug}/sso",
+            get(auth::sso::list_providers).post(auth::sso::create_provider),
+        )
+        .route(
+            "/api/orgs/{slug}/sso/{provider_id}",
+            axum::routing::put(auth::sso::update_provider)
+                .delete(auth::sso::delete_provider),
+        )
+        // SSO public (login flow)
+        .route(
+            "/api/auth/sso/providers",
+            get(auth::sso::discover_providers),
+        )
+        .route(
+            "/api/auth/sso/{provider_id}/login",
+            get(auth::sso::sso_login),
+        )
+        .route(
+            "/api/auth/sso/{provider_id}/callback",
+            get(auth::sso::oidc_callback),
+        )
+        .route(
+            "/api/auth/sso/{provider_id}/saml/acs",
+            post(auth::sso::saml_acs),
+        )
+        .route(
+            "/api/auth/sso/{provider_id}/saml/metadata",
+            get(auth::sso::saml_metadata),
+        )
         // Org billing / budgets
         .route("/api/orgs/{slug}/usage", get(api::billing::get_usage))
         .route(

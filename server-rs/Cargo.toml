@@ -32,6 +32,11 @@ rand = "0.9"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 lettre = { version = "0.11", default-features = false, features = ["builder", "tokio1-rustls-tls", "smtp-transport"] }
+jsonwebtoken = "9"
+base64 = "0.22"
+quick-xml = "0.37"
+flate2 = "1"
+sha2 = "0.10"
 
 [[bin]]
 name = "orchestrai-runner"
