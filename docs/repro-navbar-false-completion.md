@@ -226,3 +226,124 @@ is the sole source of false positives. It:
 4. Persists the inferred status to DB, where it is never re-evaluated
 5. Once persisted, `isPlanDone` in `Sidebar.tsx:19` consumes the
    false `doneCount` and misclassifies the plan as Done
+
+---
+
+## Task 1.1 — Trace the `infer_status` heuristic
+
+### The function under inspection
+
+`infer_status` lives at `server-rs/src/auto_status.rs:95-126`. The body
+is small enough to quote in full:
+
+```rust
+pub fn infer_status(
+    project_dir: &Path,
+    file_paths: &[String],
+    _title_words: &[&str],
+) -> (&'static str, String) {
+    let total_checked = file_paths.len();
+
+    if total_checked == 0 {
+        return ("pending", "no file paths to check".into());   // ← branch A
+    }
+
+    let found_count = file_paths
+        .iter()
+        .filter(|fp| find_file_in_project(project_dir, fp))
+        .count();
+
+    let ratio = found_count as f64 / total_checked as f64;
+    if ratio >= 0.8 {
+        ("completed", format!("{found_count}/{total_checked} files exist"))   // ← branch B
+    } else if found_count > 0 {
+        ("in_progress", format!("{found_count}/{total_checked} files exist"))
+    } else {
+        ("pending", format!("0/{total_checked} files exist"))
+    }
+}
+```
+
+The third argument (`_title_words`) is unused — git-history grep was
+disabled because common keywords (`server`, `driver`, `agent`) match
+too many existing commits. So the only signal is file existence.
+
+### Decision table
+
+| `file_paths.len()` | `found_count` | `ratio` | Result |
+|--------------------|---------------|---------|--------|
+| 0                  | n/a           | n/a     | `pending` ("no file paths to check") |
+| N ≥ 1              | ≥ 0.8·N       | ≥ 0.80  | **`completed`** (`N/N files exist`) |
+| N ≥ 1              | 1..0.8·N      | 0..0.80 | `in_progress` |
+| N ≥ 1              | 0             | 0.00    | `pending` |
+
+The pivotal row is the second: **branch B at line 113 returns
+`"completed"`** based purely on the ratio of files-on-disk to
+files-listed. This is the root cause.
+
+### Why branch B is wrong
+
+`find_file_in_project` (auto_status.rs:5-45) returns `true` if a path
+exists *right now*, with no regard for:
+
+- **When the file was created.** A pre-existing `server-rs/src/api/plans.rs`
+  satisfies a brand-new task whose description is "add feature X to plans.rs".
+- **What changed inside it.** The check is `path.exists()`, not a content
+  diff or a git-blame on the listed lines.
+- **Whether any agent ran.** A plan can be marked "completed" with zero
+  rows in the `agents` table.
+- **The plan's own creation time.** A plan whose YAML was written this
+  morning will be auto-completed if its referenced files happen to exist.
+
+This is why the scheduler plan (Task 0.1 evidence) flips to "completed"
+instantly: every referenced file (`api/plans.rs`, `agents/mod.rs`,
+`TaskCard.tsx`, `agent-store.ts`, …) is a long-lived core file that
+predates the plan by months. The 80 % threshold, plus the fact that
+listing 1–4 files makes `0.8` trivially reachable (`1/1 = 1.0`,
+`2/2 = 1.0`, `4/4 = 1.0`), makes branch B the *expected* outcome for
+any plan that anchors its tasks to existing modules.
+
+### Code path that bakes the false positive into the DB
+
+```
+caller                                    file:line
+──────────────────────────────────────    ───────────────────────────────
+POST /api/plans/:name/auto-status   →     api/plans.rs:771-813
+   (skipped if DB row exists,             api/plans.rs:775
+    so the heuristic only writes
+    once per task)
+   ↓
+auto_status::infer_status            →    auto_status.rs:95-126
+   ratio ≥ 0.8 → "completed"              auto_status.rs:113   ← root cause
+   ↓
+INSERT INTO task_status              →    api/plans.rs:796-803
+   ↓
+GET /api/plans recomputes doneCount  →    api/plans.rs:99-105
+   from task_status (status IN
+   ('completed','skipped'))
+   ↓
+Sidebar isPlanDone(p)                →    Sidebar.tsx:19-21
+   doneCount >= taskCount  →  Done fold
+```
+
+Each downstream step is correct in isolation: the API counts what the
+DB says, the sidebar reads what the API ships. The fault is the *value
+written* by line 113.
+
+### Acceptance criteria for Task 1.1
+
+> Root cause documented: `infer_status` ≥80 % threshold produces false
+> `completed` for tasks whose files pre-exist.
+
+✅ Confirmed. The ≥0.8 branch at `server-rs/src/auto_status.rs:113`
+returns `"completed"` whenever the listed files exist on disk, with no
+guard for file age, content, or agent activity. Phase 2 (Tasks 2.1-2.3)
+will:
+
+- Cap `infer_status` at `in_progress` so file existence can never
+  produce `completed` (Task 2.1 — change line 113's branch).
+- Add a `source` column to `task_status` so re-runs of auto-status can
+  overwrite their own prior `auto` rows but never overwrite `manual`
+  ones (Task 2.2).
+- Provide a cleanup path for legacy bulk-inferred `completed` rows
+  (Task 2.3).
