@@ -409,6 +409,14 @@ fn migrate(conn: &Connection) {
     conn.execute_batch("ALTER TABLE agents ADD COLUMN user_id TEXT;")
         .ok();
 
+    // Distinguishes auto-inferred status rows ('auto') from explicit user or
+    // agent updates ('manual'). NULL on rows written before this column
+    // existed — treated as overwritable by auto_status alongside 'auto' rows
+    // so a one-time conservative re-run can correct legacy false positives.
+    // Only source='manual' is sticky against re-inference.
+    conn.execute_batch("ALTER TABLE task_status ADD COLUMN source TEXT DEFAULT NULL;")
+        .ok();
+
     // Seed the default org and migrate orphaned users/plans into it.
     crate::auth::orgs::ensure_default_org(conn);
 }
@@ -596,6 +604,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "completed");
+    }
+
+    #[test]
+    fn task_status_source_column_defaults_null_and_round_trips() {
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+
+        // Pre-source-column legacy write: source defaults to NULL.
+        conn.execute(
+            "INSERT INTO task_status (plan_name, task_number, status) VALUES (?1, ?2, ?3)",
+            params!["plan-a", "1.1", "completed"],
+        )
+        .unwrap();
+        let legacy: Option<String> = conn
+            .query_row(
+                "SELECT source FROM task_status WHERE plan_name=?1 AND task_number=?2",
+                params!["plan-a", "1.1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy, None);
+
+        // 'auto' and 'manual' values round-trip.
+        conn.execute(
+            "INSERT INTO task_status (plan_name, task_number, status, source) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params!["plan-a", "1.2", "in_progress", "auto"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_status (plan_name, task_number, status, source) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params!["plan-a", "1.3", "completed", "manual"],
+        )
+        .unwrap();
+        let auto: Option<String> = conn
+            .query_row(
+                "SELECT source FROM task_status WHERE plan_name=?1 AND task_number=?2",
+                params!["plan-a", "1.2"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let manual: Option<String> = conn
+            .query_row(
+                "SELECT source FROM task_status WHERE plan_name=?1 AND task_number=?2",
+                params!["plan-a", "1.3"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(auto.as_deref(), Some("auto"));
+        assert_eq!(manual.as_deref(), Some("manual"));
     }
 
     #[test]

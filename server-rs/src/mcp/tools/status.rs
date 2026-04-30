@@ -146,10 +146,12 @@ impl BranchworkMcp {
         {
             let db = self.ctx.db.lock().unwrap();
             db.execute(
-                "INSERT INTO task_status (plan_name, task_number, status, updated_at)
-                 VALUES (?1, ?2, ?3, datetime('now'))
+                "INSERT INTO task_status (plan_name, task_number, status, source, updated_at)
+                 VALUES (?1, ?2, ?3, 'manual', datetime('now'))
                  ON CONFLICT(plan_name, task_number)
-                 DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at",
+                 DO UPDATE SET status = excluded.status,
+                               source = 'manual',
+                               updated_at = excluded.updated_at",
                 params![req.plan, req.task, req.status],
             )
             .map_err(|e| {
@@ -282,10 +284,12 @@ impl BranchworkMcp {
         {
             let db = self.ctx.db.lock().unwrap();
             db.execute(
-                "INSERT INTO task_status (plan_name, task_number, status, updated_at)
-                 VALUES (?1, ?2, 'failed', datetime('now'))
+                "INSERT INTO task_status (plan_name, task_number, status, source, updated_at)
+                 VALUES (?1, ?2, 'failed', 'manual', datetime('now'))
                  ON CONFLICT(plan_name, task_number)
-                 DO UPDATE SET status = 'failed', updated_at = excluded.updated_at",
+                 DO UPDATE SET status = 'failed',
+                               source = 'manual',
+                               updated_at = excluded.updated_at",
                 params![req.plan, req.task],
             )
             .map_err(|e| {

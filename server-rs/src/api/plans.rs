@@ -526,10 +526,12 @@ pub async fn set_task_status(
         .ok();
 
     db.execute(
-        "INSERT INTO task_status (plan_name, task_number, status, updated_at)
-         VALUES (?1, ?2, ?3, datetime('now'))
+        "INSERT INTO task_status (plan_name, task_number, status, source, updated_at)
+         VALUES (?1, ?2, ?3, 'manual', datetime('now'))
          ON CONFLICT(plan_name, task_number)
-         DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at",
+         DO UPDATE SET status = excluded.status,
+                       source = 'manual',
+                       updated_at = excluded.updated_at",
         params![name, task_number, body.status],
     )
     .unwrap();
@@ -748,14 +750,15 @@ pub async fn auto_status(
 
     let db = state.db.lock().unwrap();
 
-    // Load existing manual statuses
+    // Load only manual statuses — auto-inferred rows (source='auto') and
+    // legacy NULL rows are overwritable by re-inference.
     let mut manual: HashMap<String, String> = HashMap::new();
-    if let Ok(mut stmt) =
-        db.prepare("SELECT task_number, status FROM task_status WHERE plan_name = ?")
-        && let Ok(rows) = stmt.query_map(params![name], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-    {
+    if let Ok(mut stmt) = db.prepare(
+        "SELECT task_number, status FROM task_status \
+         WHERE plan_name = ? AND source = 'manual'",
+    ) && let Ok(rows) = stmt.query_map(params![name], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) {
         for row in rows.flatten() {
             manual.insert(row.0, row.1);
         }
@@ -770,8 +773,7 @@ pub async fn auto_status(
 
     for phase in &plan.phases {
         for task in &phase.tasks {
-            // If a status already exists in DB (manual or prior auto), keep it.
-            // Only auto-infer for tasks with no DB row at all.
+            // Manual statuses are sticky — never overwrite them.
             if let Some(s) = manual.get(&task.number) {
                 let s = s.clone();
                 *summary.entry(s.clone()).or_insert(0) += 1;
@@ -794,10 +796,12 @@ pub async fn auto_status(
                 auto_status::infer_status(&project_dir, &task.file_paths, &title_words);
 
             db.execute(
-                "INSERT INTO task_status (plan_name, task_number, status, updated_at)
-                 VALUES (?1, ?2, ?3, datetime('now'))
+                "INSERT INTO task_status (plan_name, task_number, status, source, updated_at)
+                 VALUES (?1, ?2, ?3, 'auto', datetime('now'))
                  ON CONFLICT(plan_name, task_number)
-                 DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at",
+                 DO UPDATE SET status = excluded.status,
+                               source = 'auto',
+                               updated_at = excluded.updated_at",
                 params![name, task.number, status],
             )
             .ok();
@@ -860,14 +864,15 @@ pub async fn sync_all(State(state): State<AppState>) -> impl IntoResponse {
             Err(_) => continue,
         };
 
-        // Load existing statuses
+        // Load only manual statuses — auto-inferred rows (source='auto') and
+        // legacy NULL rows are overwritable by re-inference.
         let mut manual: HashMap<String, String> = HashMap::new();
-        if let Ok(mut stmt) =
-            db.prepare("SELECT task_number, status FROM task_status WHERE plan_name = ?")
-            && let Ok(rows) = stmt.query_map(params![s.name], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-        {
+        if let Ok(mut stmt) = db.prepare(
+            "SELECT task_number, status FROM task_status \
+             WHERE plan_name = ? AND source = 'manual'",
+        ) && let Ok(rows) = stmt.query_map(params![s.name], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
             for row in rows.flatten() {
                 manual.insert(row.0, row.1);
             }
@@ -875,7 +880,7 @@ pub async fn sync_all(State(state): State<AppState>) -> impl IntoResponse {
 
         for phase in &plan.phases {
             for task in &phase.tasks {
-                // Keep any existing DB status (manual or prior auto)
+                // Manual statuses are sticky — never overwrite them.
                 if let Some(s) = manual.get(&task.number) {
                     *totals.entry(s.clone()).or_insert(0) += 1;
                     continue;
@@ -891,10 +896,12 @@ pub async fn sync_all(State(state): State<AppState>) -> impl IntoResponse {
                     auto_status::infer_status(&project_dir, &task.file_paths, &title_words);
 
                 db.execute(
-                    "INSERT INTO task_status (plan_name, task_number, status, updated_at)
-                     VALUES (?1, ?2, ?3, datetime('now'))
+                    "INSERT INTO task_status (plan_name, task_number, status, source, updated_at)
+                     VALUES (?1, ?2, ?3, 'auto', datetime('now'))
                      ON CONFLICT(plan_name, task_number)
-                     DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at",
+                     DO UPDATE SET status = excluded.status,
+                                   source = 'auto',
+                                   updated_at = excluded.updated_at",
                     params![s.name, task.number, status],
                 )
                 .ok();
@@ -1383,10 +1390,12 @@ pub async fn start_phase_tasks(
         {
             let db = state.db.lock().unwrap();
             db.execute(
-                "INSERT INTO task_status (plan_name, task_number, status, updated_at)
-                 VALUES (?1, ?2, 'in_progress', datetime('now'))
+                "INSERT INTO task_status (plan_name, task_number, status, source, updated_at)
+                 VALUES (?1, ?2, 'in_progress', 'manual', datetime('now'))
                  ON CONFLICT(plan_name, task_number)
-                 DO UPDATE SET status = 'in_progress', updated_at = datetime('now')",
+                 DO UPDATE SET status = 'in_progress',
+                               source = 'manual',
+                               updated_at = datetime('now')",
                 params![plan_name, task.number],
             )
             .ok();
@@ -1528,10 +1537,12 @@ pub async fn check_task(
     {
         let db = state.db.lock().unwrap();
         db.execute(
-            "INSERT INTO task_status (plan_name, task_number, status, updated_at)
-             VALUES (?1, ?2, 'checking', datetime('now'))
+            "INSERT INTO task_status (plan_name, task_number, status, source, updated_at)
+             VALUES (?1, ?2, 'checking', 'manual', datetime('now'))
              ON CONFLICT(plan_name, task_number)
-             DO UPDATE SET status = 'checking', updated_at = datetime('now')",
+             DO UPDATE SET status = 'checking',
+                           source = 'manual',
+                           updated_at = datetime('now')",
             params![plan_name, task_number],
         )
         .ok();
@@ -2596,10 +2607,12 @@ pub async fn check_all(
             {
                 let db = state.db.lock().unwrap();
                 db.execute(
-                    "INSERT INTO task_status (plan_name, task_number, status, updated_at)
-                     VALUES (?1, ?2, 'checking', datetime('now'))
+                    "INSERT INTO task_status (plan_name, task_number, status, source, updated_at)
+                     VALUES (?1, ?2, 'checking', 'manual', datetime('now'))
                      ON CONFLICT(plan_name, task_number)
-                     DO UPDATE SET status = 'checking', updated_at = datetime('now')",
+                     DO UPDATE SET status = 'checking',
+                                   source = 'manual',
+                                   updated_at = datetime('now')",
                     params![name, task.number],
                 )
                 .ok();

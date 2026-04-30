@@ -414,10 +414,11 @@ async fn handle_runner_message(
             {
                 let conn = state.db.lock().unwrap();
                 conn.execute(
-                    "INSERT INTO task_status (plan_name, task_number, status, org_id)
-                     VALUES (?1, ?2, ?3, ?4)
+                    "INSERT INTO task_status (plan_name, task_number, status, source, org_id)
+                     VALUES (?1, ?2, ?3, 'manual', ?4)
                      ON CONFLICT(plan_name, task_number) DO UPDATE SET
                        status = excluded.status,
+                       source = 'manual',
                        updated_at = datetime('now')",
                     params![plan_name, task_number, status, org_id],
                 )
