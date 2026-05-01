@@ -96,7 +96,10 @@ fn auto_status_alone_does_not_inflate_done_count() {
         .status()
         .unwrap();
 
-    let plan = d.create_plan("done-count-plan", &three_task_plan("done-count-plan", &d.project));
+    let plan = d.create_plan(
+        "done-count-plan",
+        &three_task_plan("done-count-plan", &d.project),
+    );
 
     // Pre-condition: no DB rows yet — doneCount=0, taskCount=3.
     let (task_count, done_count) = fetch_counts(&d, &plan);
