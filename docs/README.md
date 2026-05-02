@@ -33,9 +33,10 @@ The three-binary split, wire protocols, and storage model.
   authenticated WebSocket upstream, runner ID persistence, driver auth
   reporting, outbox/ACK with at-least-once delivery, local agent
   spawning via the shared session daemon.
-- [architecture/protocols.md](architecture/protocols.md) _(stub)_ — session
-  IPC frames, SaaS `WireMessage` JSON, dashboard WS events, hook POST
-  shape.
+- [architecture/protocols.md](architecture/protocols.md) — session IPC
+  frames (`postcard` over UDS / named pipe), SaaS runner `WireMessage`
+  JSON envelopes with reliable/best-effort split and outbox/ACK/replay
+  semantics, plus the versioning policy.
 - [architecture/persistence.md](architecture/persistence.md) _(stub)_ —
   SQLite/Postgres schema, org multi-tenancy, outbox tables, migrations,
   what survives restart.

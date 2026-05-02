@@ -1,0 +1,274 @@
+# Wire protocols
+
+Branchwork speaks three protocols beyond plain HTTP:
+
+1. **Session IPC** — a Unix-domain-socket / Windows-named-pipe channel between
+   the server (or the runner) and a per-agent supervisor daemon. Length-prefixed
+   `postcard` frames over [`session_protocol::Message`].
+2. **Runner WebSocket** — JSON `Envelope`/`WireMessage` frames between the
+   hosted server and remote runners, with a SQLite-backed outbox providing
+   at-least-once delivery for state-changing events.
+3. **Dashboard WebSocket** — server → browser fan-out (the `agent_*`,
+   `task_status_changed`, `plan_updated`, `plan_checked` events). This page
+   covers the first two; the dashboard event vocabulary is documented inline
+   in [server.md](server.md) and [user-guide.md](../user-guide.md).
+
+For the binary split that uses these protocols see
+[overview.md](overview.md). For the daemon endpoint see
+[session-daemon.md](session-daemon.md). For the runner endpoint see
+[runner.md](runner.md).
+
+[`session_protocol::Message`]: ../../server-rs/src/agents/session_protocol.rs
+
+---
+
+## 1. Session IPC
+
+**Source:** `server-rs/src/agents/session_protocol.rs`
+
+**Transport:** a single `interprocess` local socket per agent.
+On Unix this is a Unix-domain socket at `~/.claude/sessions/<agent-id>.sock`; on
+Windows it is a named pipe with the same logical path. The supervisor binds
+and listens; the parent (server or runner) connects.
+
+**Framing.** Every frame is:
+
+```
++----------------+-----------------------------+
+| 4 bytes BE u32 |   postcard-encoded payload  |
+|  payload len   |  (1..=MAX_FRAME_BYTES)      |
++----------------+-----------------------------+
+```
+
+`MAX_FRAME_BYTES = 8 MiB` (`session_protocol::MAX_FRAME_BYTES`). Both
+[`write_frame`] and [`read_frame`] enforce the cap symmetrically — a peer
+that asks for more is dropped with `InvalidData`. There is no application-level
+heartbeat in the framing layer itself; the `Ping`/`Pong` messages below ride
+inside it.
+
+[`write_frame`]: ../../server-rs/src/agents/session_protocol.rs
+[`read_frame`]: ../../server-rs/src/agents/session_protocol.rs
+
+### `Message` variants
+
+| Variant | Direction | When sent |
+|---|---|---|
+| `Input(Vec<u8>)` | client → supervisor | Bytes typed by a dashboard user (or piped by the runner) that should reach the agent's stdin via the PTY master. Empty payloads are legal. |
+| `Output(Vec<u8>)` | supervisor → client | A chunk read from the PTY master (the agent's stdout/stderr). Forwarded to every connected client and appended to `<socket>.log` for post-mortem replay. |
+| `Resize { cols, rows }` | client → supervisor | The browser resized its xterm.js view. The supervisor forwards the new window size to the PTY so the agent re-paints. |
+| `Kill` | client → supervisor | The dashboard requested termination. The supervisor sends `SIGTERM` to the agent, then `SIGKILL` after the grace period, then exits. |
+| `Ping` | either direction | Keepalive probe. Used by the server's heartbeat task to detect a silently dead supervisor (see [session-daemon.md](session-daemon.md) — pidfile presence is the canonical crash signal; missed `Pong` is the 45 s fallback). |
+| `Pong` | either direction | Reply to `Ping`. |
+
+`Resize`, `Kill`, `Ping`, `Pong` are all unit-ish — they carry no opaque
+payload, only their well-typed fields — so they are safe to add tolerance for
+in older peers (see versioning below).
+
+### Lifecycle
+
+1. The parent spawns the supervisor (`branchwork-server session …`); the
+   supervisor `bind()`s its socket and starts the agent under a PTY.
+2. The parent connects, optionally sends an initial `Resize`, then enters a
+   read/write loop.
+3. The supervisor multiplexes PTY output as `Output` frames to **every**
+   currently connected client. Disconnected clients are reaped silently.
+4. On reconnect, the parent re-opens the socket and resumes — there is no
+   handshake. Backfill is supplied by the **server-side** SQLite
+   `agent_output` table (see [persistence.md](persistence.md) once it lands)
+   plus the live broadcast; the on-disk `<socket>.log` is post-mortem only.
+5. `Kill`, supervisor crash, or agent exit closes the socket; the parent
+   detects EOF and reconciles agent state.
+
+---
+
+## 2. Runner WebSocket
+
+**Source:** `server-rs/src/saas/runner_protocol.rs`,
+`server-rs/src/saas/runner_ws.rs`,
+`server-rs/src/saas/outbox.rs`,
+`server-rs/src/bin/branchwork_runner.rs`.
+
+**Transport:** a single WebSocket per runner.
+Runner dials `wss://<saas>/ws/runner?token=<api_token>`; the server validates
+the token against `runner_tokens` (SHA-256 lookup; tokens are 256-bit random
+hex, see [runner.md](runner.md) for the storage caveat) and either upgrades
+the connection or returns 401.
+
+**Encoding:** every frame is one JSON `Envelope`. The body uses serde's
+`#[serde(tag = "type", rename_all = "snake_case")]` tagged-union form, so a
+frame on the wire looks like:
+
+```json
+{ "seq": 17, "runner_id": "runner-…", "type": "agent_started",
+  "agent_id": "…", "plan_name": "…", "task_id": "1.2",
+  "driver": "claude", "cwd": "/work" }
+```
+
+`Envelope.runner_id` is set on **every** frame so the server can demux without
+relying on connection state — this matters during the brief window between a
+runner reconnecting and the server learning the id from the first
+`RunnerHello`. The server sends frames with `runner_id: "server"`.
+
+### Reliable vs best-effort
+
+`WireMessage::is_best_effort()` is the single source of truth for which frames
+ride the outbox:
+
+```
+best-effort  = AgentOutput | AgentInput | Ping | Pong
+reliable     = everything else
+```
+
+- **Best-effort frames** carry `seq: null` (the field is omitted in JSON via
+  `skip_serializing_if`). They are written straight to the socket and dropped
+  on disconnect. There is no ACK and no replay — by the time the connection
+  is back, terminal bytes are stale.
+- **Reliable frames** are persisted to the sender's outbox table
+  (`runner_outbox` on the runner, `inbox_pending` on the server, both keyed
+  by an autoincrement `seq`), then sent. The receiver ACKs after persisting,
+  the sender prunes. On reconnect the receiver issues `Resume { last_seen_seq }`
+  and the sender replays everything strictly greater than that seq.
+
+Receivers de-duplicate via `outbox::advance_peer_seq` (a per-peer high-water
+mark in `seq_tracker`). A duplicate frame is **always** ACKed — even though
+its side-effects are skipped — so a sender whose previous ACK was lost still
+makes progress on the next attempt.
+
+### `WireMessage` variants
+
+#### Runner → SaaS
+
+| Variant | Reliable? | When sent |
+|---|---|---|
+| `RunnerHello { hostname, version, drivers }` | yes | First message after the WS upgrade and after every reconnect. The server uses it to update the `runners` row and broadcast the dashboard's Drivers panel. |
+| `AgentStarted { agent_id, plan_name, task_id, driver, cwd }` | yes | The runner's session daemon successfully spawned an agent; the server inserts an `agents` row in `mode='remote'` and fans out `agent_started` to dashboards. |
+| `AgentOutput { agent_id, data }` | **no** (best-effort) | A chunk of base64-encoded PTY bytes. Forwarded to dashboards as `agent_output`. Loss is acceptable: the SQLite `agent_output` table on the server captures the durable transcript. |
+| `AgentStopped { agent_id, status, cost_usd?, stop_reason? }` | yes (with one wart) | Agent process exited or was killed. Server updates the `agents` row, runs org-budget enforcement if `cost_usd` is set, and broadcasts `agent_stopped`. **Wart:** the spawn-failure path sends this reliably; the normal-exit path in `branchwork_runner.rs` currently sends it best-effort (`Envelope::best_effort`). See [runner.md](runner.md). |
+| `TaskStatusChanged { plan_name, task_number, status, reason? }` | yes | The agent reported a status change via MCP, or the runner detected one. Server upserts `task_status` with `source='manual'`, optionally appends `task_learnings`, and broadcasts `task_status_changed`. |
+| `DriverAuthReport { drivers }` | yes | Driver auth state changed (e.g. user finished an OAuth flow). Re-broadcast as `runner_drivers`. Also implicitly delivered by the `RunnerHello` `drivers` field. |
+
+#### SaaS → Runner
+
+| Variant | Reliable? | When sent |
+|---|---|---|
+| `StartAgent { agent_id, plan_name, task_id, prompt, cwd, driver, effort?, max_budget_usd? }` | yes | Dashboard user clicked "Start" (or "Continue" / "Retry"). Runner spawns the agent via the same `branchwork-server session` supervisor as self-hosted. |
+| `KillAgent { agent_id }` | yes | Dashboard user clicked "Kill". Runner forwards a `Kill` over the session IPC. |
+| `ResizeTerminal { agent_id, cols, rows }` | yes | Browser resized its xterm.js view. Runner forwards a `Resize` over the session IPC. **Note:** semantically idempotent — duplicated replays are harmless. |
+| `AgentInput { agent_id, data }` | **no** (best-effort) | Keystrokes from the browser (base64). Runner forwards as `Input` over the session IPC. Loss on disconnect matches user expectations: typed characters that never reached the agent are not replayed. |
+| `TerminalReplay { agent_id, from_offset }` | yes | A reconnecting browser asked the server for backfill from a byte offset; the runner serves the missing range from its local `<socket>.log`. |
+
+#### Bidirectional
+
+| Variant | Reliable? | When sent |
+|---|---|---|
+| `Ack { ack_seq }` | best-effort | Acknowledges a single reliable frame after the receiver has persisted it. The sender then marks that outbox row `acked=1`. Always sent on duplicates too, so a lost ACK self-heals. |
+| `Ping {}` | best-effort | Heartbeat probe. The runner sends one every ~15 s; the server replies inline. Missed pongs are not directly observable — the WS-level close on read timeout is what triggers reconnect. |
+| `Pong {}` | best-effort | Reply to `Ping`. |
+| `Resume { last_seen_seq }` | best-effort | Sent immediately after a (re)connect by **both** sides. Tells the peer "replay every reliable frame whose `seq > last_seen_seq`." `last_seen_seq` is read from the local `seq_tracker` row for the peer (or `0` for a fresh runner). |
+
+### `DriverAuthStatus` states
+
+`DriverAuthInfo.status` (carried by `RunnerHello.drivers` and
+`DriverAuthReport.drivers`) is itself a tagged union on `"state"`. The
+dashboard renders each state with a different affordance.
+
+| State | When sent |
+|---|---|
+| `not_installed` | The driver's CLI binary is missing from `PATH` on the runner — the dashboard offers an install link instead of a Start button. |
+| `unauthenticated { help? }` | The CLI is installed but no credentials are configured. `help` is a one-line hint shown to the user (e.g. "run `claude auth login`"). |
+| `oauth { account? }` | OAuth-style auth is in place; `account` is the email or login the dashboard shows next to the driver name. |
+| `api_key` | An API key is configured. The dashboard shows a green check; we deliberately don't echo any key fragment. |
+| `cloud_provider { provider }` | Auth is delegated to a cloud SDK (e.g. AWS Bedrock); `provider` names the SDK so the dashboard can pick the right icon. |
+| `unknown` | Default fallback when the runner can't classify the driver's auth — also used by older runners after a server-side enum addition. |
+
+### Connection establishment, in order
+
+```
+runner ─► server : HTTP upgrade /ws/runner?token=…
+server validates token; on success completes upgrade and begins reader loop
+
+runner ─► server : RunnerHello       (reliable, seq=1)
+runner ─► server : DriverAuthReport  (reliable, seq=2)
+runner ─► server : Resume{last_seen_seq=N}   (best-effort, server's last seq runner saw)
+server ─► runner : Resume{last_seen_seq=M}   (best-effort, runner's last seq server saw)
+…both sides replay outbox entries > M / > N…
+…steady-state event flow…
+```
+
+`runner_ws.rs` sends its `Resume` and replays `inbox_pending` from inside the
+"first message" branch, so the runner's `RunnerHello` doubles as the trigger
+for both. The runner mirror is in `branchwork_runner.rs` around the
+`send_reliable(hello)` / `send_reliable(auth_report)` block.
+
+---
+
+## 3. Versioning policy
+
+The protocols are pre-1.0 and not yet under a formal compatibility contract,
+but the wire format already gives us enough room to evolve safely if we
+follow these rules.
+
+### What's safe
+
+- **Adding a new `WireMessage` variant.** Both sides match exhaustively, but
+  the server's match arm has a default `{}` for variants it doesn't expect
+  from runners (see the trailing arm in `handle_runner_message`). A new
+  variant is silently ignored by an older peer; the new peer must tolerate
+  the silence (treat the message as best-effort or fall back to a
+  pre-existing variant).
+- **Adding an `Option<…>` field** with `#[serde(skip_serializing_if = "Option::is_none")]`.
+  Older peers ignore unknown fields by default (`serde_json` is lenient);
+  newer peers see `None` from older senders. `AgentStopped.cost_usd`,
+  `AgentStopped.stop_reason`, `StartAgent.effort`, `StartAgent.max_budget_usd`
+  were all added this way.
+- **Adding a new `DriverAuthStatus` state.** Same reasoning — the tagged
+  union over `state` admits new tags as long as both sides treat unknown tags
+  as `Unknown`/no-op.
+- **Adding a new session `Message` variant** at the tail of the enum. `postcard`
+  encodes the discriminant as a varint, so appending is binary-stable. An
+  older peer that receives a new variant will fail `decode` with `InvalidData`
+  — so adders must gate use behind a capability check (see below) until the
+  rollout is complete.
+
+### What's not safe
+
+- **Reordering or removing variants** in either enum. `postcard` keys on the
+  declaration order for the discriminant; reordering changes wire bytes
+  silently. Removal breaks decode for in-flight outbox replays. Always append.
+- **Changing a field's type** (e.g. `u16` → `u32`, `String` → `Vec<u8>`).
+  Both encodings reject mismatched shapes.
+- **Removing or renaming a JSON tag.** `WireMessage` discriminates on
+  `"type": "snake_case"`; renaming breaks every older peer mid-flight.
+- **Tightening `MAX_FRAME_BYTES` downward.** Existing senders may already be
+  emitting frames near the cap.
+
+### Forward/backward compatibility in practice
+
+- **Newer server, older runner.** Server must not depend on runner-side
+  fields it added. Reliable messages still flow because the outbox layer is
+  field-agnostic. New SaaS→runner variants are gated on the `version` string
+  in `RunnerHello` — the dashboard either disables the corresponding UI or
+  falls back to a pre-existing variant.
+- **Older server, newer runner.** The runner sends best-effort the moment it
+  starts; reliable frames it sends with new fields are accepted by the
+  older server (unknown fields ignored). The runner must tolerate **not**
+  receiving new SaaS→runner messages and must not require any handshake
+  beyond `RunnerHello`/`Resume` to make progress.
+- **Newer server, older session daemon (or vice versa).** The detached
+  daemon is upgraded out of band — when the server is upgraded the running
+  daemons keep using the old binary they were spawned from. Compatibility
+  is maintained by the rules above (append-only `Message` variants, no
+  field-type changes); a fresh daemon is launched on the next agent start.
+  See [session-daemon.md](session-daemon.md) for the lifecycle.
+
+The versioning hooks we already have:
+
+- `RunnerHello.version` — server-side capability gating per-runner.
+- `Envelope.runner_id` plus the per-peer `seq_tracker` — reconnect across
+  upgrades is invisible to consumers.
+- `outbox` tables persist across server restarts — an upgrade-restart-replay
+  cycle delivers nothing twice and loses nothing reliable.
+
+When we cut 1.0 we will freeze the on-wire shape and add an explicit
+`protocol_version: u32` field to `RunnerHello` and to the session-IPC
+handshake. Until then, follow the append-only rules above.
