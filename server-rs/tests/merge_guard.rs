@@ -96,6 +96,75 @@ fn merge_with_real_commits_succeeds() {
 }
 
 #[test]
+fn merge_with_explicit_into_body_targets_that_branch() {
+    // Acceptance for plan merge-target-canonical-default-branch T2.4:
+    // POST .../merge with {"into":"feature/x"} lands on feature/x even
+    // when the canonical default (master) is also resolvable. The
+    // dropdown override wins over the default.
+    let d = TestDashboard::new();
+    d.create_plan("mp-into", &minimal_plan("mp-into", &d.project));
+
+    // feature/x at the same SHA as master so a task branched off it
+    // fast-forwards cleanly.
+    git(&d.project, &["branch", "feature/x"]);
+
+    let br = "branchwork/mp-into/1.1";
+    d.create_task_branch(br, /* with_commit */ true);
+    let task_sha = rev_parse(&d.project, br);
+    let master_sha_before = rev_parse(&d.project, "master");
+    seed_agent(
+        &d,
+        "agent-into",
+        "mp-into",
+        "1.1",
+        Some(br),
+        Some("master"),
+    );
+
+    let (s, body) = d.post(
+        "/api/agents/agent-into/merge",
+        json!({"into": "feature/x"}),
+    );
+    assert_eq!(s, 200, "expected 200, got {s}: {body}");
+    assert_eq!(body["into"], "feature/x", "merge should target feature/x");
+    // feature/x fast-forwarded to the task commit; master never moved.
+    assert_eq!(
+        rev_parse(&d.project, "feature/x"),
+        task_sha,
+        "feature/x should now point at the task commit"
+    );
+    assert_eq!(
+        rev_parse(&d.project, "master"),
+        master_sha_before,
+        "master must not have moved"
+    );
+}
+
+#[test]
+fn merge_with_empty_into_body_falls_back_to_default() {
+    // Acceptance for plan merge-target-canonical-default-branch T2.4:
+    // POST .../merge with {"into":""} treats the empty string as
+    // "no override" and lands on the canonical default (master here).
+    let d = TestDashboard::new();
+    d.create_plan("mp-empty", &minimal_plan("mp-empty", &d.project));
+
+    let br = "branchwork/mp-empty/1.1";
+    d.create_task_branch(br, /* with_commit */ true);
+    seed_agent(
+        &d,
+        "agent-empty-into",
+        "mp-empty",
+        "1.1",
+        Some(br),
+        Some("master"),
+    );
+
+    let (s, body) = d.post("/api/agents/agent-empty-into/merge", json!({"into": ""}));
+    assert_eq!(s, 200, "expected 200, got {s}: {body}");
+    assert_eq!(body["into"], "master", "empty into should fall back to master");
+}
+
+#[test]
 fn self_referencing_source_branch_does_not_cause_500() {
     // Regression: b77d9c0 shipped Fix CI with source_branch recorded AS
     // the task branch (because start_pty_agent captured git_current_branch

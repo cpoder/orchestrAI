@@ -347,7 +347,12 @@ pub async fn merge_agent_branch(
 
     let cwd_path = std::path::Path::new(&cwd);
     let default = crate::agents::git_default_branch(cwd_path);
-    let target = resolve_merge_target(body.into.as_deref(), default.as_deref(), cwd_path);
+    // Treat `Some("")` the same as `None` — an empty `into` means
+    // "no override, use the canonical default". Defensive against a
+    // future form-encoded path where empty strings sneak through; the
+    // current JSON UI already coerces empty selections to `null`.
+    let explicit = body.into.filter(|s| !s.is_empty());
+    let target = resolve_merge_target(explicit.as_deref(), default.as_deref(), cwd_path);
 
     // Guard: refuse to merge a branch with no commits ahead of its source.
     // Agents that exit before committing leave a branch that points at the
