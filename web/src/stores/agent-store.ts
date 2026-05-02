@@ -51,7 +51,13 @@ interface AgentStore {
   sendMessage: (agentId: string, message: string) => Promise<void>;
   killAgent: (agentId: string) => Promise<void>;
   finishAgent: (agentId: string) => Promise<void>;
-  mergeAgentBranch: (agentId: string) => Promise<{ ok?: boolean; error?: string }>;
+  mergeAgentBranch: (
+    agentId: string,
+    target?: string
+  ) => Promise<{ ok?: boolean; error?: string }>;
+  fetchMergeTargets: (
+    agentId: string
+  ) => Promise<{ default: string | null; available: string[] }>;
   discardAgentBranch: (agentId: string) => Promise<{ ok?: boolean; error?: string }>;
   addAgent: (agent: Agent) => void;
   updateAgentStatus: (agentId: string, status: string) => void;
@@ -99,11 +105,12 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
     await postJson(`/api/agents/${agentId}/finish`, {});
   },
 
-  mergeAgentBranch: async (agentId) => {
+  mergeAgentBranch: async (agentId, target) => {
     try {
+      const body = target ? { into: target } : {};
       const result = await postJson<{ ok?: boolean; error?: string }>(
         `/api/agents/${agentId}/merge`,
-        {}
+        body
       );
       if (result.ok) {
         // Clear branch from local state after merge
@@ -121,6 +128,12 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
       }
       return { error: String(e) };
     }
+  },
+
+  fetchMergeTargets: async (agentId) => {
+    return fetchJson<{ default: string | null; available: string[] }>(
+      `/api/agents/${agentId}/merge-targets`
+    );
   },
 
   discardAgentBranch: async (agentId) => {
