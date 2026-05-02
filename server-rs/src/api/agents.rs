@@ -10,12 +10,25 @@ use serde::Deserialize;
 use crate::auth::OptionalAuthUser;
 use crate::state::AppState;
 
-/// Resolve the merge target for an agent. Prefer the agent's recorded
-/// `source_branch`, but fall back to master/main if it doesn't resolve —
-/// e.g. the branch was deleted out-of-band, or a prior bug stored a bad
-/// value. Without this fallback `git checkout <target>` 500s before the
-/// merge guard even runs.
-fn resolve_merge_target(source_branch: Option<&str>, cwd: &std::path::Path) -> String {
+/// Decide the merge target. Pure — git probes happen in the caller
+/// (the runner in SaaS, the local helper in standalone) and pass
+/// results in. `explicit_into` is the dropdown selection from the
+/// merge endpoint's `into` body field; `default_branch` is the
+/// canonical-default-branch resolution (see
+/// [`crate::agents::git_default_branch`]).
+///
+/// Priority: explicit (if it resolves) → default → "main".
+///
+/// The agent's stored `source_branch` is intentionally NOT consulted:
+/// a stale auto-captured value (from whichever branch the user happened
+/// to be on at spawn time) was the source of the wrong-target merge
+/// bug. The escape hatch is the dropdown's `into` parameter, never the
+/// auto-populated DB column.
+fn resolve_merge_target(
+    explicit_into: Option<&str>,
+    default_branch: Option<&str>,
+    cwd: &std::path::Path,
+) -> String {
     let resolves = |name: &str| -> bool {
         std::process::Command::new("git")
             .args(["rev-parse", "--verify", "--quiet", name])
@@ -24,19 +37,24 @@ fn resolve_merge_target(source_branch: Option<&str>, cwd: &std::path::Path) -> S
             .map(|s| s.success())
             .unwrap_or(false)
     };
-    if let Some(c) = source_branch
-        && resolves(c)
+
+    if let Some(into) = explicit_into
+        && resolves(into)
     {
-        return c.to_string();
+        return into.to_string();
     }
-    if resolves("master") {
-        return "master".to_string();
+    if let Some(d) = default_branch {
+        return d.to_string();
     }
-    if resolves("main") {
-        return "main".to_string();
-    }
-    // Hopeless — let `git checkout` produce its own error downstream.
-    source_branch.unwrap_or("main").to_string()
+    "main".to_string()
+}
+
+/// Body for `POST /api/agents/{id}/merge`. `into` is the optional
+/// dropdown override; absent means "use the canonical default branch".
+#[derive(Deserialize, Default)]
+pub struct MergeBody {
+    #[serde(default)]
+    pub into: Option<String>,
 }
 
 pub async fn list_agents(
@@ -288,29 +306,22 @@ pub async fn merge_agent_branch(
     State(state): State<AppState>,
     auth: OptionalAuthUser,
     Path(id): Path<String>,
+    body: Option<Json<MergeBody>>,
 ) -> impl IntoResponse {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+
     // Look up agent details (need plan/task for CI bookkeeping too)
-    #[allow(clippy::type_complexity)]
-    let (cwd, branch, source_branch, plan_name, task_id): (
+    let (cwd, branch, plan_name, task_id): (
         String,
-        Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
     ) = {
         let db = state.db.lock().unwrap();
         match db.query_row(
-            "SELECT cwd, branch, source_branch, plan_name, task_id FROM agents WHERE id = ?",
+            "SELECT cwd, branch, plan_name, task_id FROM agents WHERE id = ?",
             params![id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ) {
             Ok(r) => r,
             Err(_) => {
@@ -334,7 +345,9 @@ pub async fn merge_agent_branch(
         }
     };
 
-    let target = resolve_merge_target(source_branch.as_deref(), std::path::Path::new(&cwd));
+    let cwd_path = std::path::Path::new(&cwd);
+    let default = crate::agents::git_default_branch(cwd_path);
+    let target = resolve_merge_target(body.into.as_deref(), default.as_deref(), cwd_path);
 
     // Guard: refuse to merge a branch with no commits ahead of its source.
     // Agents that exit before committing leave a branch that points at the
@@ -535,12 +548,12 @@ pub async fn discard_agent_branch(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     // Look up agent details
-    let (cwd, branch, source_branch): (String, Option<String>, Option<String>) = {
+    let (cwd, branch): (String, Option<String>) = {
         let db = state.db.lock().unwrap();
         match db.query_row(
-            "SELECT cwd, branch, source_branch FROM agents WHERE id = ?",
+            "SELECT cwd, branch FROM agents WHERE id = ?",
             params![id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         ) {
             Ok(r) => r,
             Err(_) => {
@@ -564,7 +577,12 @@ pub async fn discard_agent_branch(
         }
     };
 
-    let target = resolve_merge_target(source_branch.as_deref(), std::path::Path::new(&cwd));
+    // Discard has no `into` body field today (future "discard and switch
+    // to X" UI hooks here). Passing `None` falls through to the canonical
+    // default branch.
+    let cwd_path = std::path::Path::new(&cwd);
+    let default = crate::agents::git_default_branch(cwd_path);
+    let target = resolve_merge_target(None, default.as_deref(), cwd_path);
 
     // Checkout the target branch first
     let checkout = std::process::Command::new("git")
