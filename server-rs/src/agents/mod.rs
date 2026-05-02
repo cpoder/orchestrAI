@@ -159,6 +159,7 @@ pub fn git_current_branch(cwd: &std::path::Path) -> Option<String> {
 ///
 /// When git ops move to the runner, this helper's call site moves too —
 /// keep it pure git so the runner-side implementation can copy it verbatim.
+#[allow(dead_code)] // consumed by resolve_merge_target in a later Phase 2 task
 pub fn git_default_branch(cwd: &std::path::Path) -> Option<String> {
     // Step 1: origin/HEAD via symbolic-ref (set by `git clone` and
     // `git remote set-head --auto`). Exits 128, not 1, when absent —
