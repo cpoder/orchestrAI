@@ -15,7 +15,7 @@ Pages marked _(stub)_ do not exist yet — they are tracked by the
 - [quickstart.md](quickstart.md) — five-minute self-hosted path:
   install, run, open the dashboard, create your first plan, watch an
   agent survive a server restart.
-- [user-guide.md](user-guide.md) _(stub)_ — complete walkthrough of the
+- [user-guide.md](user-guide.md) — complete walkthrough of the
   dashboard, plan authoring, agent lifecycle, and common workflows.
 
 ## Architecture
