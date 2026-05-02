@@ -503,6 +503,28 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
                 .send(serde_json::to_string(&reply).unwrap_or_default());
         }
 
+        WireMessage::CreateFolder { req_id, path } => {
+            let resolved = resolve_runner_path(path);
+            let reply = match std::fs::create_dir_all(&resolved) {
+                Ok(()) => WireMessage::FolderCreated {
+                    req_id: req_id.clone(),
+                    ok: true,
+                    resolved_path: Some(resolved.display().to_string()),
+                    error: None,
+                },
+                Err(e) => WireMessage::FolderCreated {
+                    req_id: req_id.clone(),
+                    ok: false,
+                    resolved_path: None,
+                    error: Some(e.to_string()),
+                },
+            };
+            let env = Envelope::best_effort(state.runner_id.clone(), reply);
+            let _ = state
+                .ws_tx
+                .send(serde_json::to_string(&env).unwrap_or_default());
+        }
+
         // Runner doesn't receive these from server (runner→saas direction
         // only; the server sending them would be a protocol violation).
         WireMessage::RunnerHello { .. }
@@ -516,8 +538,20 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
         // saas→runner variants the runner doesn't act on yet (handlers
         // land in later phases of the folder-listing plan).
         | WireMessage::TerminalReplay { .. }
-        | WireMessage::CreateFolder { .. }
         | WireMessage::Ping {} => {}
+    }
+}
+
+/// Resolve a runner-side folder path. `~` and `~/...` expand against
+/// `dirs::home_dir()`; everything else is treated as already-absolute and
+/// passed through unchanged.
+fn resolve_runner_path(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        dirs::home_dir().unwrap_or_default().join(rest)
+    } else if path == "~" {
+        dirs::home_dir().unwrap_or_default()
+    } else {
+        PathBuf::from(path)
     }
 }
 
@@ -959,5 +993,44 @@ mod tests {
         assert!(is_ready("some output ❯ ".as_bytes()));
         assert!(is_ready("line1\n> ".as_bytes()));
         assert!(!is_ready(b"not ready yet"));
+    }
+
+    #[test]
+    fn resolve_runner_path_expands_tilde_prefix() {
+        let home = dirs::home_dir().expect("test host should have a home dir");
+        assert_eq!(resolve_runner_path("~"), home);
+        assert_eq!(
+            resolve_runner_path("~/new-project"),
+            home.join("new-project")
+        );
+        assert_eq!(
+            resolve_runner_path("~/nested/deep/dir"),
+            home.join("nested/deep/dir")
+        );
+    }
+
+    #[test]
+    fn resolve_runner_path_passes_absolute_through() {
+        assert_eq!(
+            resolve_runner_path("/tmp/branchwork-test"),
+            PathBuf::from("/tmp/branchwork-test")
+        );
+        // Bare names without ~ are not expanded.
+        assert_eq!(resolve_runner_path("relative"), PathBuf::from("relative"));
+        // ~user (not ~/) is not expanded — left as-is.
+        assert_eq!(resolve_runner_path("~root"), PathBuf::from("~root"));
+    }
+
+    #[test]
+    fn resolve_runner_path_create_dir_all_is_idempotent() {
+        let tmp =
+            std::env::temp_dir().join(format!("branchwork-runner-test-{}", uuid::Uuid::new_v4()));
+        let target = tmp.join("a/b/c");
+        let resolved = resolve_runner_path(&target.display().to_string());
+        std::fs::create_dir_all(&resolved).expect("first create");
+        // mkdir -p semantics: a second call must succeed too.
+        std::fs::create_dir_all(&resolved).expect("second create");
+        assert!(resolved.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
