@@ -192,7 +192,10 @@ fn merge_lands_on_stale_source_branch_instead_of_master() {
     // architecture-docs/3.4: a stale base branch off master with one
     // distinct commit. Resolvable, so resolve_merge_target() prefers
     // it over the master fallback.
-    git(&d.project, &["checkout", "-q", "-b", "architecture-docs/3.4"]);
+    git(
+        &d.project,
+        &["checkout", "-q", "-b", "architecture-docs/3.4"],
+    );
     std::fs::write(d.project.join("arch.md"), "stale base").unwrap();
     git(&d.project, &["add", "arch.md"]);
     git(&d.project, &["commit", "-q", "-m", "stale base commit"]);
@@ -245,27 +248,27 @@ fn merge_lands_on_stale_source_branch_instead_of_master() {
         "master must not have moved"
     );
     assert!(
-        !std::path::Path::new(&d.project).join("work.txt").exists()
-            || {
-                // We're on master and work.txt only exists on the task
-                // branch / stale branch. After the merge the server
-                // checked out architecture-docs/3.4, so the working
-                // tree may have work.txt — but master itself should
-                // have no work.txt commit. Verify via ls-tree.
-                let out = std::process::Command::new("git")
-                    .args(["ls-tree", "-r", "--name-only", "master"])
-                    .current_dir(&d.project)
-                    .output()
-                    .unwrap();
-                let names = String::from_utf8_lossy(&out.stdout);
-                !names.lines().any(|l| l == "work.txt")
-            },
+        !std::path::Path::new(&d.project).join("work.txt").exists() || {
+            // We're on master and work.txt only exists on the task
+            // branch / stale branch. After the merge the server
+            // checked out architecture-docs/3.4, so the working
+            // tree may have work.txt — but master itself should
+            // have no work.txt commit. Verify via ls-tree.
+            let out = std::process::Command::new("git")
+                .args(["ls-tree", "-r", "--name-only", "master"])
+                .current_dir(&d.project)
+                .output()
+                .unwrap();
+            let names = String::from_utf8_lossy(&out.stdout);
+            !names.lines().any(|l| l == "work.txt")
+        },
         "master tree must not contain the task's work.txt"
     );
 
     // Task branch was deleted by the success path.
     assert!(
-        !d.local_branches().contains(&"branchwork/foo/1.1".to_string()),
+        !d.local_branches()
+            .contains(&"branchwork/foo/1.1".to_string()),
         "task branch should have been deleted after merge: {:?}",
         d.local_branches()
     );
@@ -333,7 +336,10 @@ fn merge_inserts_orphan_ci_runs_row_for_stale_target() {
     );
 
     // Same stale-target setup as T0.1.
-    git(&d.project, &["checkout", "-q", "-b", "architecture-docs/3.4"]);
+    git(
+        &d.project,
+        &["checkout", "-q", "-b", "architecture-docs/3.4"],
+    );
     std::fs::write(d.project.join("arch.md"), "stale base").unwrap();
     git(&d.project, &["add", "arch.md"]);
     git(&d.project, &["commit", "-q", "-m", "stale base commit"]);
@@ -366,9 +372,10 @@ fn merge_inserts_orphan_ci_runs_row_for_stale_target() {
     // so poll the DB for the row. 5s is far more than enough on every
     // platform we test on; the trigger is a single git push + one
     // INSERT.
+    type CiRunRow = (String, String, Option<String>, Option<String>, String);
     let db_path = d.dir.path().join(".claude").join("branchwork.db");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut row: Option<(String, String, Option<String>, Option<String>, String)> = None;
+    let mut row: Option<CiRunRow> = None;
     while std::time::Instant::now() < deadline {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let r = conn

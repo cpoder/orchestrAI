@@ -29,6 +29,7 @@ use super::runner_protocol::{Envelope, FolderEntry, WireMessage};
 /// A response from a runner to a request/response WireMessage pair (e.g.
 /// `ListFolders` → `FoldersListed`). Routed back to the originating HTTP
 /// caller via a `oneshot` sender registered in `ConnectedRunner.pending`.
+#[allow(dead_code)] // payload fields read by HTTP consumers in Phase 2 of saas-folder-listing-via-runner
 #[derive(Debug)]
 pub enum RunnerResponse {
     FoldersListed(Vec<FolderEntry>),

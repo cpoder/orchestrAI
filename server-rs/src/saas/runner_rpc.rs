@@ -16,6 +16,8 @@
 //! Late replies (post-timeout or post-reconnect) find nothing waiting in
 //! the map and are silently discarded by `handle_runner_message`.
 
+#![allow(dead_code)] // HTTP consumers land in Phase 2 of saas-folder-listing-via-runner
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
