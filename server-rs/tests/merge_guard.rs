@@ -271,6 +271,157 @@ fn merge_lands_on_stale_source_branch_instead_of_master() {
     );
 }
 
+/// Reproduce the orphan `ci_runs` row that follows the stale-target
+/// merge from T0.1. Setup is identical, with two additions:
+/// - `.github/workflows/ci.yml` so `has_github_actions(&cwd)` returns
+///   true and `trigger_after_merge` does not bail early.
+/// - A bare local `origin` remote so `git push origin <target>`
+///   succeeds without auth.
+///
+/// Pre-fix behaviour, asserted here:
+/// - The merge succeeds (200, `into = "architecture-docs/3.4"`).
+/// - `trigger_after_merge` (spawned async) inserts exactly one
+///   `ci_runs` row with `branch = "branchwork/foo/1.1"` and
+///   `commit_sha = task_sha` (the fast-forwarded HEAD), even though
+///   we merged onto a non-default branch that CI is not configured
+///   to watch. The row sits at `pending` and would tip into
+///   `unknown` after `MAX_RUN_AGE_SECS` (30 min) — a stuck CI badge
+///   for work that never actually triggered CI.
+///
+/// We don't wait the 30 min — the spurious row's existence is what
+/// matters; the pending → unknown timeline is documented in
+/// `ci.rs::MAX_RUN_AGE_SECS`.
+///
+/// Marked `#[ignore]` alongside T0.1 so the buggy behaviour is
+/// documented but doesn't gate CI. Phase 2's merge-target fix
+/// indirectly fixes this: the trigger will push to master and CI
+/// will actually run, so the row is no longer orphan.
+#[test]
+#[ignore = "documents pre-fix behaviour for plan merge-target-canonical-default-branch — Phase 2 will change merge target"]
+fn merge_inserts_orphan_ci_runs_row_for_stale_target() {
+    let d = TestDashboard::new();
+    d.create_plan("foo", &minimal_plan("foo", &d.project));
+
+    // Make `has_github_actions(&cwd)` return true. Commit on master
+    // first so every descendant branch (architecture-docs/3.4,
+    // branchwork/foo/1.1) inherits the workflow file.
+    std::fs::create_dir_all(d.project.join(".github").join("workflows")).unwrap();
+    std::fs::write(
+        d.project.join(".github").join("workflows").join("ci.yml"),
+        "name: ci\non: [push]\njobs:\n  noop:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n",
+    )
+    .unwrap();
+    git(&d.project, &["add", ".github/workflows/ci.yml"]);
+    git(&d.project, &["commit", "-q", "-m", "add ci workflow"]);
+
+    // Bare repo as `origin`. Local bare repos accept pushes without
+    // auth, and the first push populates them with the full history.
+    let origin = d.dir.path().join("origin.git");
+    let init = std::process::Command::new("git")
+        .args(["init", "--bare", "-q"])
+        .arg(&origin)
+        .output()
+        .expect("spawn git init --bare");
+    assert!(
+        init.status.success(),
+        "git init --bare: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    git(
+        &d.project,
+        &["remote", "add", "origin", &origin.to_string_lossy()],
+    );
+
+    // Same stale-target setup as T0.1.
+    git(&d.project, &["checkout", "-q", "-b", "architecture-docs/3.4"]);
+    std::fs::write(d.project.join("arch.md"), "stale base").unwrap();
+    git(&d.project, &["add", "arch.md"]);
+    git(&d.project, &["commit", "-q", "-m", "stale base commit"]);
+
+    git(&d.project, &["checkout", "-q", "-b", "branchwork/foo/1.1"]);
+    std::fs::write(d.project.join("work.txt"), "task work").unwrap();
+    git(&d.project, &["add", "work.txt"]);
+    git(&d.project, &["commit", "-q", "-m", "task work commit"]);
+    let task_sha = head_sha(&d.project);
+
+    git(&d.project, &["checkout", "-q", "master"]);
+
+    seed_agent(
+        &d,
+        "agent-orphan-ci",
+        "foo",
+        "1.1",
+        Some("branchwork/foo/1.1"),
+        Some("architecture-docs/3.4"),
+    );
+
+    let (s, body) = d.post("/api/agents/agent-orphan-ci/merge", json!({}));
+    assert_eq!(s, 200, "expected 200, got {s}: {body}");
+    assert_eq!(
+        body["into"], "architecture-docs/3.4",
+        "merge landed on the wrong target: {body}"
+    );
+
+    // `trigger_after_merge` runs in `tokio::spawn` after the response,
+    // so poll the DB for the row. 5s is far more than enough on every
+    // platform we test on; the trigger is a single git push + one
+    // INSERT.
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut row: Option<(String, String, Option<String>, Option<String>, String)> = None;
+    while std::time::Instant::now() < deadline {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let r = conn
+            .query_row(
+                "SELECT plan_name, task_number, branch, commit_sha, status \
+                 FROM ci_runs ORDER BY id DESC LIMIT 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .ok();
+        if r.is_some() {
+            row = r;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let (plan_name, task_number, branch, commit_sha, status) =
+        row.expect("ci_runs row should have been inserted by trigger_after_merge");
+    assert_eq!(plan_name, "foo");
+    assert_eq!(task_number, "1.1");
+    assert_eq!(
+        branch.as_deref(),
+        Some("branchwork/foo/1.1"),
+        "ci_runs.branch should record the task branch — the orphan-row signature"
+    );
+    assert_eq!(
+        commit_sha.as_deref(),
+        Some(task_sha.as_str()),
+        "ci_runs.commit_sha should be the merged HEAD (= task_sha after fast-forward)"
+    );
+    assert_eq!(
+        status, "pending",
+        "row inserted as pending — would tip to `unknown` after MAX_RUN_AGE_SECS"
+    );
+
+    // Sanity check: exactly one row. We don't want a sibling row to
+    // mask the orphan signature.
+    let count: i64 = rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM ci_runs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1, "expected exactly one ci_runs row, got {count}");
+}
+
 fn git(cwd: &std::path::Path, args: &[&str]) {
     let out = std::process::Command::new("git")
         .args(args)
