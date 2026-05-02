@@ -10,8 +10,10 @@
 //! - [`runner_protocol`] — wire-protocol types (events, commands, ACK)
 //! - [`outbox`] — SQLite-backed outbox for at-least-once delivery
 //! - [`runner_ws`] — server-side WebSocket handler + token management API
+//! - [`runner_rpc`] — request/response helper over the WS
 
 pub mod billing;
 pub mod outbox;
 pub mod runner_protocol;
+pub mod runner_rpc;
 pub mod runner_ws;

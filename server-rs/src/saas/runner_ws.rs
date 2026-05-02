@@ -29,6 +29,7 @@ use super::runner_protocol::{Envelope, FolderEntry, WireMessage};
 /// A response from a runner to a request/response WireMessage pair (e.g.
 /// `ListFolders` → `FoldersListed`). Routed back to the originating HTTP
 /// caller via a `oneshot` sender registered in `ConnectedRunner.pending`.
+#[derive(Debug)]
 pub enum RunnerResponse {
     FoldersListed(Vec<FolderEntry>),
     FolderCreated {
@@ -245,8 +246,13 @@ async fn handle_runner_ws(
     // ── Cleanup on disconnect ───────────────────────────────────────────
     let rid = runner_id_write.lock().await.clone();
     if let Some(rid) = &rid {
-        // Remove from in-memory registry.
-        runners.lock().await.remove(rid);
+        // Remove from in-memory registry. Drain the pending request map so
+        // any in-flight `runner_request` callers wake immediately with
+        // `RunnerDisconnected` instead of waiting for the full timeout —
+        // their oneshot receivers see `Closed` once the senders are dropped.
+        if let Some(runner) = runners.lock().await.remove(rid) {
+            runner.pending.lock().await.clear();
+        }
 
         // Mark offline in DB.
         {
