@@ -1,11 +1,17 @@
-# Branchwork Plan Schema Reference
+# Branchwork plan template
 #
-# Plans can be written in YAML (.yaml/.yml) or Markdown (.md).
-# YAML is the preferred format for new plans. Both produce identical
-# results in the dashboard.
+# Canonical schema reference: docs/reference/plan-schema.md
+# (every field, types, optional vs. required, YAML vs. Markdown,
+#  produces_commit, project inference, created_at).
+#
+# This file is a minimal example. Copy it into <claude-dir>/plans/
+# (default ~/.claude/plans/), rename to <plan-name>.yaml, and adapt.
+# Plans can also be written in Markdown (.md); YAML is preferred for
+# new plans.
 #
 # Tasks that don't produce a commit (e.g. investigation, reproduction)
-# should set `produces_commit: false` to hide the Merge button.
+# should set `produces_commit: false` to hide the Merge button — see
+# the canonical reference for details.
 
 title: "Plan Title"
 context: |

@@ -54,8 +54,11 @@ Flag-level detail, file layouts, schemas.
   `<cwd>/.branchwork-runner-sessions/`, every environment variable
   the source actually reads (`BRANCHWORK_*`, `SMTP_*`, driver API
   keys), and a list of variables that look like config but aren't.
-- [reference/plan-schema.md](reference/plan-schema.md) _(stub)_ — canonical
-  YAML plan schema; supersedes the root `plan.yaml` sample.
+- [reference/plan-schema.md](reference/plan-schema.md) — canonical
+  YAML plan schema (every field on `YamlPlan` / `YamlPlanPhase` /
+  `YamlPlanTask`, the Markdown fallback's heuristics, `produces_commit`,
+  project inference, `created_at`). Supersedes the in-repo sample at
+  the root [`plan.yaml`](../plan.yaml).
 - [reference/drivers.md](reference/drivers.md) _(stub)_ — `AgentDriver`
   trait, `DriverCapabilities`, authoring a new driver, registering in
   `DriverRegistry`, MCP auto-injection.
