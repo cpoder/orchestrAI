@@ -74,8 +74,8 @@ in older peers (see versioning below).
    currently connected client. Disconnected clients are reaped silently.
 4. On reconnect, the parent re-opens the socket and resumes — there is no
    handshake. Backfill is supplied by the **server-side** SQLite
-   `agent_output` table (see [persistence.md](persistence.md) once it lands)
-   plus the live broadcast; the on-disk `<socket>.log` is post-mortem only.
+   `agent_output` table (see [persistence.md](persistence.md)) plus
+   the live broadcast; the on-disk `<socket>.log` is post-mortem only.
 5. `Kill`, supervisor crash, or agent exit closes the socket; the parent
    detects EOF and reconciles agent state.
 

@@ -37,9 +37,10 @@ The three-binary split, wire protocols, and storage model.
   frames (`postcard` over UDS / named pipe), SaaS runner `WireMessage`
   JSON envelopes with reliable/best-effort split and outbox/ACK/replay
   semantics, plus the versioning policy.
-- [architecture/persistence.md](architecture/persistence.md) _(stub)_ —
-  SQLite/Postgres schema, org multi-tenancy, outbox tables, migrations,
-  what survives restart.
+- [architecture/persistence.md](architecture/persistence.md) — SQLite
+  schema, org multi-tenancy, outbox tables, idempotent migrations, the
+  per-agent sibling files, and a four-way restart matrix covering every
+  persisted artifact.
 
 ## Reference
 

@@ -286,5 +286,6 @@ a reconnect is fine; dropping an `AgentStopped` would leak a stuck
   outbox, reconnect.
 - [architecture/protocols.md](protocols.md) _(stub)_ — frame formats
   and WS event vocabulary.
-- [architecture/persistence.md](persistence.md) _(stub)_ — SQLite /
-  Postgres schema and what survives restart.
+- [architecture/persistence.md](persistence.md) — SQLite schema, the
+  on-disk artifacts, and a four-way restart matrix covering every
+  persisted artifact.

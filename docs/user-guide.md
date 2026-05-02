@@ -641,8 +641,8 @@ configuration.
 - [quickstart.md](quickstart.md) — five-minute install + first plan.
 - [architecture/overview.md](architecture/overview.md) — the three
   binaries, protocols, and what survives a restart.
-- [architecture/persistence.md](architecture/persistence.md) _(stub)_
-  — SQLite/Postgres schema for what's described above.
+- [architecture/persistence.md](architecture/persistence.md) — SQLite
+  schema, on-disk artifacts, and the restart matrix.
 - [reference/plan-schema.md](reference/plan-schema.md) _(stub)_ —
   field-by-field plan YAML reference, supersedes the inline schema
   in this guide.
