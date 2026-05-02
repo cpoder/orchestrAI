@@ -165,6 +165,61 @@ fn merge_with_empty_into_body_falls_back_to_default() {
 }
 
 #[test]
+fn stale_source_branch_is_ignored_in_favour_of_default() {
+    // Regression for plan merge-target-canonical-default-branch T4.1:
+    // when an agent has a stale-but-resolvable `source_branch` recorded
+    // (e.g. the user was on stale/3.4 when they spawned the agent), the
+    // merge endpoint must still target the canonical default branch
+    // (master), not the stored value. Pre-Phase-2 behaviour: `into`
+    // came back as "stale/3.4" and the work landed on the wrong branch.
+    let d = TestDashboard::new();
+    d.create_plan("mp-stale", &minimal_plan("mp-stale", &d.project));
+    d.create_task_branch("stale/3.4", /* with_commit */ true);
+
+    let task = "branchwork/mp-stale/1.1";
+    d.create_task_branch(task, /* with_commit */ true);
+    seed_agent(
+        &d,
+        "agent-stale",
+        "mp-stale",
+        "1.1",
+        Some(task),
+        Some("stale/3.4"),
+    );
+
+    let (s, body) = d.post("/api/agents/agent-stale/merge", json!({}));
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(
+        body["into"], "master",
+        "merge must target the default branch, not the stale \
+         stored source_branch"
+    );
+}
+
+#[test]
+fn null_source_branch_targets_default() {
+    // Sibling to stale_source_branch_is_ignored_in_favour_of_default:
+    // when source_branch is NULL in the DB (older agent rows, or rows
+    // where capture intentionally stored nothing), the merge endpoint
+    // must still resolve to the canonical default branch.
+    // `merge_with_real_commits_succeeds` already covers the
+    // `Some("master")` case; this fills the NULL gap.
+    let d = TestDashboard::new();
+    d.create_plan("mp-null", &minimal_plan("mp-null", &d.project));
+
+    let task = "branchwork/mp-null/1.1";
+    d.create_task_branch(task, /* with_commit */ true);
+    seed_agent(&d, "agent-null", "mp-null", "1.1", Some(task), None);
+
+    let (s, body) = d.post("/api/agents/agent-null/merge", json!({}));
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(
+        body["into"], "master",
+        "NULL source_branch must still resolve to the canonical default"
+    );
+}
+
+#[test]
 fn self_referencing_source_branch_does_not_cause_500() {
     // Regression: b77d9c0 shipped Fix CI with source_branch recorded AS
     // the task branch (because start_pty_agent captured git_current_branch
