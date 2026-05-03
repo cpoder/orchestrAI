@@ -175,24 +175,28 @@ pub async fn kill_agent(
     auth: OptionalAuthUser,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if state.registry.kill_agent(&id).await {
-        let db = state.db.lock().unwrap();
-        crate::audit::log(
-            &db,
-            auth.org_id(),
-            auth.0.as_ref().map(|u| u.id.as_str()),
-            auth.0.as_ref().map(|u| u.email.as_str()),
-            crate::audit::actions::AGENT_KILL,
-            crate::audit::resources::AGENT,
-            Some(&id),
-            None,
-        );
-        (StatusCode::OK, Json(serde_json::json!({"ok": true})))
-    } else {
-        (
+    let org_id = auth.org_id().to_string();
+    match crate::agents::spawn_ops::kill_agent_dispatch(&state, &org_id, &id).await {
+        Ok(true) => {
+            let db = state.db.lock().unwrap();
+            crate::audit::log(
+                &db,
+                auth.org_id(),
+                auth.0.as_ref().map(|u| u.id.as_str()),
+                auth.0.as_ref().map(|u| u.email.as_str()),
+                crate::audit::actions::AGENT_KILL,
+                crate::audit::resources::AGENT,
+                Some(&id),
+                None,
+            );
+            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+        }
+        Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Agent not found"})),
         )
+            .into_response(),
+        Err(e) => rpc_error_response(e),
     }
 }
 

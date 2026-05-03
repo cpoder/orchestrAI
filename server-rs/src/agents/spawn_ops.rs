@@ -1,13 +1,14 @@
-//! Agent-spawn dispatcher: route to a connected runner in SaaS mode, or
-//! spawn a local session daemon in standalone mode.
+//! Agent-spawn / kill dispatchers: route to a connected runner in SaaS mode,
+//! or operate locally in standalone mode.
 //!
 //! Mirrors the design of [`crate::agents::git_ops`]: branch on
 //! [`crate::saas::dispatch::org_has_runner`], then either delegate to the
-//! existing in-process [`crate::agents::pty_agent::start_pty_agent`] (which
-//! shells out via the local `git` binary and `supervisor::spawn_session_daemon`)
-//! or emit a [`WireMessage::StartAgent`] to the runner over the WS link.
+//! existing in-process [`crate::agents::pty_agent::start_pty_agent`] /
+//! [`crate::agents::AgentRegistry::kill_agent`] (which shell out via the
+//! local `git` binary and `supervisor::spawn_session_daemon`) or emit the
+//! corresponding [`WireMessage`] to the runner over the WS link.
 //!
-//! ## SaaS mode
+//! ## SaaS-mode start
 //!
 //! 1. Generate `agent_id` server-side (so the HTTP caller has it before the
 //!    runner replies).
@@ -15,20 +16,29 @@
 //!    runner's `AgentStarted`-handler in `saas/runner_ws.rs` flips the row
 //!    to `running` once the spawn succeeds (via INSERT ... ON CONFLICT
 //!    DO UPDATE so the upgrade is idempotent for this dispatcher path).
-//! 3. Resolve `source_branch` via the existing
-//!    [`git_ops::default_branch`] dispatcher — runner-routed when SaaS,
-//!    local when standalone. `base_commit` and the active-branch checkout
-//!    are intentionally skipped server-side: in SaaS mode the runner owns
-//!    the filesystem and the agent itself does the branch checkout via the
-//!    `unattended_contract_block` instructions baked into the prompt
-//!    (see `agents/prompt.rs`).
+//! 3. `source_branch` is left NULL in SaaS mode (informational only, see
+//!    [`start_agent_via_runner`]).
 //! 4. Send the `StartAgent` envelope reliably (outbox + push-if-connected)
 //!    so an offline runner picks it up on reconnect.
 //!
+//! ## SaaS-mode kill
+//!
+//! 1. Send the `KillAgent` envelope reliably (outbox + push-if-connected),
+//!    so a momentarily-offline runner still terminates the orphaned daemon
+//!    on reconnect.
+//! 2. Update `agents.status='killed'` server-side as a fast-path: the
+//!    runner-side handler aborts the I/O task before sending `AgentStopped`,
+//!    so the runner does not ship a status update on kill — only this
+//!    server-side write moves the row out of `running`. Without it the
+//!    dashboard would show the agent stuck on `running` forever even after
+//!    the daemon is dead.
+//! 3. Broadcast `agent_stopped` so connected dashboards refresh immediately.
+//!
 //! ## Standalone mode
 //!
-//! Delegates verbatim to `pty_agent::start_pty_agent`. No behavioral change
-//! vs the pre-dispatcher code path — the dispatcher is a thin branch.
+//! Both dispatchers delegate verbatim to the existing local helpers. No
+//! behavioral change vs the pre-dispatcher code path — the dispatcher is
+//! a thin branch.
 
 use rusqlite::params;
 
@@ -36,6 +46,7 @@ use crate::agents::pty_agent::{self, StartPtyOpts};
 use crate::saas::dispatch::org_has_runner;
 use crate::saas::outbox;
 use crate::saas::runner_protocol::{Envelope, WireMessage};
+use crate::saas::runner_rpc::RunnerRpcError;
 use crate::state::AppState;
 use crate::ws::broadcast_event;
 
@@ -134,42 +145,138 @@ async fn start_agent_via_runner(state: &AppState, org_id: &str, opts: StartPtyOp
     };
     let payload = serde_json::to_string(&message).unwrap_or_default();
 
-    // Pick the most recently-seen runner for this org (matches
-    // runner_request_with_registry's selection rule). Online-only filter:
-    // if every runner is offline, the StartAgent still gets queued in the
-    // outbox for the runner picked here, replayed when it reconnects.
-    let runner_id: Option<String> = {
-        let conn = state.db.lock().unwrap();
-        conn.query_row(
-            "SELECT id FROM runners WHERE org_id = ?1 \
-             ORDER BY (status = 'online') DESC, last_seen_at DESC LIMIT 1",
-            params![org_id],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
-    };
-
-    let Some(runner_id) = runner_id else {
+    let Some(runner_id) = pick_runner_for_org(&state.db, org_id) else {
         eprintln!(
             "[spawn_ops] org {org_id} has runner row(s) but selection failed; agent {agent_id} stays in 'starting'"
         );
         return agent_id;
     };
 
-    // Reliable delivery: enqueue first so an offline runner picks this up
-    // on reconnect via outbox replay; push immediately if currently online.
+    send_reliable_to_runner(state, &runner_id, message, &payload).await;
+    agent_id
+}
+
+/// Pick the most recently-seen runner for `org_id`, prioritising online
+/// runners. Returns `None` only if the `runners` table has no row for this
+/// org — callers above the dispatcher have already gated on
+/// [`org_has_runner`], so this should be infallible in practice.
+fn pick_runner_for_org(db: &crate::db::Db, org_id: &str) -> Option<String> {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT id FROM runners WHERE org_id = ?1 \
+         ORDER BY (status = 'online') DESC, last_seen_at DESC LIMIT 1",
+        params![org_id],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
+/// Reliable delivery: enqueue first so an offline runner picks this up
+/// on reconnect via outbox replay; push immediately if currently online.
+async fn send_reliable_to_runner(
+    state: &AppState,
+    runner_id: &str,
+    message: WireMessage,
+    payload: &str,
+) {
     let seq = {
         let conn = state.db.lock().unwrap();
-        outbox::enqueue_server_command(&conn, &runner_id, message.event_type(), &payload)
+        outbox::enqueue_server_command(&conn, runner_id, message.event_type(), payload)
     };
     let envelope = Envelope::reliable("server".to_string(), seq, message);
     let env_json = serde_json::to_string(&envelope).unwrap_or_default();
 
-    if let Some(runner) = state.runners.lock().await.get(&runner_id) {
+    if let Some(runner) = state.runners.lock().await.get(runner_id) {
         let _ = runner.command_tx.send(env_json);
     }
+}
 
-    agent_id
+/// Kill an agent — either locally (standalone) via SIGTERM through the
+/// in-process [`crate::agents::AgentRegistry::kill_agent`], or via a
+/// reliably-enqueued [`WireMessage::KillAgent`] to the registered runner
+/// (SaaS).
+///
+/// `Ok(true)` ⇒ the agent existed and the kill was issued (in either
+/// mode); `Ok(false)` ⇒ the agent_id is unknown to this server. The error
+/// arm is reserved for runner-selection / send failures and is not used
+/// today — the outbox absorbs transient runner outages, and the local
+/// path never errors. Keeping the `Result` in the signature lets the
+/// auto-mode loop (3.3) and any future caller surface RPC failures
+/// uniformly without an API break.
+///
+/// In SaaS mode the row is updated server-side to `status='killed'` as a
+/// fast-path: the runner-side handler aborts the per-agent I/O task
+/// before SIGTERM lands on the daemon, so it does not (today) follow up
+/// with an `AgentStopped`. Without this server-side update the dashboard
+/// would observe `running` forever.
+pub async fn kill_agent_dispatch(
+    state: &AppState,
+    org_id: &str,
+    agent_id: &str,
+) -> Result<bool, RunnerRpcError> {
+    if org_has_runner(&state.db, org_id) {
+        kill_agent_via_runner(state, org_id, agent_id).await
+    } else {
+        Ok(state.registry.kill_agent(agent_id).await)
+    }
+}
+
+async fn kill_agent_via_runner(
+    state: &AppState,
+    org_id: &str,
+    agent_id: &str,
+) -> Result<bool, RunnerRpcError> {
+    // Existence check — return Ok(false) so the HTTP handler maps to 404.
+    // The local registry's `kill_agent` is permissive (always returns
+    // true), but SaaS mode can be stricter because we have authoritative
+    // org-scoped DB state.
+    let exists: bool = {
+        let conn = state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT 1 FROM agents WHERE id = ?1 AND org_id = ?2",
+            params![agent_id, org_id],
+            |_row| Ok(()),
+        )
+        .is_ok()
+    };
+    if !exists {
+        return Ok(false);
+    }
+
+    let Some(runner_id) = pick_runner_for_org(&state.db, org_id) else {
+        eprintln!(
+            "[spawn_ops] org {org_id} has runner row(s) but selection failed; \
+             cannot route KillAgent for {agent_id}"
+        );
+        return Err(RunnerRpcError::NoConnectedRunner);
+    };
+
+    let message = WireMessage::KillAgent {
+        agent_id: agent_id.to_string(),
+    };
+    let payload = serde_json::to_string(&message).unwrap_or_default();
+    send_reliable_to_runner(state, &runner_id, message, &payload).await;
+
+    // Fast-path the row out of `running` / `starting`. The status filter
+    // matches the local kill_agent path so we never overwrite a terminal
+    // state (already-killed / failed / completed agents stay as-is).
+    {
+        let conn = state.db.lock().unwrap();
+        conn.execute(
+            "UPDATE agents SET status = 'killed', finished_at = datetime('now'), branch = NULL \
+             WHERE id = ?1 AND status IN ('running', 'starting')",
+            params![agent_id],
+        )
+        .ok();
+    }
+
+    broadcast_event(
+        &state.broadcast_tx,
+        "agent_stopped",
+        serde_json::json!({"id": agent_id, "status": "killed"}),
+    );
+
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -349,5 +456,202 @@ mod tests {
         let (db, _td) = full_db();
         // No runner row inserted — org_has_runner returns false.
         assert!(!org_has_runner(&db, "default-org"));
+    }
+
+    /// Acceptance: spawn a fix agent via 0.8's `start_agent_dispatch`,
+    /// then call `kill_agent_dispatch`. Assert a `KillAgent` envelope
+    /// reaches the stub runner with the expected `agent_id`, the
+    /// agents row is fast-pathed to status='killed', and the
+    /// KillAgent is enqueued for reliable delivery.
+    #[tokio::test]
+    async fn saas_dispatch_emits_kill_agent_envelope_to_runner() {
+        let (db, _td) = full_db();
+        let org_id = "default-org"; // seeded by db::init
+        seed_runner(&db, "runner-1", org_id, "online");
+
+        let runners = new_runner_registry();
+        let mut server_to_runner_rx = install_capturing_runner(&runners, "runner-1").await;
+        let state = test_app_state(db.clone(), runners);
+
+        // Spawn via T0.8 so the agents row exists with mode='remote'.
+        let cwd = PathBuf::from("/runner/projects/demo");
+        let opts = StartPtyOpts {
+            prompt: "fix the failing test".to_string(),
+            cwd: &cwd,
+            plan_name: Some("demo-plan"),
+            task_id: Some("0.9"),
+            effort: crate::config::Effort::High,
+            branch: Some("branchwork/demo-plan/0.9"),
+            is_continue: false,
+            max_budget_usd: Some(2.5),
+            driver: Some("claude"),
+            user_id: None,
+            org_id: Some(org_id),
+        };
+        let agent_id = start_agent_dispatch(&state, org_id, opts).await;
+
+        // Drain the StartAgent envelope so the KillAgent is the next read.
+        let _start_payload =
+            tokio::time::timeout(Duration::from_millis(500), server_to_runner_rx.recv())
+                .await
+                .expect("StartAgent envelope should arrive")
+                .expect("channel still open");
+
+        // Now flip the row to 'running' so the kill fast-path actually
+        // updates it (mirrors what AgentStarted would do in production).
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE agents SET status = 'running' WHERE id = ?1",
+                params![agent_id],
+            )
+            .unwrap();
+        }
+
+        // Dispatch the kill.
+        let result = kill_agent_dispatch(&state, org_id, &agent_id).await;
+        assert!(
+            matches!(result, Ok(true)),
+            "expected Ok(true), got {result:?}"
+        );
+
+        // The KillAgent envelope should have arrived at the stub runner.
+        let payload = tokio::time::timeout(Duration::from_millis(500), server_to_runner_rx.recv())
+            .await
+            .expect("KillAgent envelope should arrive")
+            .expect("channel still open");
+
+        let envelope: Envelope = serde_json::from_str(&payload).unwrap();
+        match envelope.message {
+            WireMessage::KillAgent { agent_id: got_id } => {
+                assert_eq!(got_id, agent_id);
+            }
+            other => panic!("expected KillAgent variant, got {other:?}"),
+        }
+
+        // Server-side row must be fast-pathed to status='killed' with
+        // branch cleared so it stops advertising as mergeable.
+        let (status, branch): (String, Option<String>) = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT status, branch FROM agents WHERE id = ?1",
+                params![agent_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(status, "killed");
+        assert_eq!(branch, None);
+
+        // Outbox should hold the KillAgent for replay on reconnect.
+        let outbox_count: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM inbox_pending WHERE runner_id = ?1 AND command_type = 'kill_agent'",
+                params!["runner-1"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            outbox_count, 1,
+            "KillAgent should be enqueued for reliable delivery"
+        );
+    }
+
+    /// Unknown agent_id ⇒ Ok(false) (the HTTP handler maps this to 404).
+    /// We must NOT send any envelope or update any row in this case.
+    #[tokio::test]
+    async fn saas_kill_dispatch_returns_false_for_unknown_agent() {
+        let (db, _td) = full_db();
+        let org_id = "default-org";
+        seed_runner(&db, "runner-1", org_id, "online");
+
+        let runners = new_runner_registry();
+        let mut server_to_runner_rx = install_capturing_runner(&runners, "runner-1").await;
+        let state = test_app_state(db, runners);
+
+        let result = kill_agent_dispatch(&state, org_id, "no-such-agent").await;
+        assert!(
+            matches!(result, Ok(false)),
+            "expected Ok(false), got {result:?}"
+        );
+
+        // No envelope should have been sent.
+        let envelope =
+            tokio::time::timeout(Duration::from_millis(150), server_to_runner_rx.recv()).await;
+        assert!(envelope.is_err(), "no envelope should have been emitted");
+    }
+
+    /// Standalone (`org_has_runner == false`): the dispatcher must
+    /// delegate to the in-process `AgentRegistry::kill_agent`, which
+    /// SIGTERMs the local session daemon (or no-ops cleanly if the
+    /// agent doesn't exist in-process). We verify the local path by
+    /// observing the DB-level kill semantics: an in-DB-only agent row
+    /// (no live socket / pid) flips to 'killed' and the broadcast
+    /// fires.
+    ///
+    /// We can't drive a real PTY supervisor from this unit test, so we
+    /// simulate "agent registered in DB but not in-process" — the
+    /// fall-through branch of `AgentRegistry::kill_agent` that updates
+    /// the row regardless. Combined with the SaaS-mode test above,
+    /// this exercises both branches of the dispatcher.
+    #[tokio::test]
+    async fn standalone_kill_dispatch_takes_local_path() {
+        let (db, _td) = full_db();
+        let org_id = "default-org"; // seeded by db::init, no runners row
+        assert!(
+            !org_has_runner(&db, org_id),
+            "standalone test requires no runners"
+        );
+
+        let runners = new_runner_registry();
+        let state = test_app_state(db.clone(), runners);
+
+        // Insert an agent row that is "alive" in DB but not in-process.
+        let agent_id = "stale-agent-001";
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, cwd, status, mode, org_id) \
+                 VALUES (?1, '/tmp/test', 'running', 'pty', ?2)",
+                params![agent_id, org_id],
+            )
+            .unwrap();
+        }
+
+        // Subscribe to the broadcast so we can observe agent_stopped.
+        let mut bc_rx = state.broadcast_tx.subscribe();
+
+        let result = kill_agent_dispatch(&state, org_id, agent_id).await;
+        // Local kill_agent always returns true (existing semantics —
+        // see the docstring on `kill_agent_dispatch`).
+        assert!(
+            matches!(result, Ok(true)),
+            "expected Ok(true), got {result:?}"
+        );
+
+        // DB row should be flipped to 'killed' by the local path.
+        let status: String = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT status FROM agents WHERE id = ?1",
+                params![agent_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(status, "killed");
+
+        // agent_stopped should have been broadcast.
+        let event = tokio::time::timeout(Duration::from_millis(200), bc_rx.recv())
+            .await
+            .expect("expected agent_stopped broadcast")
+            .expect("broadcast channel still open");
+        assert!(event.contains("agent_stopped"), "got broadcast: {event}");
+        assert!(
+            event.contains(agent_id),
+            "broadcast should reference {agent_id}: {event}"
+        );
     }
 }
