@@ -88,6 +88,30 @@ pub fn git_list_branches(cwd: &Path) -> Vec<String> {
     branches
 }
 
+/// Resolve the current branch name of the repo at `cwd` via
+/// `git rev-parse --abbrev-ref HEAD`. Returns `None` for a missing repo,
+/// a detached HEAD, or any other failure. Used by the runner-side
+/// `MergeAgentBranch` handler to recover the agent's task branch from
+/// the cwd it was spawned in (the high-level wire variant doesn't carry
+/// `task_branch` — the runner's authoritative answer is "whatever HEAD
+/// currently points at").
+pub fn git_current_branch(cwd: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if branch.is_empty() || branch == "HEAD" {
+        None
+    } else {
+        Some(branch)
+    }
+}
+
 /// Capture `git rev-parse HEAD`. Private helper — the merge sequence needs
 /// it to populate `MergeOutcome::Ok { merged_sha }`.
 fn git_head_sha(cwd: &Path) -> Option<String> {

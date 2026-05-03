@@ -40,14 +40,16 @@ mod saas {
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use rusqlite::Connection;
+use serde::Deserialize;
 use tokio::sync::{Mutex, mpsc};
 
 use runner_protocol::{
-    DriverAuthInfo, DriverAuthStatus, Envelope, FolderEntry, GhRun, MergeOutcome, WireMessage,
+    CiAggregate, CiRunSummary, DriverAuthInfo, DriverAuthStatus, Envelope, FolderEntry, GhRun,
+    MergeOutcome, WireMessage,
 };
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
@@ -96,6 +98,18 @@ struct RunnerState {
     ws_tx: mpsc::UnboundedSender<String>,
     cwd: PathBuf,
     server_bin: PathBuf,
+    /// `plan_name → cwd` populated from each `StartAgent`. The CI handlers
+    /// (`GetCiRunStatus`, `CiFailureLog`) only carry `plan_name` on the wire,
+    /// so the runner needs a sticky map to recover the directory it should
+    /// run `gh` in. Survives agent exit so the auto-mode loop can keep
+    /// polling after the task agent has stopped.
+    plan_cwd: Arc<Mutex<HashMap<String, PathBuf>>>,
+    /// Per-SHA aggregate cache for `GetCiRunStatus` (~10 s TTL). The
+    /// `latest_sha_by_plan` side-table lets `CiFailureLog { run_id: None }`
+    /// re-resolve the failing run for the most recent SHA the runner saw
+    /// for a plan — that's the auto-mode 3.1 use-case where the loop has
+    /// dropped the run id by the time it decides to fetch a log.
+    ci_cache: Arc<Mutex<CiAggregateCache>>,
 }
 
 struct AgentHandle {
@@ -105,6 +119,73 @@ struct AgentHandle {
     socket_path: PathBuf,
     /// Abort handle for the I/O forwarding task.
     io_task: tokio::task::JoinHandle<()>,
+    /// Where the agent was spawned. Stored at `StartAgent` time so the
+    /// `MergeAgentBranch` and `HasGithubActions` handlers can reach the
+    /// same directory the agent committed to (the runner's canonical
+    /// `--cwd` may be a parent if multiple projects share one runner).
+    cwd: PathBuf,
+}
+
+/// Aggregate-cache TTL. ~10 s per the auto-mode brief — short enough that
+/// a stale entry doesn't paper over a CI state change, long enough that a
+/// tight server-side poll loop on a 1–2 s cadence collapses into one `gh`
+/// call per cycle.
+const CI_CACHE_TTL: Duration = Duration::from_secs(10);
+
+/// Soft cap on cache entries. Eviction is opportunistic on insert: when
+/// the map exceeds this size we drop entries whose age exceeds 5×TTL.
+const CI_CACHE_MAX_ENTRIES: usize = 64;
+
+#[derive(Default)]
+struct CiAggregateCache {
+    /// SHA → most recently computed aggregate (and the time it was
+    /// computed). `aggregate: None` is itself a cacheable result — it
+    /// means "`gh run list` returned no rows for this SHA yet" and the
+    /// loop should keep polling.
+    by_sha: HashMap<String, CachedAggregate>,
+    /// `plan_name → most-recent SHA the runner has been asked about`.
+    /// Populated as a side effect of every `GetCiRunStatus` so the
+    /// `run_id: None` branch of `CiFailureLog` can re-resolve.
+    latest_sha_by_plan: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+struct CachedAggregate {
+    computed_at: Instant,
+    aggregate: Option<CiAggregate>,
+}
+
+impl CiAggregateCache {
+    fn fresh(&self, sha: &str) -> Option<Option<CiAggregate>> {
+        let entry = self.by_sha.get(sha)?;
+        if entry.computed_at.elapsed() < CI_CACHE_TTL {
+            Some(entry.aggregate.clone())
+        } else {
+            None
+        }
+    }
+
+    fn put(&mut self, sha: String, aggregate: Option<CiAggregate>) {
+        self.by_sha.insert(
+            sha,
+            CachedAggregate {
+                computed_at: Instant::now(),
+                aggregate,
+            },
+        );
+        if self.by_sha.len() > CI_CACHE_MAX_ENTRIES {
+            self.by_sha
+                .retain(|_, e| e.computed_at.elapsed() < CI_CACHE_TTL * 5);
+        }
+    }
+
+    fn record_plan_sha(&mut self, plan: String, sha: String) {
+        self.latest_sha_by_plan.insert(plan, sha);
+    }
+
+    fn latest_sha_for_plan(&self, plan: &str) -> Option<String> {
+        self.latest_sha_by_plan.get(plan).cloned()
+    }
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -224,6 +305,8 @@ async fn connect_and_run(
         ws_tx: ws_tx.clone(),
         cwd: cwd.to_path_buf(),
         server_bin: server_bin.to_path_buf(),
+        plan_cwd: Arc::new(Mutex::new(HashMap::new())),
+        ci_cache: Arc::new(Mutex::new(CiAggregateCache::default())),
     });
 
     // ── Writer task: flush channel messages to WebSocket ─────────────────
@@ -404,6 +487,15 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
             .await
             {
                 Ok(()) => {
+                    // Remember plan→cwd so CI handlers (which only carry
+                    // `plan_name` on the wire) can later run `gh` in the
+                    // right directory. Survives agent exit.
+                    state
+                        .plan_cwd
+                        .lock()
+                        .await
+                        .insert(plan_name.clone(), agent_cwd.clone());
+
                     // Report agent_started.
                     let started = WireMessage::AgentStarted {
                         agent_id: agent_id.clone(),
@@ -683,6 +775,206 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
             send_best_effort(state, WireMessage::GhFailureLogFetched { req_id, log });
         }
 
+        WireMessage::MergeAgentBranch {
+            req_id,
+            agent_id,
+            into,
+        } => {
+            let req_id = req_id.clone();
+            let agent_id = agent_id.clone();
+            let into = into.clone();
+
+            // Look up the agent's cwd from the runner's in-memory registry.
+            // AgentHandle is inserted at `StartAgent` and never removed on a
+            // clean exit, so the auto-mode loop's "agent finished, now merge"
+            // round-trip finds the right path.
+            let agent_cwd = state.agents.lock().await.get(&agent_id).map(|h| h.cwd.clone());
+
+            let Some(cwd) = agent_cwd else {
+                send_best_effort(
+                    state,
+                    WireMessage::AgentBranchMerged {
+                        req_id,
+                        ok: false,
+                        merged_sha: None,
+                        target_branch: String::new(),
+                        had_conflict: false,
+                        error: Some("agent_not_found_on_runner".to_string()),
+                    },
+                );
+                return;
+            };
+
+            let cwd_for_blocking = cwd.clone();
+            let into_for_blocking = into.clone();
+            let result = run_blocking_with_timeout(MERGE_TIMEOUT, move || {
+                merge_agent_branch_on_runner(&cwd_for_blocking, into_for_blocking.as_deref())
+            })
+            .await;
+
+            let reply = match result {
+                Some(merge) => WireMessage::AgentBranchMerged {
+                    req_id,
+                    ok: merge.merged_sha.is_some(),
+                    merged_sha: merge.merged_sha,
+                    target_branch: merge.target_branch,
+                    had_conflict: merge.had_conflict,
+                    error: merge.error,
+                },
+                None => WireMessage::AgentBranchMerged {
+                    req_id,
+                    ok: false,
+                    merged_sha: None,
+                    target_branch: String::new(),
+                    had_conflict: false,
+                    error: Some(format!(
+                        "merge timed out after {}s",
+                        MERGE_TIMEOUT.as_secs()
+                    )),
+                },
+            };
+            send_best_effort(state, reply);
+        }
+
+        WireMessage::HasGithubActions { req_id, agent_id } => {
+            let req_id = req_id.clone();
+            let agent_id = agent_id.clone();
+
+            let agent_cwd = state.agents.lock().await.get(&agent_id).map(|h| h.cwd.clone());
+
+            let present = match agent_cwd {
+                Some(cwd) => run_blocking_with_timeout(READ_TIMEOUT, move || {
+                    has_github_actions(&cwd)
+                })
+                .await
+                .unwrap_or(false),
+                None => false,
+            };
+
+            send_best_effort(
+                state,
+                WireMessage::GithubActionsDetected { req_id, present },
+            );
+        }
+
+        WireMessage::GetCiRunStatus {
+            req_id,
+            plan_name,
+            task_number: _,
+            merged_sha,
+        } => {
+            let req_id = req_id.clone();
+            let plan_name = plan_name.clone();
+            let merged_sha = merged_sha.clone();
+
+            // Always record plan→sha so a follow-up `CiFailureLog { run_id:
+            // None }` can re-resolve.
+            {
+                let mut cache = state.ci_cache.lock().await;
+                cache.record_plan_sha(plan_name.clone(), merged_sha.clone());
+            }
+
+            // Fast path: serve a fresh cached aggregate.
+            let cached = state.ci_cache.lock().await.fresh(&merged_sha);
+
+            let aggregate = if let Some(cached) = cached {
+                cached
+            } else {
+                let cwd = state
+                    .plan_cwd
+                    .lock()
+                    .await
+                    .get(&plan_name)
+                    .cloned()
+                    .unwrap_or_else(|| state.cwd.clone());
+
+                let computed = run_blocking_with_timeout(GH_TIMEOUT, {
+                    let sha = merged_sha.clone();
+                    move || compute_ci_aggregate(&cwd, &sha)
+                })
+                .await
+                .unwrap_or(None);
+
+                state
+                    .ci_cache
+                    .lock()
+                    .await
+                    .put(merged_sha.clone(), computed.clone());
+                computed
+            };
+
+            send_best_effort(
+                state,
+                WireMessage::CiRunStatusResolved { req_id, aggregate },
+            );
+        }
+
+        WireMessage::CiFailureLog {
+            req_id,
+            plan_name,
+            run_id,
+        } => {
+            let req_id = req_id.clone();
+            let plan_name = plan_name.clone();
+            let explicit_run_id = run_id.clone();
+
+            // Resolve the run id to fetch — explicit on the wire, otherwise
+            // re-resolved from the most recent cached aggregate for this
+            // plan. This is the auto-mode 3.1 path: by the time the loop
+            // sees a Red outcome it has dropped the run id.
+            let resolved_run_id: Option<String> = match explicit_run_id {
+                Some(id) if !id.is_empty() => Some(id),
+                _ => {
+                    let cache = state.ci_cache.lock().await;
+                    let latest_sha = cache.latest_sha_for_plan(&plan_name);
+                    latest_sha
+                        .and_then(|sha| cache.by_sha.get(&sha).cloned())
+                        .and_then(|entry| entry.aggregate)
+                        .and_then(|agg| agg.failing_run_id)
+                }
+            };
+
+            let Some(run_id_used) = resolved_run_id else {
+                send_best_effort(
+                    state,
+                    WireMessage::CiFailureLogResolved {
+                        req_id,
+                        log: None,
+                        run_id_used: None,
+                    },
+                );
+                return;
+            };
+
+            // Resolve cwd the same way `GetCiRunStatus` does — fall back to
+            // the runner's canonical root if the plan hasn't started any
+            // agents yet (defensive; should not happen on the auto-mode
+            // path because the loop only fetches logs after a merge).
+            let cwd = state
+                .plan_cwd
+                .lock()
+                .await
+                .get(&plan_name)
+                .cloned()
+                .unwrap_or_else(|| state.cwd.clone());
+
+            let run_id_for_blocking = run_id_used.clone();
+            let log = run_blocking_with_timeout(GH_TIMEOUT, move || {
+                git_helpers::gh_failure_log_local(&cwd, &run_id_for_blocking)
+            })
+            .await
+            .unwrap_or(None);
+
+            send_best_effort(
+                state,
+                WireMessage::CiFailureLogResolved {
+                    req_id,
+                    log,
+                    run_id_used: Some(run_id_used),
+                },
+            );
+        }
+
         // Runner doesn't receive these from server (runner→saas direction
         // only; the server sending them would be a protocol violation).
         WireMessage::RunnerHello { .. }
@@ -703,13 +995,8 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
         | WireMessage::GithubActionsDetected { .. }
         | WireMessage::CiRunStatusResolved { .. }
         | WireMessage::CiFailureLogResolved { .. }
-        // saas→runner variants the runner doesn't act on yet (handlers
-        // land in later phases — auto-mode 0.4 wires the four below).
+        // saas→runner variants the runner doesn't act on (no current handler).
         | WireMessage::TerminalReplay { .. }
-        | WireMessage::MergeAgentBranch { .. }
-        | WireMessage::HasGithubActions { .. }
-        | WireMessage::GetCiRunStatus { .. }
-        | WireMessage::CiFailureLog { .. }
         | WireMessage::Ping {} => {}
     }
 }
@@ -820,6 +1107,283 @@ fn check_or_create_folder(
     } else {
         (false, resolved_str, Some("folder_not_found".to_string()))
     }
+}
+
+// ── Auto-mode handler helpers ───────────────────────────────────────────────
+//
+// The four high-level handlers (MergeAgentBranch, HasGithubActions,
+// GetCiRunStatus, CiFailureLog) all delegate to small synchronous helpers
+// that the handler arm wraps in `run_blocking_with_timeout`. Keeping the
+// helpers pure-sync (and small) means they can be unit-tested directly
+// against tempdir git repos and stub `gh` outputs.
+
+/// Outcome of [`merge_agent_branch_on_runner`]. Wire conversion happens
+/// in the `MergeAgentBranch` arm of [`handle_server_message`]: this struct
+/// just carries the four pieces of information the wire reply needs.
+struct AgentMergeResult {
+    merged_sha: Option<String>,
+    target_branch: String,
+    had_conflict: bool,
+    error: Option<String>,
+}
+
+/// Run the same five-step merge sequence as `api::agents::merge_agent_branch_inner`,
+/// resolving inputs locally:
+///
+/// 1. Resolve `task_branch` from the cwd's current `HEAD`. Auto-mode policy
+///    leaves the agent on its task branch on exit, so this is reliable.
+/// 2. Resolve the canonical default branch via `git_default_branch`.
+/// 3. Pick a target: the dropdown override (if it appears in
+///    `git_list_branches`), otherwise the canonical default, otherwise
+///    `"main"` — same precedence as `api::agents::resolve_merge_target`.
+/// 4. Run `merge_branch_local` (no-commit guard, checkout, merge,
+///    branch cleanup).
+/// 5. On success, push origin if the target equals the canonical default.
+///    Push errors are swallowed — the merge is the load-bearing step; CI
+///    gating is owned by `HasGithubActions` upstream.
+fn merge_agent_branch_on_runner(cwd: &Path, into: Option<&str>) -> AgentMergeResult {
+    let Some(task_branch) = git_helpers::git_current_branch(cwd) else {
+        return AgentMergeResult {
+            merged_sha: None,
+            target_branch: String::new(),
+            had_conflict: false,
+            error: Some("could not resolve task branch (HEAD detached?)".to_string()),
+        };
+    };
+
+    let default = git_helpers::git_default_branch(cwd);
+    let explicit = into.filter(|s| !s.is_empty());
+    let target = if let Some(into) = explicit {
+        let branches = git_helpers::git_list_branches(cwd);
+        if branches.iter().any(|b| b == into) {
+            into.to_string()
+        } else {
+            default.clone().unwrap_or_else(|| "main".to_string())
+        }
+    } else {
+        default.clone().unwrap_or_else(|| "main".to_string())
+    };
+
+    if task_branch == target {
+        return AgentMergeResult {
+            merged_sha: None,
+            target_branch: target,
+            had_conflict: false,
+            error: Some("empty_branch".to_string()),
+        };
+    }
+
+    match git_helpers::merge_branch_local(cwd, &target, &task_branch) {
+        MergeOutcome::Ok { merged_sha } => {
+            // Push only when target is the canonical default — same gate as
+            // `ci::should_record_ci_run` on the server side.
+            if default.as_deref() == Some(target.as_str()) {
+                let _ = git_helpers::push_branch_local(cwd, &target);
+            }
+            AgentMergeResult {
+                merged_sha: Some(merged_sha),
+                target_branch: target,
+                had_conflict: false,
+                error: None,
+            }
+        }
+        MergeOutcome::EmptyBranch => AgentMergeResult {
+            merged_sha: None,
+            target_branch: target,
+            had_conflict: false,
+            error: Some("empty_branch".to_string()),
+        },
+        MergeOutcome::Conflict { stderr } => AgentMergeResult {
+            merged_sha: None,
+            target_branch: target,
+            had_conflict: true,
+            error: Some(stderr),
+        },
+        MergeOutcome::CheckoutFailed { stderr } => AgentMergeResult {
+            merged_sha: None,
+            target_branch: target,
+            had_conflict: false,
+            error: Some(format!("checkout failed: {stderr}")),
+        },
+        MergeOutcome::Other { stderr } => AgentMergeResult {
+            merged_sha: None,
+            target_branch: target,
+            had_conflict: false,
+            error: Some(stderr),
+        },
+    }
+}
+
+/// Glob `cwd/.github/workflows/*.{yml,yaml}` and report whether at least
+/// one match exists. Filename-only check — no YAML parsing, since the
+/// auto-mode loop just needs to know whether to enter the CI-gate state.
+fn has_github_actions(cwd: &Path) -> bool {
+    let workflows = cwd.join(".github").join("workflows");
+    let Ok(rd) = std::fs::read_dir(&workflows) else {
+        return false;
+    };
+    rd.flatten().any(|e| {
+        let path = e.path();
+        path.is_file()
+            && path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml"))
+                .unwrap_or(false)
+    })
+}
+
+/// One workflow run as parsed from `gh run list --json
+/// databaseId,workflowName,status,conclusion,createdAt`. Fields beyond
+/// `databaseId` are best-effort: defaulted on absent JSON keys so a stub
+/// `gh` (or a future schema change) doesn't turn the whole aggregate into
+/// `None`.
+#[derive(Debug, Deserialize, Clone)]
+struct GhRunDetail {
+    #[serde(rename = "databaseId")]
+    database_id: i64,
+    #[serde(rename = "workflowName", default)]
+    workflow_name: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    conclusion: Option<String>,
+    /// ISO-8601 timestamp. Used as the workflow-graph-order fallback for
+    /// `failing_run_id` (the brief asks for `dependsOn`/`workflow_run`
+    /// first, but `gh` doesn't expose those).
+    #[serde(rename = "createdAt", default)]
+    created_at: Option<String>,
+}
+
+/// Shell `gh run list --commit <sha> --json
+/// databaseId,workflowName,status,conclusion,createdAt --limit 50` in
+/// `cwd`. Returns `None` only when the call itself failed (gh not
+/// installed, no auth, etc) — an empty result set comes back as
+/// `Some(vec![])` so the aggregator can distinguish "still polling" from
+/// "tooling broken."
+fn gh_run_list_full(cwd: &Path, sha: &str) -> Option<Vec<GhRunDetail>> {
+    let out = std::process::Command::new("gh")
+        .args([
+            "run",
+            "list",
+            "--commit",
+            sha,
+            "--json",
+            "databaseId,workflowName,status,conclusion,createdAt",
+            "--limit",
+            "50",
+        ])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
+}
+
+/// Compute the per-SHA aggregate from runner-side `gh` shell-outs. Returns
+/// `None` when `gh run list` failed, when no runs exist for the SHA yet,
+/// or when the runs vec is empty (still polling). The `Reglyze`-shape
+/// aggregation — failure-poisons-skip — is in [`aggregate_runs`].
+fn compute_ci_aggregate(cwd: &Path, sha: &str) -> Option<CiAggregate> {
+    let runs = gh_run_list_full(cwd, sha)?;
+    if runs.is_empty() {
+        return None;
+    }
+    Some(aggregate_runs(runs))
+}
+
+/// Apply the auto-mode CI aggregation rule to a list of `gh run list`
+/// rows. Pure function so the Reglyze regression test can hit it directly
+/// without standing up `gh` on the test runner.
+///
+/// ## Rules
+/// - If any run has `conclusion in {failure, cancelled, timed_out}` →
+///   aggregate `conclusion = "failure"`.
+/// - If all runs have `status == "completed"` AND aggregate didn't fail →
+///   `status = "completed"`; otherwise `status = "in_progress"`.
+/// - `failing_run_id` is the first non-skipped failing run by `created_at`
+///   ascending. If no `created_at` is available, fall back to the first
+///   matching row's order in the input vec.
+/// - A run with `conclusion = "skipped"` has `skipped_due_to_upstream =
+///   true` iff the SHA's run set has any failing run. This collapses the
+///   precise "needs:/workflow_run failure" detection (which `gh` doesn't
+///   expose cleanly) into the conservative "skip-when-set-failed" — the
+///   bug we're guarding against is the loop reading a downstream
+///   `deploy: skipped` as success while `tests: failure` is in the same
+///   run set; either heuristic catches that case.
+/// - When there is no failure and any skipped runs are non-upstream-skip,
+///   conclusion is `success` only when every run is `success` or
+///   `skipped`. Otherwise `conclusion = None` (still polling).
+fn aggregate_runs(runs: Vec<GhRunDetail>) -> CiAggregate {
+    let any_failing = runs.iter().any(|r| {
+        matches!(
+            r.conclusion.as_deref(),
+            Some("failure") | Some("cancelled") | Some("timed_out")
+        )
+    });
+
+    let summaries: Vec<CiRunSummary> = runs
+        .iter()
+        .map(|r| CiRunSummary {
+            run_id: r.database_id.to_string(),
+            workflow_name: r.workflow_name.clone(),
+            status: if r.status.is_empty() {
+                "completed".to_string()
+            } else {
+                r.status.clone()
+            },
+            conclusion: r.conclusion.clone(),
+            skipped_due_to_upstream: r.conclusion.as_deref() == Some("skipped") && any_failing,
+        })
+        .collect();
+
+    let all_completed = summaries.iter().all(|s| s.status == "completed");
+    let agg_status = if all_completed {
+        "completed".to_string()
+    } else {
+        "in_progress".to_string()
+    };
+
+    let agg_conclusion = if any_failing {
+        Some("failure".to_string())
+    } else if all_completed
+        && summaries
+            .iter()
+            .all(|s| matches!(s.conclusion.as_deref(), Some("success") | Some("skipped")))
+    {
+        Some("success".to_string())
+    } else {
+        None
+    };
+
+    let failing_run_id = pick_failing_run_id(&runs);
+
+    CiAggregate {
+        status: agg_status,
+        conclusion: agg_conclusion,
+        runs: summaries,
+        failing_run_id,
+    }
+}
+
+/// First non-skipped failing run by `created_at` ascending. Falls back to
+/// the input order when timestamps are missing or equal — `gh` always
+/// emits ISO-8601 strings that sort lexicographically, so this is
+/// chronological for any real `gh` output.
+fn pick_failing_run_id(runs: &[GhRunDetail]) -> Option<String> {
+    let mut failing: Vec<&GhRunDetail> = runs
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.conclusion.as_deref(),
+                Some("failure") | Some("cancelled") | Some("timed_out")
+            )
+        })
+        .collect();
+    failing.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    failing.first().map(|r| r.database_id.to_string())
 }
 
 /// List non-dot directories at the top level of the runner's home dir.
@@ -957,6 +1521,7 @@ async fn spawn_agent(
             pid,
             socket_path,
             io_task,
+            cwd: cwd.to_path_buf(),
         },
     );
 
@@ -1409,6 +1974,8 @@ mod tests {
             ws_tx,
             cwd: canonical,
             server_bin: PathBuf::from("/usr/bin/true"),
+            plan_cwd: Arc::new(Mutex::new(HashMap::new())),
+            ci_cache: Arc::new(Mutex::new(CiAggregateCache::default())),
         });
         (state, ws_rx)
     }
@@ -1758,6 +2325,596 @@ mod tests {
                 assert!(stderr.contains("outside runner root"), "stderr={stderr}");
             }
             other => panic!("expected MergeResult::Other, got {other:?}"),
+        }
+    }
+
+    // ── Phase 0.4 (auto-mode) handler tests ─────────────────────────────
+    //
+    // These cover the four high-level wire variants:
+    //   - MergeAgentBranch — looks up agent cwd from state.agents,
+    //     resolves task branch from HEAD, runs the merge sequence,
+    //     pushes when target == default.
+    //   - HasGithubActions — globs cwd/.github/workflows/*.yml.
+    //   - GetCiRunStatus — Reglyze-shaped aggregation. The pure
+    //     `aggregate_runs` is tested directly with stub data so the
+    //     test passes on machines without `gh` installed.
+    //   - CiFailureLog — re-resolves failing run id from the in-memory
+    //     cache when run_id=None.
+
+    /// Insert an `AgentHandle` into `state.agents` without running a real
+    /// session daemon — needed because `MergeAgentBranch` /
+    /// `HasGithubActions` look up cwd via the agents map. The handle is
+    /// inert (pid=0, abortable but already-completed io_task) so dropping
+    /// it on test teardown is harmless.
+    async fn seed_test_agent(state: &Arc<RunnerState>, agent_id: &str, cwd: &Path) {
+        let io_task = tokio::spawn(async {});
+        state.agents.lock().await.insert(
+            agent_id.to_string(),
+            AgentHandle {
+                pid: 0,
+                socket_path: PathBuf::new(),
+                io_task,
+                cwd: cwd.to_path_buf(),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_agent_branch_happy_path_replies_ok_and_targets_default() {
+        let dir = TempDir::new().unwrap();
+        git_init_with_commit(dir.path(), "master");
+        git(dir.path(), &["checkout", "-b", "feature/x"]);
+        std::fs::write(dir.path().join("foo.txt"), "hi").unwrap();
+        git(dir.path(), &["add", "foo.txt"]);
+        git(dir.path(), &["commit", "-m", "add foo"]);
+        // Stay on feature/x — auto-mode policy leaves the agent on its
+        // task branch on exit, so HEAD is the source of truth.
+
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+        seed_test_agent(&state, "agent-1", &state.cwd.clone()).await;
+
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::MergeAgentBranch {
+                req_id: "req-merge-1".into(),
+                agent_id: "agent-1".into(),
+                into: None,
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::AgentBranchMerged {
+                req_id,
+                ok,
+                merged_sha,
+                target_branch,
+                had_conflict,
+                error,
+            } => {
+                assert_eq!(req_id, "req-merge-1");
+                assert!(ok, "expected ok=true, error={error:?}");
+                assert_eq!(target_branch, "master");
+                assert!(!had_conflict);
+                assert_eq!(merged_sha.unwrap_or_default().len(), 40);
+                assert!(error.is_none());
+            }
+            other => panic!("expected AgentBranchMerged, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_agent_branch_unknown_agent_replies_error_sentinel() {
+        let dir = TempDir::new().unwrap();
+        git_init_with_commit(dir.path(), "master");
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::MergeAgentBranch {
+                req_id: "req-merge-2".into(),
+                agent_id: "ghost".into(),
+                into: None,
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::AgentBranchMerged {
+                ok,
+                error,
+                merged_sha,
+                ..
+            } => {
+                assert!(!ok);
+                assert!(merged_sha.is_none());
+                assert_eq!(error.as_deref(), Some("agent_not_found_on_runner"));
+            }
+            other => panic!("expected AgentBranchMerged, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_agent_branch_empty_branch_reports_empty() {
+        let dir = TempDir::new().unwrap();
+        git_init_with_commit(dir.path(), "master");
+        // Branch from master at the same SHA — zero commits ahead.
+        git(dir.path(), &["checkout", "-b", "feature/empty"]);
+
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+        seed_test_agent(&state, "agent-2", &state.cwd.clone()).await;
+
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::MergeAgentBranch {
+                req_id: "req-merge-3".into(),
+                agent_id: "agent-2".into(),
+                into: None,
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::AgentBranchMerged {
+                ok,
+                had_conflict,
+                error,
+                ..
+            } => {
+                assert!(!ok);
+                assert!(!had_conflict);
+                assert_eq!(error.as_deref(), Some("empty_branch"));
+            }
+            other => panic!("expected AgentBranchMerged, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_agent_branch_conflict_reports_had_conflict() {
+        let dir = TempDir::new().unwrap();
+        git_init_with_commit(dir.path(), "master");
+        std::fs::write(dir.path().join("c.txt"), "base\n").unwrap();
+        git(dir.path(), &["add", "c.txt"]);
+        git(dir.path(), &["commit", "-m", "base"]);
+
+        git(dir.path(), &["checkout", "-b", "feature/conflict"]);
+        std::fs::write(dir.path().join("c.txt"), "branch\n").unwrap();
+        git(dir.path(), &["add", "c.txt"]);
+        git(dir.path(), &["commit", "-m", "branch"]);
+
+        // Diverge master.
+        git(dir.path(), &["checkout", "master"]);
+        std::fs::write(dir.path().join("c.txt"), "master\n").unwrap();
+        git(dir.path(), &["add", "c.txt"]);
+        git(dir.path(), &["commit", "-m", "master"]);
+
+        // Back to feature so HEAD is the task branch when MergeAgentBranch fires.
+        git(dir.path(), &["checkout", "feature/conflict"]);
+
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+        seed_test_agent(&state, "agent-3", &state.cwd.clone()).await;
+
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::MergeAgentBranch {
+                req_id: "req-merge-4".into(),
+                agent_id: "agent-3".into(),
+                into: None,
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::AgentBranchMerged {
+                had_conflict,
+                ok,
+                merged_sha,
+                ..
+            } => {
+                assert!(had_conflict, "expected conflict reply");
+                assert!(!ok);
+                assert!(merged_sha.is_none());
+            }
+            other => panic!("expected AgentBranchMerged, got {other:?}"),
+        }
+        // No leftover MERGE_HEAD — runner aborted cleanly.
+        assert!(!dir.path().join(".git/MERGE_HEAD").exists());
+    }
+
+    #[tokio::test]
+    async fn has_github_actions_present_when_workflow_yml_exists() {
+        let dir = TempDir::new().unwrap();
+        git_init_with_commit(dir.path(), "master");
+        let workflows = dir.path().join(".github/workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(workflows.join("ci.yml"), "name: ci\n").unwrap();
+
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+        seed_test_agent(&state, "agent-gh-1", &state.cwd.clone()).await;
+
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::HasGithubActions {
+                req_id: "req-gh-1".into(),
+                agent_id: "agent-gh-1".into(),
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::GithubActionsDetected { req_id, present } => {
+                assert_eq!(req_id, "req-gh-1");
+                assert!(present);
+            }
+            other => panic!("expected GithubActionsDetected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn has_github_actions_absent_when_no_workflow_dir() {
+        let dir = TempDir::new().unwrap();
+        git_init_with_commit(dir.path(), "master");
+
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+        seed_test_agent(&state, "agent-gh-2", &state.cwd.clone()).await;
+
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::HasGithubActions {
+                req_id: "req-gh-2".into(),
+                agent_id: "agent-gh-2".into(),
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::GithubActionsDetected { present, .. } => {
+                assert!(!present);
+            }
+            other => panic!("expected GithubActionsDetected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn has_github_actions_unknown_agent_replies_present_false() {
+        // No agent in registry → no cwd → defensively reply false.
+        let dir = TempDir::new().unwrap();
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::HasGithubActions {
+                req_id: "req-gh-3".into(),
+                agent_id: "ghost".into(),
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::GithubActionsDetected { present, .. } => assert!(!present),
+            other => panic!("expected GithubActionsDetected, got {other:?}"),
+        }
+    }
+
+    /// Build the Reglyze fixture: three runs for one SHA where `tests` failed,
+    /// `lint` passed, and `deploy` was skipped because tests failed.
+    fn reglyze_fixture() -> Vec<GhRunDetail> {
+        vec![
+            GhRunDetail {
+                database_id: 100,
+                workflow_name: "tests".into(),
+                status: "completed".into(),
+                conclusion: Some("failure".into()),
+                created_at: Some("2026-04-12T10:00:00Z".into()),
+            },
+            GhRunDetail {
+                database_id: 101,
+                workflow_name: "lint".into(),
+                status: "completed".into(),
+                conclusion: Some("success".into()),
+                created_at: Some("2026-04-12T10:00:01Z".into()),
+            },
+            GhRunDetail {
+                database_id: 102,
+                workflow_name: "deploy".into(),
+                status: "completed".into(),
+                conclusion: Some("skipped".into()),
+                created_at: Some("2026-04-12T10:00:02Z".into()),
+            },
+        ]
+    }
+
+    #[test]
+    fn aggregate_runs_reglyze_fixture_marks_skipped_due_to_upstream() {
+        let aggregate = aggregate_runs(reglyze_fixture());
+        assert_eq!(aggregate.status, "completed");
+        assert_eq!(aggregate.conclusion.as_deref(), Some("failure"));
+        assert_eq!(aggregate.failing_run_id.as_deref(), Some("100"));
+
+        let by_workflow: HashMap<&str, &CiRunSummary> = aggregate
+            .runs
+            .iter()
+            .map(|s| (s.workflow_name.as_str(), s))
+            .collect();
+        assert!(!by_workflow["tests"].skipped_due_to_upstream);
+        assert!(!by_workflow["lint"].skipped_due_to_upstream);
+        assert!(
+            by_workflow["deploy"].skipped_due_to_upstream,
+            "deploy must be marked skipped_due_to_upstream when tests failed in same SHA"
+        );
+    }
+
+    #[test]
+    fn aggregate_runs_all_success_reports_success_and_no_failing_run() {
+        let runs = vec![
+            GhRunDetail {
+                database_id: 200,
+                workflow_name: "tests".into(),
+                status: "completed".into(),
+                conclusion: Some("success".into()),
+                created_at: Some("2026-04-12T10:00:00Z".into()),
+            },
+            GhRunDetail {
+                database_id: 201,
+                workflow_name: "deploy".into(),
+                status: "completed".into(),
+                conclusion: Some("skipped".into()),
+                created_at: Some("2026-04-12T10:00:01Z".into()),
+            },
+        ];
+        let aggregate = aggregate_runs(runs);
+        assert_eq!(aggregate.conclusion.as_deref(), Some("success"));
+        assert!(aggregate.failing_run_id.is_none());
+        // deploy.skipped_due_to_upstream must be false — no failure in set.
+        assert!(!aggregate.runs.iter().any(|r| r.skipped_due_to_upstream));
+    }
+
+    #[test]
+    fn aggregate_runs_in_progress_when_any_run_pending() {
+        let runs = vec![
+            GhRunDetail {
+                database_id: 300,
+                workflow_name: "tests".into(),
+                status: "completed".into(),
+                conclusion: Some("success".into()),
+                created_at: Some("2026-04-12T10:00:00Z".into()),
+            },
+            GhRunDetail {
+                database_id: 301,
+                workflow_name: "deploy".into(),
+                status: "in_progress".into(),
+                conclusion: None,
+                created_at: Some("2026-04-12T10:00:01Z".into()),
+            },
+        ];
+        let aggregate = aggregate_runs(runs);
+        assert_eq!(aggregate.status, "in_progress");
+        assert!(aggregate.conclusion.is_none());
+    }
+
+    #[test]
+    fn aggregate_runs_failing_run_id_picks_earliest_by_created_at() {
+        // Two failing runs, second created_at chronologically earlier.
+        let runs = vec![
+            GhRunDetail {
+                database_id: 500,
+                workflow_name: "later".into(),
+                status: "completed".into(),
+                conclusion: Some("failure".into()),
+                created_at: Some("2026-04-12T11:00:00Z".into()),
+            },
+            GhRunDetail {
+                database_id: 501,
+                workflow_name: "earlier".into(),
+                status: "completed".into(),
+                conclusion: Some("failure".into()),
+                created_at: Some("2026-04-12T10:00:00Z".into()),
+            },
+        ];
+        let aggregate = aggregate_runs(runs);
+        assert_eq!(aggregate.failing_run_id.as_deref(), Some("501"));
+    }
+
+    #[tokio::test]
+    async fn get_ci_run_status_caches_and_records_plan_sha() {
+        // Drive the handler with a SHA the cache has been pre-seeded for —
+        // skipping the real `gh` shell-out entirely. This proves the cache
+        // hit path returns the seeded aggregate AND that the plan→sha
+        // side-table is updated.
+        let dir = TempDir::new().unwrap();
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+
+        // Pre-seed the cache so the handler doesn't shell out.
+        let aggregate = aggregate_runs(reglyze_fixture());
+        {
+            let mut cache = state.ci_cache.lock().await;
+            cache.put("merged-sha-1".to_string(), Some(aggregate.clone()));
+        }
+
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::GetCiRunStatus {
+                req_id: "req-ci-1".into(),
+                plan_name: "demo-plan".into(),
+                task_number: "1.2".into(),
+                merged_sha: "merged-sha-1".into(),
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::CiRunStatusResolved {
+                req_id,
+                aggregate: Some(agg),
+            } => {
+                assert_eq!(req_id, "req-ci-1");
+                assert_eq!(agg.conclusion.as_deref(), Some("failure"));
+                assert_eq!(agg.failing_run_id.as_deref(), Some("100"));
+            }
+            other => panic!("expected CiRunStatusResolved, got {other:?}"),
+        }
+
+        // plan→sha was recorded so CiFailureLog{run_id:None} can re-resolve.
+        let cache = state.ci_cache.lock().await;
+        assert_eq!(
+            cache.latest_sha_for_plan("demo-plan").as_deref(),
+            Some("merged-sha-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_failure_log_with_no_known_aggregate_replies_log_none() {
+        // No cached aggregate for any plan → nothing to re-resolve →
+        // log:None, run_id_used:None. This is the "loop polled before
+        // a CI run completed" branch.
+        let dir = TempDir::new().unwrap();
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::CiFailureLog {
+                req_id: "req-cl-1".into(),
+                plan_name: "demo-plan".into(),
+                run_id: None,
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::CiFailureLogResolved {
+                req_id,
+                log,
+                run_id_used,
+            } => {
+                assert_eq!(req_id, "req-cl-1");
+                assert!(log.is_none());
+                assert!(run_id_used.is_none());
+            }
+            other => panic!("expected CiFailureLogResolved, got {other:?}"),
+        }
+    }
+
+    /// **Reglyze regression test (acceptance criterion).**
+    ///
+    /// Walks the full auto-mode loop path: pre-seed the cache with the
+    /// three-runs Reglyze fixture, fire `GetCiRunStatus` to confirm the
+    /// aggregator output, then fire `CiFailureLog { run_id: None }` and
+    /// assert that the re-resolved run is `tests` (id=100), NOT the
+    /// skipped `deploy` (id=102).
+    ///
+    /// The bug this guards against: the loop, on Red, calls
+    /// `CiFailureLog { run_id: None }` and expects the runner to give it
+    /// the failing run's log. If the aggregator wrongly treats
+    /// `deploy: skipped` as success and picks deploy's id, the loop
+    /// gets a "no failures" empty string back instead of the test
+    /// failure log — and falsely reports the run as healthy.
+    #[tokio::test]
+    async fn reglyze_regression_failure_log_resolves_to_tests_run_not_skipped_deploy() {
+        let dir = TempDir::new().unwrap();
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+
+        // Pre-seed the cache with a fully-aggregated entry for the SHA.
+        let aggregate = aggregate_runs(reglyze_fixture());
+        // Sanity-check the aggregator before relying on it for the regression.
+        assert_eq!(aggregate.failing_run_id.as_deref(), Some("100"));
+        let deploy = aggregate
+            .runs
+            .iter()
+            .find(|r| r.workflow_name == "deploy")
+            .expect("deploy summary present");
+        assert!(
+            deploy.skipped_due_to_upstream,
+            "deploy must be marked skipped_due_to_upstream"
+        );
+
+        {
+            let mut cache = state.ci_cache.lock().await;
+            cache.put("reglyze-sha".to_string(), Some(aggregate.clone()));
+            cache.record_plan_sha("reglyze-plan".to_string(), "reglyze-sha".to_string());
+        }
+
+        // Step 1: GetCiRunStatus returns the seeded aggregate verbatim.
+        let status_reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::GetCiRunStatus {
+                req_id: "req-rgz-1".into(),
+                plan_name: "reglyze-plan".into(),
+                task_number: "0.4".into(),
+                merged_sha: "reglyze-sha".into(),
+            },
+        )
+        .await;
+        match status_reply {
+            WireMessage::CiRunStatusResolved {
+                aggregate: Some(agg),
+                ..
+            } => {
+                assert_eq!(agg.conclusion.as_deref(), Some("failure"));
+                assert_eq!(agg.failing_run_id.as_deref(), Some("100"));
+                let deploy = agg
+                    .runs
+                    .iter()
+                    .find(|r| r.workflow_name == "deploy")
+                    .expect("deploy in reply");
+                assert!(deploy.skipped_due_to_upstream);
+            }
+            other => panic!("expected CiRunStatusResolved, got {other:?}"),
+        }
+
+        // Step 2: CiFailureLog { run_id: None } re-resolves to tests run.
+        // The actual `gh run view --log-failed` shell-out returns None on
+        // any test machine (no real run with that id), but `run_id_used`
+        // must reflect that we picked tests (100), NOT deploy (102).
+        let log_reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::CiFailureLog {
+                req_id: "req-rgz-2".into(),
+                plan_name: "reglyze-plan".into(),
+                run_id: None,
+            },
+        )
+        .await;
+        match log_reply {
+            WireMessage::CiFailureLogResolved {
+                req_id,
+                run_id_used,
+                ..
+            } => {
+                assert_eq!(req_id, "req-rgz-2");
+                assert_eq!(
+                    run_id_used.as_deref(),
+                    Some("100"),
+                    "must re-resolve to the tests run, not the skipped deploy run"
+                );
+            }
+            other => panic!("expected CiFailureLogResolved, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ci_failure_log_with_explicit_run_id_uses_it_directly() {
+        // No cache, but explicit run_id is provided — runner must echo
+        // it back in `run_id_used` even when the gh shell-out fails.
+        let dir = TempDir::new().unwrap();
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::CiFailureLog {
+                req_id: "req-cl-2".into(),
+                plan_name: "demo".into(),
+                run_id: Some("999".into()),
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::CiFailureLogResolved { run_id_used, .. } => {
+                assert_eq!(run_id_used.as_deref(), Some("999"));
+            }
+            other => panic!("expected CiFailureLogResolved, got {other:?}"),
         }
     }
 }
