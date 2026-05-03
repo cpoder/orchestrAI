@@ -658,6 +658,100 @@ fn list_merge_targets_empty_available_when_only_default_exists() {
     );
 }
 
+/// Count `ci_runs` rows for a given plan, used to assert whether
+/// `trigger_after_merge` did or did not fire for the merge under test.
+fn ci_run_count(d: &TestDashboard, plan_name: &str) -> i64 {
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM ci_runs WHERE plan_name = ?1",
+        rusqlite::params![plan_name],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn merge_to_default_inserts_ci_run() {
+    // Acceptance for plan merge-target-canonical-default-branch T4.4:
+    // when an empty-body merge resolves to the canonical default
+    // (master) and the project has both a workflow and an origin
+    // remote, `should_record_ci_run` returns true and
+    // `trigger_after_merge` inserts exactly one ci_runs row. This is
+    // the *positive* half of the gate — confirms the gate is
+    // selective, not "always skip".
+    let d = TestDashboard::new();
+    d.create_plan("mp-def", &minimal_plan("mp-def", &d.project));
+    d.setup_github_actions();
+    d.setup_origin_remote();
+
+    let task = "branchwork/mp-def/1.1";
+    d.create_task_branch(task, /* with_commit */ true);
+    seed_agent(&d, "agent-def", "mp-def", "1.1", Some(task), Some("master"));
+
+    let (s, body) = d.post("/api/agents/agent-def/merge", json!({}));
+    assert_eq!(s, 200, "expected 200, got {s}: {body}");
+    assert_eq!(body["into"], "master");
+
+    // `trigger_after_merge` is `tokio::spawn`d after the response, so
+    // poll for the row. 500ms is the brief's soft default; widen the
+    // deadline a bit so a slow CI run does not flake before the
+    // single git push + INSERT lands.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if ci_run_count(&d, "mp-def") >= 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        ci_run_count(&d, "mp-def"),
+        1,
+        "merge to canonical default should have inserted exactly one ci_runs row"
+    );
+}
+
+#[test]
+fn merge_to_non_default_skips_ci_run() {
+    // Acceptance for plan merge-target-canonical-default-branch T4.4:
+    // when the merge target is NOT the canonical default,
+    // `should_record_ci_run` returns false and `trigger_after_merge`
+    // exits before the git push + INSERT. The orphan-row failure mode
+    // documented in the ignored T0.2 repro is gone.
+    let d = TestDashboard::new();
+    d.create_plan("mp-non", &minimal_plan("mp-non", &d.project));
+    d.setup_github_actions();
+    d.setup_origin_remote();
+
+    // feature/x at master's HEAD so the task branch fast-forwards
+    // cleanly onto it.
+    git(&d.project, &["branch", "feature/x"]);
+
+    let task = "branchwork/mp-non/1.1";
+    d.create_task_branch(task, /* with_commit */ true);
+    seed_agent(&d, "agent-non", "mp-non", "1.1", Some(task), Some("master"));
+
+    let (s, body) = d.post(
+        "/api/agents/agent-non/merge",
+        json!({"into": "feature/x"}),
+    );
+    assert_eq!(s, 200, "expected 200, got {s}: {body}");
+    assert_eq!(body["into"], "feature/x");
+
+    // Wait long enough for the spawned trigger to have *not* inserted
+    // a row. 500ms is the brief's soft default; on a slow box the
+    // trigger could in principle still be pending after this window —
+    // but it would still be running its skip path, so the count stays
+    // at 0. Re-checking after a short sleep is a stable proxy for
+    // "the trigger has reached its decision".
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_eq!(
+        ci_run_count(&d, "mp-non"),
+        0,
+        "merge to non-default branch must not insert a ci_runs row"
+    );
+}
+
 fn git(cwd: &std::path::Path, args: &[&str]) {
     let out = std::process::Command::new("git")
         .args(args)

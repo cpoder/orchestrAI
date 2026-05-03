@@ -140,6 +140,49 @@ impl TestDashboard {
         run("git", &["checkout", "-q", "master"], &self.project);
     }
 
+    /// Write `.github/workflows/ci.yml` with a stub workflow and commit
+    /// it on the *current* branch. Callers should run this on `master`
+    /// before creating task branches so descendant branches inherit the
+    /// workflow file (otherwise `has_github_actions` returns false on
+    /// the task branch and `trigger_after_merge` bails before reaching
+    /// the `should_record_ci_run` gate this test is meant to exercise).
+    pub fn setup_github_actions(&self) {
+        std::fs::create_dir_all(self.project.join(".github").join("workflows")).unwrap();
+        std::fs::write(
+            self.project.join(".github").join("workflows").join("ci.yml"),
+            "name: ci\non: [push]\njobs:\n  noop:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n",
+        )
+        .unwrap();
+        run("git", &["add", ".github/workflows/ci.yml"], &self.project);
+        run(
+            "git",
+            &["commit", "-q", "-m", "add ci workflow"],
+            &self.project,
+        );
+    }
+
+    /// Initialise a bare repo inside the tempdir and add it as `origin`.
+    /// Local bare repos accept pushes without auth, so `git push origin
+    /// <target>` inside `trigger_after_merge` succeeds without network.
+    pub fn setup_origin_remote(&self) {
+        let origin = self.dir.path().join("origin.git");
+        let init = Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(&origin)
+            .output()
+            .expect("spawn git init --bare");
+        assert!(
+            init.status.success(),
+            "git init --bare: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        run(
+            "git",
+            &["remote", "add", "origin", &origin.to_string_lossy()],
+            &self.project,
+        );
+    }
+
     /// Return all local branches in the scratch project.
     pub fn local_branches(&self) -> Vec<String> {
         let out = Command::new("git")
