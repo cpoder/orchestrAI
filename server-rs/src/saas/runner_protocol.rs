@@ -622,11 +622,7 @@ mod tests {
     fn branches_listed_round_trip() {
         let msg = WireMessage::BranchesListed {
             req_id: "req-10".into(),
-            branches: vec![
-                "feature/x".into(),
-                "main".into(),
-                "master".into(),
-            ],
+            branches: vec!["feature/x".into(), "main".into(), "master".into()],
         };
         assert!(msg.is_best_effort());
         assert_eq!(msg.event_type(), "branches_listed");

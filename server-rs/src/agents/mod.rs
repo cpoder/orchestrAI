@@ -8,8 +8,8 @@ pub mod terminal_ws;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::Mutex;
 
 use crate::config::Effort;
