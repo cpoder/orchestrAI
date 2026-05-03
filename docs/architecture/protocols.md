@@ -148,6 +148,7 @@ makes progress on the next attempt.
 | `DriverAuthReport { drivers }` | yes | Driver auth state changed (e.g. user finished an OAuth flow). Re-broadcast as `runner_drivers`. Also implicitly delivered by the `RunnerHello` `drivers` field. |
 | `FoldersListed { req_id, entries }` | **no** — req/resp | Reply to `ListFolders`. Carries one `FolderEntry { name, path }` per directory under the runner's home (one level deep, mirroring the local-mode listing in `api::settings::list_folders`). Server matches `req_id` to a pending oneshot to resolve the originating HTTP caller; late replies (post-timeout or post-reconnect) are silently discarded. See [Request/response frames](#requestresponse-frames). |
 | `FolderCreated { req_id, ok, resolved_path?, error? }` | **no** — req/resp | Reply to `CreateFolder`. `ok=true` ⇒ `resolved_path` is the canonical absolute path the runner created; `ok=false` ⇒ `error` carries a human-readable reason (permission denied, path traversal, etc.). Same `req_id` correlation as `FoldersListed`. |
+| `PushResult { req_id, ok, stderr? }` | **no** — req/resp | Reply to `PushBranch`. `ok=false` ⇒ `stderr` carries the captured `git push` error so the server can log it; the dashboard does not surface push failures to the user (CI will retry on the next merge). |
 
 #### SaaS → Runner
 
@@ -160,6 +161,7 @@ makes progress on the next attempt.
 | `TerminalReplay { agent_id, from_offset }` | yes | A reconnecting browser asked the server for backfill from a byte offset; the runner serves the missing range from its local `<socket>.log`. |
 | `ListFolders { req_id }` | **no** — req/resp | Dashboard hit a synchronous folder-listing HTTP endpoint and the org has a runner attached. Server mints `req_id`, registers a oneshot, sends best-effort, awaits with a timeout. See [Request/response frames](#requestresponse-frames). |
 | `CreateFolder { req_id, path }` | **no** — req/resp | Dashboard hit a synchronous folder-creation HTTP endpoint with a target path. Same correlation pattern as `ListFolders`; the runner replies with `FolderCreated`. |
+| `PushBranch { req_id, cwd, branch }` | **no** — req/resp | Server-internal follow-up to a successful `MergeBranch`, conditionally sent when `ci::should_record_ci_run(target, default_branch) == true`. The runner runs `git push origin <branch>` and replies with `PushResult`. Split out from `MergeBranch` so the gate stays a pure function on the SaaS side and the side effect (and `gh` dependency) stays on the runner side. |
 
 #### Bidirectional
 
@@ -208,6 +210,16 @@ the user's actual expectation of a "Refresh" button.
 Today only the SaaS side initiates these pairs. The pattern is
 direction-agnostic — a runner-initiated request would mirror the same
 pending-requests map on the runner side.
+
+**Deferred: `gh` / CI poller migration.** The CI poller in `ci.rs`
+(`fetch_run`) and the failure-log fetcher (`fetch_failure_log`) still
+shell out to `gh` directly on the SaaS host. A matching `GhRunList` /
+`GhRunListed` request/response pair would mirror the patterns above and
+move the last server-side `gh` dependency onto the runner, but it is
+intentionally out of scope for the merge-target plan. The runner already
+shells out to `git` for `MergeBranch` and `PushBranch`, so adding `gh`
+for the poller is a follow-up that reuses the same dispatch shape rather
+than a new capability.
 
 ### `DriverAuthStatus` states
 

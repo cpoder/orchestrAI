@@ -535,12 +535,14 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
         | WireMessage::DefaultBranchResolved { .. }
         | WireMessage::BranchesListed { .. }
         | WireMessage::MergeResult { .. }
+        | WireMessage::PushResult { .. }
         // saas→runner variants the runner doesn't act on yet (handlers
         // land in later phases).
         | WireMessage::TerminalReplay { .. }
         | WireMessage::GetDefaultBranch { .. }
         | WireMessage::ListBranches { .. }
         | WireMessage::MergeBranch { .. }
+        | WireMessage::PushBranch { .. }
         | WireMessage::Ping {} => {}
     }
 }

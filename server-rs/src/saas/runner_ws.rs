@@ -561,7 +561,8 @@ async fn handle_runner_message(
         // wire format lands without dragging dispatch wiring in.
         WireMessage::DefaultBranchResolved { .. }
         | WireMessage::BranchesListed { .. }
-        | WireMessage::MergeResult { .. } => {}
+        | WireMessage::MergeResult { .. }
+        | WireMessage::PushResult { .. } => {}
 
         // Server doesn't receive these from runners — the runner sending them
         // would be a protocol violation (saas→runner direction only).
@@ -575,7 +576,8 @@ async fn handle_runner_message(
         | WireMessage::CreateFolder { .. }
         | WireMessage::GetDefaultBranch { .. }
         | WireMessage::ListBranches { .. }
-        | WireMessage::MergeBranch { .. } => {}
+        | WireMessage::MergeBranch { .. }
+        | WireMessage::PushBranch { .. } => {}
     }
 }
 

@@ -198,6 +198,30 @@ pub enum WireMessage {
         outcome: MergeOutcome,
     },
 
+    /// Dashboard asked the runner to `git push origin <branch>` in `cwd`
+    /// after a successful merge. Split out from `MergeBranch` because the
+    /// push is gated by `should_record_ci_run` (`ci.rs`), a pure function
+    /// over the default branch + merge target that lives on the server.
+    /// Splitting keeps the policy decision on the SaaS side and the side
+    /// effect (and `gh` dependency) on the runner side.
+    ///
+    /// Best-effort: tied to a live HTTP caller, so outbox replay is useless.
+    PushBranch {
+        req_id: String,
+        cwd: String,
+        branch: String,
+    },
+
+    /// Runner reply with the push result. `ok=false` ⇒ `stderr` carries the
+    /// captured error so the server can log it; the dashboard does not
+    /// surface push failures to the user (CI will retry on the next merge).
+    PushResult {
+        req_id: String,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stderr: Option<String>,
+    },
+
     // ── Bidirectional ───────────────────────────────────────────────────
     /// Acknowledge receipt of a sequenced message. The receiver sends this
     /// after persisting the event so the sender can prune its outbox.
@@ -308,6 +332,8 @@ impl WireMessage {
                 | WireMessage::BranchesListed { .. }
                 | WireMessage::MergeBranch { .. }
                 | WireMessage::MergeResult { .. }
+                | WireMessage::PushBranch { .. }
+                | WireMessage::PushResult { .. }
         )
     }
 
@@ -335,6 +361,8 @@ impl WireMessage {
             WireMessage::BranchesListed { .. } => "branches_listed",
             WireMessage::MergeBranch { .. } => "merge_branch",
             WireMessage::MergeResult { .. } => "merge_result",
+            WireMessage::PushBranch { .. } => "push_branch",
+            WireMessage::PushResult { .. } => "push_result",
             WireMessage::Ack { .. } => "ack",
             WireMessage::Ping {} => "ping",
             WireMessage::Pong {} => "pong",
@@ -840,5 +868,80 @@ mod tests {
         );
         let json = serde_json::to_string(&outcome).unwrap();
         assert!(json.contains("\"kind\":\"other\""));
+    }
+
+    #[test]
+    fn push_branch_round_trip() {
+        let msg = WireMessage::PushBranch {
+            req_id: "req-17".into(),
+            cwd: "/home/user/proj".into(),
+            branch: "master".into(),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "push_branch");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"push_branch\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::PushBranch {
+                req_id,
+                cwd,
+                branch,
+            } => {
+                assert_eq!(req_id, "req-17");
+                assert_eq!(cwd, "/home/user/proj");
+                assert_eq!(branch, "master");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_result_round_trip_ok() {
+        let msg = WireMessage::PushResult {
+            req_id: "req-18".into(),
+            ok: true,
+            stderr: None,
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "push_result");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"push_result\""));
+        // `stderr: None` should be omitted in the wire form.
+        assert!(!json.contains("\"stderr\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::PushResult { req_id, ok, stderr } => {
+                assert_eq!(req_id, "req-18");
+                assert!(ok);
+                assert!(stderr.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_result_round_trip_err() {
+        let msg = WireMessage::PushResult {
+            req_id: "req-19".into(),
+            ok: false,
+            stderr: Some("error: failed to push some refs to 'origin'".into()),
+        };
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::PushResult { req_id, ok, stderr } => {
+                assert_eq!(req_id, "req-19");
+                assert!(!ok);
+                assert_eq!(
+                    stderr.as_deref(),
+                    Some("error: failed to push some refs to 'origin'")
+                );
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 }
