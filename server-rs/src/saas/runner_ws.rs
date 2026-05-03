@@ -641,7 +641,19 @@ async fn handle_runner_message(
         | WireMessage::MergeBranch { .. }
         | WireMessage::PushBranch { .. }
         | WireMessage::GhRunList { .. }
-        | WireMessage::GhFailureLog { .. } => {}
+        | WireMessage::GhFailureLog { .. }
+        | WireMessage::MergeAgentBranch { .. }
+        | WireMessage::HasGithubActions { .. }
+        | WireMessage::GetCiRunStatus { .. }
+        | WireMessage::CiFailureLog { .. }
+        // Reply variants from the runner — handlers in saas/runner_ws.rs
+        // route these via resolve_pending in auto-mode 0.4. Until then
+        // they're stubbed alongside the other reply-not-yet-routed
+        // variants so the build stays green.
+        | WireMessage::AgentBranchMerged { .. }
+        | WireMessage::GithubActionsDetected { .. }
+        | WireMessage::CiRunStatusResolved { .. }
+        | WireMessage::CiFailureLogResolved { .. } => {}
     }
 }
 

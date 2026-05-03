@@ -154,6 +154,10 @@ makes progress on the next attempt.
 | `PushResult { req_id, ok, stderr? }` | **no** — req/resp | Reply to `PushBranch`. `ok=false` ⇒ `stderr` carries the captured `git push` error so the server can log it; the dashboard does not surface push failures to the user (CI will retry on the next merge). |
 | `GhRunListed { req_id, run? }` | **no** — req/resp | Reply to `GhRunList`. `run=None` ⇒ no workflow has fired yet for that commit (or `gh` is unavailable). Carries the gh-spelled `databaseId` field verbatim — see [CI status round-trips](#ci-status-round-trips). |
 | `GhFailureLogFetched { req_id, log? }` | **no** — req/resp | Reply to `GhFailureLog`. `log` is the trailing ~8 KB of `gh run view --log-failed` output (the same tail size `ci.rs::fetch_failure_log` keeps when running locally); `None` when the run has no failure log (still pending, no auth, etc). |
+| `AgentBranchMerged { req_id, ok, merged_sha?, target_branch, had_conflict, error? }` | **no** — req/resp | Reply to `MergeAgentBranch`. Flat payload shaped like `api::agents::MergeOutcome` minus `task_branch` — auto-mode reads `had_conflict` (pause with `merge_conflict`) before falling through to `merged_sha.is_some()` (advance) and finally `error` (pause with `merge_failed: <msg>`). `target_branch` is the empty string for early-return failures (agent not found on the runner, no task branch). See [Auto-mode round-trips](#auto-mode-round-trips). |
+| `GithubActionsDetected { req_id, present }` | **no** — req/resp | Reply to `HasGithubActions`. `true` ⇒ `cwd/.github/workflows/*.{yml,yaml}` matched at least one file; gates the auto-mode CI wait branch. |
+| `CiRunStatusResolved { req_id, aggregate? }` | **no** — req/resp | Reply to `GetCiRunStatus`. `aggregate=None` ⇒ no workflow run exists yet for the SHA (still polling) or `gh` unavailable. The aggregate's `failing_run_id` is pre-computed runner-side so the loop pulls failure logs from the **root-cause** run, not a downstream `skipped` step. See [Auto-mode round-trips](#auto-mode-round-trips) for the Reglyze-fix aggregation rule. |
+| `CiFailureLogResolved { req_id, log?, run_id_used? }` | **no** — req/resp | Reply to `CiFailureLog`. `log` is the same ~8 KB tail as `GhFailureLogFetched`; `run_id_used` echoes the run id the runner actually inspected, especially useful when the request was made with `run_id: None` (auto-mode 3.1 re-resolves from the runner-side cache). |
 
 #### SaaS → Runner
 
@@ -172,6 +176,10 @@ makes progress on the next attempt.
 | `PushBranch { req_id, cwd, branch }` | **no** — req/resp | Server-internal follow-up to a successful `MergeBranch`, conditionally sent when `ci::should_record_ci_run(target, default_branch) == true`. The runner runs `git push origin <branch>` and replies with `PushResult`. Split out from `MergeBranch` so the gate stays a pure function on the SaaS side and the side effect (and `gh` dependency) stays on the runner side. |
 | `GhRunList { req_id, cwd, sha }` | **no** — req/resp | The CI poller's per-row probe. The runner runs `gh run list --commit <sha> -L 1 --json databaseId,status,conclusion,url` and replies with `GhRunListed`. Sent from a background tokio task on a ~30 s cadence, not a live HTTP caller — see [CI status round-trips](#ci-status-round-trips). |
 | `GhFailureLog { req_id, cwd, run_id }` | **no** — req/resp | The dashboard's "view CI failure" path. The runner runs `gh run view <run_id> --log-failed`, tail-trims to ~8 KB (mirroring `ci.rs::fetch_failure_log`), and replies with `GhFailureLogFetched`. Used by the Fix-CI flow to embed the failure tail in the recovery agent's prompt. |
+| `MergeAgentBranch { req_id, agent_id, into? }` | **no** — req/resp | Auto-mode loop (or HTTP merge button via the dispatch shim) asked the runner to merge `agent_id`'s task branch. The runner already knows the agent's `cwd` (it spawned it), so the wire only carries the agent id and an optional dropdown override; the runner runs the same target-resolution + 5-step git sequence as `merge_agent_branch_inner` and replies with `AgentBranchMerged`. Naming note: `MergeAgentBranch` is the high-level agent-aware variant; the lower-level `MergeBranch` (cwd / target / task_branch) is the per-merge git primitive used by the same merge button in the merge-target plan. See [Auto-mode round-trips](#auto-mode-round-trips). |
+| `HasGithubActions { req_id, agent_id }` | **no** — req/resp | Auto-mode loop's CI gate probe. The runner globs `cwd/.github/workflows/*.{yml,yaml}` and replies with `GithubActionsDetected`. Used to decide whether to wait for CI or advance to the next task immediately after merge. |
+| `GetCiRunStatus { req_id, plan_name, task_number, merged_sha }` | **no** — req/resp | Auto-mode loop polls per-SHA aggregate CI status. The runner runs `gh run list` + per-skipped-run `gh run view` to enumerate workflow runs and inspect job-level skip causes (so a `deploy` `skipped` *because* `tests` failed upstream isn't read as success — the **Reglyze fix**), then applies the aggregation rule and replies with `CiRunStatusResolved`. Cached runner-side for ~10 s so a tight poll loop doesn't hammer `gh`. See [Auto-mode round-trips](#auto-mode-round-trips). |
+| `CiFailureLog { req_id, plan_name, run_id? }` | **no** — req/resp | Auto-mode loop asks for the failure log. With `run_id=Some(id)` the runner shells `gh run view <id> --log-failed` directly (also the path the existing UI tooltip uses); with `run_id=None` the runner re-resolves the latest aggregate's `failing_run_id` from its in-memory cache (auto-mode 3.1, where the loop has lost the run id by the time it sees a `Red` outcome). Reply is `CiFailureLogResolved`. |
 
 #### Bidirectional
 
@@ -306,6 +314,82 @@ poll cycle that sees a non-`in_progress` `conclusion`, and the failure
 log is written through to `ci_runs.failure_log` on the first successful
 `gh` call so subsequent dashboard fetches return immediately without a
 runner round-trip.
+
+### Auto-mode round-trips
+
+These eight variants — `MergeAgentBranch`/`AgentBranchMerged`,
+`HasGithubActions`/`GithubActionsDetected`,
+`GetCiRunStatus`/`CiRunStatusResolved`,
+`CiFailureLog`/`CiFailureLogResolved` — back the auto-mode loop's
+merge → CI gate → fix sequence. They follow the same
+[request/response pattern](#requestresponse-frames) as the folder
+pairs (single live SaaS-side caller awaiting a oneshot, late replies
+silently dropped), with two distinguishing properties:
+
+1. **Agent-aware addressing.** Where the merge-target plan's
+   `MergeBranch` carries `cwd / target / task_branch`,
+   `MergeAgentBranch` carries only `agent_id` plus an optional `into`
+   override. The runner already knows the agent's `cwd` (it spawned
+   it) and resolves the merge target itself. This keeps the auto-mode
+   server-side dispatcher trivial — it forwards a single id — and
+   lets the runner reuse the `merge_agent_branch_inner` logic without
+   the server first round-tripping a bunch of agent metadata.
+
+2. **CI aggregation is runner-side.** `CiRunStatusResolved` carries a
+   pre-computed [`CiAggregate`](#ciaggregate) instead of a list of raw
+   `GhRun` rows. The aggregation rule (below) is the **Reglyze fix**:
+   a multi-workflow CI where a downstream `deploy` is `skipped`
+   because an upstream `tests` failed must aggregate to `failure`,
+   never `success`. Computing this on the runner means the SaaS
+   server doesn't reapply the same heuristic in two places, and the
+   `failing_run_id` field points at the actual root-cause run so the
+   loop pulls the right log.
+
+#### `CiAggregate`
+
+```
+status:       queued | in_progress | completed
+conclusion:   success | failure | cancelled | timed_out | ... | None
+runs:         [CiRunSummary]
+failing_run_id: Option<String>
+```
+
+#### Aggregation rule
+
+- If any run has `conclusion="failure" | "cancelled" | "timed_out"` ⇒
+  aggregate `conclusion="failure"`.
+- If any run is `status!="completed"` and there is no already-failing
+  run ⇒ aggregate `status="in_progress"` (still polling).
+- If all runs are `conclusion="success"` OR `conclusion="skipped"`
+  with `skipped_due_to_upstream=false` ⇒ aggregate
+  `conclusion="success"`.
+- A run with `conclusion="skipped"` and `skipped_due_to_upstream=true`
+  is **never** treated as success — the runner walks the workflow-
+  graph in dependency order so an upstream failure poisons every
+  downstream skip.
+- `failing_run_id` is the first non-skipped failing run in
+  workflow-graph order. The runner fills `skipped_due_to_upstream` by
+  inspecting `gh run view <id> --json jobs` for each `skipped` run
+  (every job `skipped` and at least one job's `steps[]` reports the
+  skip was caused by `needs:` failure ⇒ upstream-poisoned).
+
+#### `CiFailureLog`'s two modes
+
+- `run_id: Some(id)` is the existing UI tooltip path: the runner
+  shells `gh run view <id> --log-failed` against that specific id.
+- `run_id: None` is the auto-mode 3.1 path: by the time the loop sees
+  a `Red` outcome it has dropped the run id, so the runner
+  re-resolves `failing_run_id` from the latest cached aggregate for
+  `plan_name`. `CiFailureLogResolved.run_id_used` echoes back which
+  run was actually inspected so the audit log stays honest.
+
+#### Best-effort rationale
+
+All eight variants are best-effort. Live HTTP callers in the merge
+button path and the auto-mode loop's wait-and-poll cadence both treat
+a missed reply the same way: time out, retry on the next tick. Outbox
+replay would deliver stale answers after the caller had already moved
+on.
 
 ### `DriverAuthStatus` states
 

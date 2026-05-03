@@ -699,9 +699,17 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
         | WireMessage::PushResult { .. }
         | WireMessage::GhRunListed { .. }
         | WireMessage::GhFailureLogFetched { .. }
+        | WireMessage::AgentBranchMerged { .. }
+        | WireMessage::GithubActionsDetected { .. }
+        | WireMessage::CiRunStatusResolved { .. }
+        | WireMessage::CiFailureLogResolved { .. }
         // saas→runner variants the runner doesn't act on yet (handlers
-        // land in later phases).
+        // land in later phases — auto-mode 0.4 wires the four below).
         | WireMessage::TerminalReplay { .. }
+        | WireMessage::MergeAgentBranch { .. }
+        | WireMessage::HasGithubActions { .. }
+        | WireMessage::GetCiRunStatus { .. }
+        | WireMessage::CiFailureLog { .. }
         | WireMessage::Ping {} => {}
     }
 }

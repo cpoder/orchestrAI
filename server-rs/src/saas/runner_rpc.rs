@@ -185,7 +185,15 @@ fn req_id_for(msg: &WireMessage) -> Option<&str> {
         | WireMessage::GhRunList { req_id, .. }
         | WireMessage::GhRunListed { req_id, .. }
         | WireMessage::GhFailureLog { req_id, .. }
-        | WireMessage::GhFailureLogFetched { req_id, .. } => Some(req_id),
+        | WireMessage::GhFailureLogFetched { req_id, .. }
+        | WireMessage::MergeAgentBranch { req_id, .. }
+        | WireMessage::AgentBranchMerged { req_id, .. }
+        | WireMessage::HasGithubActions { req_id, .. }
+        | WireMessage::GithubActionsDetected { req_id, .. }
+        | WireMessage::GetCiRunStatus { req_id, .. }
+        | WireMessage::CiRunStatusResolved { req_id, .. }
+        | WireMessage::CiFailureLog { req_id, .. }
+        | WireMessage::CiFailureLogResolved { req_id, .. } => Some(req_id),
         _ => None,
     }
 }

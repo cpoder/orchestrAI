@@ -261,6 +261,142 @@ pub enum WireMessage {
         log: Option<String>,
     },
 
+    // ── Auto-mode round-trips (saas → runner request, runner → saas reply) ──
+    //
+    // The four pairs below back the auto-mode loop's merge / CI gate / fix
+    // sequence (auto-mode plan tasks 0.3 / 0.4 / 0.5). They mirror the
+    // folder-ops dispatch pattern: live HTTP / loop caller waits on the
+    // reply with a short timeout, so all eight variants are best-effort —
+    // outbox replay would land after the caller has given up.
+    //
+    // Naming note: the auto-mode plan brief described the merge pair as
+    // `MergeBranch` / `BranchMerged`, but `MergeBranch` is already the
+    // low-level git primitive (cwd / target / task_branch → MergeOutcome)
+    // wired by the merge-target plan and used by api/agents.rs's HTTP
+    // merge button. The high-level agent-aware variant lives under
+    // [`MergeAgentBranch`] / [`AgentBranchMerged`] to keep both pairs
+    // available — the auto-mode dispatcher in 0.5 + the runner-side
+    // handler in 0.4 use the new high-level pair, and the merge button
+    // path is unchanged.
+    /// Auto-mode loop (or HTTP merge button via the 0.5 dispatch shim) asked
+    /// the runner to merge `agent_id`'s task branch. The runner already
+    /// knows `agent_id`'s `cwd` because it spawned the agent, so the wire
+    /// only carries the agent id and an optional dropdown override; the
+    /// runner runs the same target-resolution + 5-step git sequence as
+    /// `merge_agent_branch_inner` (api/agents.rs).
+    ///
+    /// Best-effort: tied to a live HTTP / loop caller, so outbox replay
+    /// would land after the caller has given up.
+    MergeAgentBranch {
+        req_id: String,
+        agent_id: String,
+        /// Dropdown override for the merge target. `None` (and empty
+        /// strings filtered to `None` server-side) selects the canonical
+        /// default branch the runner resolves at merge time.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        into: Option<String>,
+    },
+    /// Runner reply with a flat merge outcome shaped to match the
+    /// server-side `api::agents::MergeOutcome` struct minus `task_branch`
+    /// (which the auto-mode loop doesn't need). `had_conflict` and `error`
+    /// are mutually informative — `had_conflict=true` means the runner ran
+    /// `git merge --abort`, and the loop pauses with `merge_conflict`;
+    /// otherwise `error` carries a human-readable reason for the loop's
+    /// `merge_failed: <msg>` pause path.
+    AgentBranchMerged {
+        req_id: String,
+        /// `true` ≡ `merged_sha` is set; `false` ≡ either `had_conflict`
+        /// or `error` is set.
+        ok: bool,
+        /// New HEAD on `target_branch` after the merge commit. `None` for
+        /// any failure path.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        merged_sha: Option<String>,
+        /// Branch the merge targeted (resolved canonical default or the
+        /// validated `into` override). Empty string for early-return
+        /// failures before target resolution (e.g. agent not found on
+        /// the runner, agent has no task branch).
+        target_branch: String,
+        /// `git merge` reported a conflict; the runner already ran
+        /// `git merge --abort` so the working tree is clean.
+        had_conflict: bool,
+        /// Human-readable error message for non-conflict failures.
+        /// Sentinel values the dispatcher recognizes:
+        /// - `"agent_not_found_on_runner"` — runner can't resolve `agent_id`
+        /// - `"empty_branch"` — task branch has no commits ahead of target
+        /// - other strings flow through as `merge_failed: <msg>`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
+    /// Auto-mode loop asked the runner whether the agent's project has any
+    /// GitHub Actions workflows. Drives the CI gate decision in
+    /// `ci::trigger_after_merge` — without workflows there's no CI to wait
+    /// on and the loop advances straight to the next task. The runner
+    /// resolves the agent's `cwd` itself; only `agent_id` is on the wire.
+    ///
+    /// Best-effort: tied to the loop's wait-and-poll cadence.
+    HasGithubActions { req_id: String, agent_id: String },
+    /// Runner reply: `true` iff `cwd/.github/workflows/*.{yml,yaml}` has
+    /// at least one matching file.
+    GithubActionsDetected { req_id: String, present: bool },
+
+    /// Auto-mode loop asked the runner for the aggregate CI status across
+    /// every workflow run for `merged_sha`. The runner runs `gh run list`
+    /// plus per-skipped-run `gh run view` to inspect job-level skip
+    /// reasons (Reglyze bug: a downstream `deploy` workflow `skipped`
+    /// because `tests` failed upstream is **not** a success), then
+    /// applies the aggregation rule in 0.3 to produce a [`CiAggregate`].
+    ///
+    /// Best-effort: the loop polls on a ~30 s cadence and a missed reply
+    /// just retries on the next tick.
+    GetCiRunStatus {
+        req_id: String,
+        plan_name: String,
+        task_number: String,
+        merged_sha: String,
+    },
+    /// Runner reply with the resolved aggregate, or `None` when no
+    /// workflow run exists yet for the SHA (still polling) or `gh` is
+    /// unavailable on the runner.
+    CiRunStatusResolved {
+        req_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aggregate: Option<CiAggregate>,
+    },
+
+    /// Auto-mode loop asked the runner for the failure log of a CI run.
+    ///
+    /// When `run_id` is `Some(id)`, the runner shells `gh run view <id>
+    /// --log-failed` against that specific id (this is also what the
+    /// existing UI failure-log tooltip uses).
+    ///
+    /// When `run_id` is `None`, the runner re-resolves the `failing_run_id`
+    /// from the most recent [`CiAggregate`] it cached for `plan_name`. This
+    /// is what auto-mode 3.1 uses — by the time the loop sees a `Red`
+    /// outcome it has dropped the run id, and the runner-side cache is
+    /// the cheapest place to look it up.
+    ///
+    /// Best-effort: tied to a live loop caller deciding whether to spawn
+    /// a fix agent.
+    CiFailureLog {
+        req_id: String,
+        plan_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+    },
+    /// Runner reply with the `--log-failed` tail (capped at 8 KB, same as
+    /// `ci::fetch_failure_log`) and the run id that was actually inspected.
+    /// `run_id_used` lets the caller audit which run the log came from
+    /// (especially when the request was made with `run_id: None`).
+    CiFailureLogResolved {
+        req_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        log: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_id_used: Option<String>,
+    },
+
     // ── Bidirectional ───────────────────────────────────────────────────
     /// Acknowledge receipt of a sequenced message. The receiver sends this
     /// after persisting the event so the sender can prune its outbox.
@@ -345,6 +481,75 @@ pub enum MergeOutcome {
     Other { stderr: String },
 }
 
+// ── CI aggregate (auto-mode CI gate) ────────────────────────────────────────
+
+/// Aggregate CI status across **every** workflow run for a SHA, as resolved
+/// runner-side for `GetCiRunStatus`. Plain struct (no enum tag) so the wire
+/// shape is flat JSON; `status`/`conclusion` strings mirror what `gh run
+/// view --json status,conclusion` emits so the auto-mode loop can pattern
+/// match without a translation layer.
+///
+/// **Aggregation rule** (the Reglyze bug — multi-workflow CI where a
+/// downstream `deploy` is `skipped` because `tests` failed upstream):
+///
+/// - If any run has `conclusion="failure" | "cancelled" | "timed_out"` ⇒
+///   `conclusion="failure"`.
+/// - If any run is `status!="completed"` and there is no already-failing
+///   run ⇒ `status="in_progress"` (still polling).
+/// - If all runs are `conclusion="success"` OR `conclusion="skipped"` with
+///   `skipped_due_to_upstream=false` ⇒ `conclusion="success"`.
+/// - A run with `conclusion="skipped"` and `skipped_due_to_upstream=true`
+///   is **never** treated as success — the runner walks the workflow-graph
+///   in dependency order so an upstream failure poisons every downstream
+///   skip.
+/// - `failing_run_id` is the first non-skipped failing run in
+///   workflow-graph order. Pre-computed runner-side because the runner has
+///   the `gh` context and the server shouldn't reapply the same heuristic
+///   in two places.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CiAggregate {
+    /// Aggregate status: `queued | in_progress | completed`.
+    pub status: String,
+    /// Aggregate conclusion: `success | failure | cancelled | timed_out
+    /// | ...`. `None` until at least one run reaches a terminal state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conclusion: Option<String>,
+    /// Per-run breakdown so the loop can distinguish "deploy was skipped
+    /// because tests failed" from "everything passed and deploy was
+    /// skipped on purpose."
+    pub runs: Vec<CiRunSummary>,
+    /// Run id the loop should pull failure logs from. Set to the first
+    /// non-skipped failing run in workflow-graph order; `None` when
+    /// nothing failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failing_run_id: Option<String>,
+}
+
+/// One workflow run inside a [`CiAggregate`]. Fields lift from `gh run
+/// list --json databaseId,workflowName,status,conclusion` plus the
+/// upstream-skip flag the runner derives from per-run `gh run view --json
+/// jobs` inspection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CiRunSummary {
+    /// `databaseId` from `gh`, stringified for ergonomic equality with
+    /// `failing_run_id` and the `run_id` argument to `CiFailureLog`.
+    pub run_id: String,
+    /// Human-readable workflow file name (e.g. `tests.yml`).
+    pub workflow_name: String,
+    /// `queued | in_progress | completed`.
+    pub status: String,
+    /// `success | failure | cancelled | skipped | timed_out | ...`.
+    /// `None` while the run is still queued / in_progress.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conclusion: Option<String>,
+    /// `true` ≡ this run was skipped because an upstream `needs:`
+    /// dependency failed (vs. skipped because its `if:` evaluated false).
+    /// The runner sets this by inspecting `gh run view <id> --json jobs`
+    /// — when every job has `conclusion="skipped"` and any job's
+    /// `steps[]` reports the skip was caused by `needs:` failure.
+    pub skipped_due_to_upstream: bool,
+}
+
 // ── Driver auth info ────────────────────────────────────────────────────────
 
 /// Snapshot of a single driver's authentication status on the runner.
@@ -402,6 +607,14 @@ impl WireMessage {
                 | WireMessage::GhRunListed { .. }
                 | WireMessage::GhFailureLog { .. }
                 | WireMessage::GhFailureLogFetched { .. }
+                | WireMessage::MergeAgentBranch { .. }
+                | WireMessage::AgentBranchMerged { .. }
+                | WireMessage::HasGithubActions { .. }
+                | WireMessage::GithubActionsDetected { .. }
+                | WireMessage::GetCiRunStatus { .. }
+                | WireMessage::CiRunStatusResolved { .. }
+                | WireMessage::CiFailureLog { .. }
+                | WireMessage::CiFailureLogResolved { .. }
         )
     }
 
@@ -435,6 +648,14 @@ impl WireMessage {
             WireMessage::GhRunListed { .. } => "gh_run_listed",
             WireMessage::GhFailureLog { .. } => "gh_failure_log",
             WireMessage::GhFailureLogFetched { .. } => "gh_failure_log_fetched",
+            WireMessage::MergeAgentBranch { .. } => "merge_agent_branch",
+            WireMessage::AgentBranchMerged { .. } => "agent_branch_merged",
+            WireMessage::HasGithubActions { .. } => "has_github_actions",
+            WireMessage::GithubActionsDetected { .. } => "github_actions_detected",
+            WireMessage::GetCiRunStatus { .. } => "get_ci_run_status",
+            WireMessage::CiRunStatusResolved { .. } => "ci_run_status_resolved",
+            WireMessage::CiFailureLog { .. } => "ci_failure_log",
+            WireMessage::CiFailureLogResolved { .. } => "ci_failure_log_resolved",
             WireMessage::Ack { .. } => "ack",
             WireMessage::Ping {} => "ping",
             WireMessage::Pong {} => "pong",
@@ -1196,6 +1417,435 @@ mod tests {
             WireMessage::GhFailureLogFetched { req_id, log } => {
                 assert_eq!(req_id, "req-25");
                 assert!(log.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    // ── Auto-mode round-trip frames ─────────────────────────────────────
+
+    #[test]
+    fn merge_agent_branch_round_trip_with_into() {
+        let msg = WireMessage::MergeAgentBranch {
+            req_id: "req-30".into(),
+            agent_id: "agent-abc".into(),
+            into: Some("feature/x".into()),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "merge_agent_branch");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"merge_agent_branch\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::MergeAgentBranch {
+                req_id,
+                agent_id,
+                into,
+            } => {
+                assert_eq!(req_id, "req-30");
+                assert_eq!(agent_id, "agent-abc");
+                assert_eq!(into.as_deref(), Some("feature/x"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_agent_branch_round_trip_without_into() {
+        // `into: None` (default-merge) should be omitted from the wire form
+        // so the auto-mode loop's no-override path looks like
+        // `{"type":"merge_agent_branch","req_id":"...","agent_id":"..."}`.
+        let msg = WireMessage::MergeAgentBranch {
+            req_id: "req-31".into(),
+            agent_id: "agent-def".into(),
+            into: None,
+        };
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(!json.contains("\"into\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::MergeAgentBranch {
+                req_id,
+                agent_id,
+                into,
+            } => {
+                assert_eq!(req_id, "req-31");
+                assert_eq!(agent_id, "agent-def");
+                assert!(into.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_branch_merged_round_trip_ok() {
+        let msg = WireMessage::AgentBranchMerged {
+            req_id: "req-32".into(),
+            ok: true,
+            merged_sha: Some("deadbeef1234".into()),
+            target_branch: "master".into(),
+            had_conflict: false,
+            error: None,
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "agent_branch_merged");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"agent_branch_merged\""));
+        // Optionals default to None — both fields stay off the wire.
+        assert!(!json.contains("\"error\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::AgentBranchMerged {
+                req_id,
+                ok,
+                merged_sha,
+                target_branch,
+                had_conflict,
+                error,
+            } => {
+                assert_eq!(req_id, "req-32");
+                assert!(ok);
+                assert_eq!(merged_sha.as_deref(), Some("deadbeef1234"));
+                assert_eq!(target_branch, "master");
+                assert!(!had_conflict);
+                assert!(error.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_branch_merged_round_trip_conflict() {
+        let msg = WireMessage::AgentBranchMerged {
+            req_id: "req-33".into(),
+            ok: false,
+            merged_sha: None,
+            target_branch: "master".into(),
+            had_conflict: true,
+            error: None,
+        };
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        // `merged_sha: None` is omitted; the auto-mode loop reads
+        // `had_conflict` first and pauses with `merge_conflict`.
+        assert!(!json.contains("\"merged_sha\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::AgentBranchMerged {
+                req_id,
+                ok,
+                merged_sha,
+                target_branch,
+                had_conflict,
+                error,
+            } => {
+                assert_eq!(req_id, "req-33");
+                assert!(!ok);
+                assert!(merged_sha.is_none());
+                assert_eq!(target_branch, "master");
+                assert!(had_conflict);
+                assert!(error.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_branch_merged_round_trip_error() {
+        let msg = WireMessage::AgentBranchMerged {
+            req_id: "req-34".into(),
+            ok: false,
+            merged_sha: None,
+            target_branch: String::new(),
+            had_conflict: false,
+            error: Some("agent_not_found_on_runner".into()),
+        };
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::AgentBranchMerged {
+                req_id,
+                ok,
+                merged_sha,
+                target_branch,
+                had_conflict,
+                error,
+            } => {
+                assert_eq!(req_id, "req-34");
+                assert!(!ok);
+                assert!(merged_sha.is_none());
+                assert_eq!(target_branch, "");
+                assert!(!had_conflict);
+                assert_eq!(error.as_deref(), Some("agent_not_found_on_runner"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn has_github_actions_round_trip() {
+        let msg = WireMessage::HasGithubActions {
+            req_id: "req-35".into(),
+            agent_id: "agent-abc".into(),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "has_github_actions");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"has_github_actions\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::HasGithubActions { req_id, agent_id } => {
+                assert_eq!(req_id, "req-35");
+                assert_eq!(agent_id, "agent-abc");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn github_actions_detected_round_trip() {
+        for present in [true, false] {
+            let msg = WireMessage::GithubActionsDetected {
+                req_id: "req-36".into(),
+                present,
+            };
+            assert!(msg.is_best_effort());
+            assert_eq!(msg.event_type(), "github_actions_detected");
+            let env = Envelope::best_effort("r1".into(), msg);
+            let json = serde_json::to_string(&env).unwrap();
+            assert!(json.contains("\"type\":\"github_actions_detected\""));
+            let back: Envelope = serde_json::from_str(&json).unwrap();
+            match back.message {
+                WireMessage::GithubActionsDetected { req_id, present: p } => {
+                    assert_eq!(req_id, "req-36");
+                    assert_eq!(p, present);
+                }
+                other => panic!("unexpected variant: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn get_ci_run_status_round_trip() {
+        let msg = WireMessage::GetCiRunStatus {
+            req_id: "req-37".into(),
+            plan_name: "auto-mode-merge-ci-fix-loop".into(),
+            task_number: "0.3".into(),
+            merged_sha: "abcd1234".into(),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "get_ci_run_status");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"get_ci_run_status\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::GetCiRunStatus {
+                req_id,
+                plan_name,
+                task_number,
+                merged_sha,
+            } => {
+                assert_eq!(req_id, "req-37");
+                assert_eq!(plan_name, "auto-mode-merge-ci-fix-loop");
+                assert_eq!(task_number, "0.3");
+                assert_eq!(merged_sha, "abcd1234");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ci_run_status_resolved_round_trip_some() {
+        // The Reglyze scenario: tests failed, lint succeeded, deploy was
+        // skipped *because* tests failed. Aggregate must call this a
+        // failure and pin `failing_run_id` to the tests run.
+        let aggregate = CiAggregate {
+            status: "completed".into(),
+            conclusion: Some("failure".into()),
+            runs: vec![
+                CiRunSummary {
+                    run_id: "1001".into(),
+                    workflow_name: "tests.yml".into(),
+                    status: "completed".into(),
+                    conclusion: Some("failure".into()),
+                    skipped_due_to_upstream: false,
+                },
+                CiRunSummary {
+                    run_id: "1002".into(),
+                    workflow_name: "lint.yml".into(),
+                    status: "completed".into(),
+                    conclusion: Some("success".into()),
+                    skipped_due_to_upstream: false,
+                },
+                CiRunSummary {
+                    run_id: "1003".into(),
+                    workflow_name: "deploy.yml".into(),
+                    status: "completed".into(),
+                    conclusion: Some("skipped".into()),
+                    skipped_due_to_upstream: true,
+                },
+            ],
+            failing_run_id: Some("1001".into()),
+        };
+        let msg = WireMessage::CiRunStatusResolved {
+            req_id: "req-38".into(),
+            aggregate: Some(aggregate.clone()),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "ci_run_status_resolved");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"ci_run_status_resolved\""));
+        // Pin the upstream-skip flag spelling so a future rename can't
+        // silently regress the Reglyze-fix detection.
+        assert!(json.contains("\"skipped_due_to_upstream\":true"));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::CiRunStatusResolved {
+                req_id,
+                aggregate: agg,
+            } => {
+                assert_eq!(req_id, "req-38");
+                assert_eq!(agg, Some(aggregate));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ci_run_status_resolved_round_trip_none() {
+        // No workflow run exists yet for this SHA — runner sends back
+        // `aggregate: None` and the loop polls again on the next tick.
+        let msg = WireMessage::CiRunStatusResolved {
+            req_id: "req-39".into(),
+            aggregate: None,
+        };
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(!json.contains("\"aggregate\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::CiRunStatusResolved { req_id, aggregate } => {
+                assert_eq!(req_id, "req-39");
+                assert!(aggregate.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ci_failure_log_round_trip_with_run_id() {
+        let msg = WireMessage::CiFailureLog {
+            req_id: "req-40".into(),
+            plan_name: "auto-mode-merge-ci-fix-loop".into(),
+            run_id: Some("1001".into()),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "ci_failure_log");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"ci_failure_log\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::CiFailureLog {
+                req_id,
+                plan_name,
+                run_id,
+            } => {
+                assert_eq!(req_id, "req-40");
+                assert_eq!(plan_name, "auto-mode-merge-ci-fix-loop");
+                assert_eq!(run_id.as_deref(), Some("1001"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ci_failure_log_round_trip_without_run_id() {
+        // `run_id: None` is the auto-mode 3.1 path — the runner re-resolves
+        // the latest aggregate's `failing_run_id` from its own cache.
+        let msg = WireMessage::CiFailureLog {
+            req_id: "req-41".into(),
+            plan_name: "auto-mode-merge-ci-fix-loop".into(),
+            run_id: None,
+        };
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(!json.contains("\"run_id\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::CiFailureLog {
+                req_id,
+                plan_name,
+                run_id,
+            } => {
+                assert_eq!(req_id, "req-41");
+                assert_eq!(plan_name, "auto-mode-merge-ci-fix-loop");
+                assert!(run_id.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ci_failure_log_resolved_round_trip_some() {
+        let msg = WireMessage::CiFailureLogResolved {
+            req_id: "req-42".into(),
+            log: Some("error: cargo test failed at line 42\n".into()),
+            run_id_used: Some("1001".into()),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "ci_failure_log_resolved");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"ci_failure_log_resolved\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::CiFailureLogResolved {
+                req_id,
+                log,
+                run_id_used,
+            } => {
+                assert_eq!(req_id, "req-42");
+                assert_eq!(
+                    log.as_deref(),
+                    Some("error: cargo test failed at line 42\n")
+                );
+                assert_eq!(run_id_used.as_deref(), Some("1001"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ci_failure_log_resolved_round_trip_none() {
+        // Both the log and the run id can be absent — e.g. a `run_id: None`
+        // request when the runner never saw a failing run for the plan.
+        let msg = WireMessage::CiFailureLogResolved {
+            req_id: "req-43".into(),
+            log: None,
+            run_id_used: None,
+        };
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(!json.contains("\"log\""));
+        assert!(!json.contains("\"run_id_used\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::CiFailureLogResolved {
+                req_id,
+                log,
+                run_id_used,
+            } => {
+                assert_eq!(req_id, "req-43");
+                assert!(log.is_none());
+                assert!(run_id_used.is_none());
             }
             other => panic!("unexpected variant: {other:?}"),
         }
