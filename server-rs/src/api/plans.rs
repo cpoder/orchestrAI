@@ -711,6 +711,7 @@ pub async fn list_task_learnings(
 pub async fn auto_status(
     State(state): State<AppState>,
     Path(name): Path<String>,
+    auth: OptionalAuthUser,
 ) -> impl IntoResponse {
     let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &name) {
         Some(p) => p,
@@ -801,6 +802,17 @@ pub async fn auto_status(
             let (status, reason) =
                 auto_status::infer_status(&project_dir, &task.file_paths, &title_words);
 
+            // Capture the prior status (if any) so the audit log can record
+            // a real before→after diff. Best-effort — `None` ⇒ row didn't exist.
+            let prev_status: Option<String> = db
+                .query_row(
+                    "SELECT status FROM task_status \
+                     WHERE plan_name = ?1 AND task_number = ?2",
+                    params![name, task.number],
+                    |row| row.get(0),
+                )
+                .ok();
+
             db.execute(
                 "INSERT INTO task_status (plan_name, task_number, status, source, updated_at)
                  VALUES (?1, ?2, ?3, 'auto', datetime('now'))
@@ -811,6 +823,29 @@ pub async fn auto_status(
                 params![name, task.number, status],
             )
             .ok();
+
+            // Audit any real status transition. Pure source-flips and
+            // updated_at-only churn are not audited (no behavioural change).
+            if prev_status.as_deref() != Some(status) {
+                let resource_id = format!("{}/{}", name, task.number);
+                let diff = serde_json::json!({
+                    "from": prev_status,
+                    "to": status,
+                    "source": "auto",
+                    "reason": reason,
+                })
+                .to_string();
+                crate::audit::log(
+                    &db,
+                    auth.org_id(),
+                    auth.0.as_ref().map(|u| u.id.as_str()),
+                    auth.0.as_ref().map(|u| u.email.as_str()),
+                    crate::audit::actions::TASK_STATUS_CHANGE,
+                    crate::audit::resources::TASK,
+                    Some(&resource_id),
+                    Some(&diff),
+                );
+            }
 
             *summary.entry(status.to_string()).or_insert(0) += 1;
             results.push(serde_json::json!({
@@ -839,7 +874,10 @@ pub async fn auto_status(
 
 // ── POST /api/plans/sync-all ────────────────────────────────────────────────
 
-pub async fn sync_all(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn sync_all(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+) -> impl IntoResponse {
     let summaries = plan_parser::list_plans(&state.plans_dir);
     let home = dirs::home_dir().unwrap();
     let db = state.db.lock().unwrap();
@@ -898,8 +936,17 @@ pub async fn sync_all(State(state): State<AppState>) -> impl IntoResponse {
                     .filter(|w| w.len() >= 5)
                     .collect();
 
-                let (status, _) =
+                let (status, reason) =
                     auto_status::infer_status(&project_dir, &task.file_paths, &title_words);
+
+                let prev_status: Option<String> = db
+                    .query_row(
+                        "SELECT status FROM task_status \
+                         WHERE plan_name = ?1 AND task_number = ?2",
+                        params![s.name, task.number],
+                        |row| row.get(0),
+                    )
+                    .ok();
 
                 db.execute(
                     "INSERT INTO task_status (plan_name, task_number, status, source, updated_at)
@@ -911,6 +958,27 @@ pub async fn sync_all(State(state): State<AppState>) -> impl IntoResponse {
                     params![s.name, task.number, status],
                 )
                 .ok();
+
+                if prev_status.as_deref() != Some(status) {
+                    let resource_id = format!("{}/{}", s.name, task.number);
+                    let diff = serde_json::json!({
+                        "from": prev_status,
+                        "to": status,
+                        "source": "auto",
+                        "reason": reason,
+                    })
+                    .to_string();
+                    crate::audit::log(
+                        &db,
+                        auth.org_id(),
+                        auth.0.as_ref().map(|u| u.id.as_str()),
+                        auth.0.as_ref().map(|u| u.email.as_str()),
+                        crate::audit::actions::TASK_STATUS_CHANGE,
+                        crate::audit::resources::TASK,
+                        Some(&resource_id),
+                        Some(&diff),
+                    );
+                }
 
                 *totals.entry(status.to_string()).or_insert(0) += 1;
             }

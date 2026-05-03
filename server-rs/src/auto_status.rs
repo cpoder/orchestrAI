@@ -2,6 +2,7 @@ use std::path::Path;
 use std::process::Command;
 
 /// Check if a file path (possibly relative, possibly just a filename) exists in the project.
+#[allow(dead_code)] // unused while infer_status is disabled (2026-05-03); kept for the real replacement
 pub fn find_file_in_project(project_dir: &Path, file_path: &str) -> bool {
     // Strip line number suffixes like :609-664 or :42
     let clean = file_path.split(':').next().unwrap_or(file_path).trim();
@@ -80,39 +81,29 @@ pub fn check_git_for_task(project_dir: &Path, keywords: &[&str]) -> usize {
 
 /// Determine task status based on file existence.
 ///
-/// File existence is evidence the task may have started (or that the listed
-/// files pre-existed) — never evidence it finished. Only explicit agent or
-/// user action sets "completed", so this function caps inferred status at
-/// "in_progress".
+/// **Currently disabled — always returns `"pending"`.** The previous heuristic
+/// flipped tasks to `"in_progress"` when any of their listed `file_paths`
+/// existed on disk, but file existence cannot distinguish "an agent has
+/// started this task" from "the file pre-existed because the task is meant to
+/// modify it." For tasks that modify existing files (the majority of
+/// branchwork's actual work) this produced false positives across an entire
+/// plan on first sync — see the auto-mode-merge-ci-fix-loop incident on
+/// 2026-05-03 where 17 of 20 tasks were silently flipped to in_progress.
 ///
-/// Policy:
-/// - No file paths listed → "pending". No anchor to check against.
-/// - At least one file exists → "in_progress".
-/// - No files exist → "pending".
+/// A real replacement should derive `in_progress` from authoritative signals
+/// (an `agents` row exists for the task and is not finished, or the task's
+/// branch exists in the worktree), not from disk file existence. Until that
+/// lands, this function returns `"pending"` for every input so the call
+/// sites at `api/plans.rs` no longer corrupt state on sync.
 pub fn infer_status(
-    project_dir: &Path,
-    file_paths: &[String],
+    _project_dir: &Path,
+    _file_paths: &[String],
     _title_words: &[&str],
 ) -> (&'static str, String) {
-    let total_checked = file_paths.len();
-
-    if total_checked == 0 {
-        return ("pending", "no file paths to check".into());
-    }
-
-    let found_count = file_paths
-        .iter()
-        .filter(|fp| find_file_in_project(project_dir, fp))
-        .count();
-
-    if found_count > 0 {
-        (
-            "in_progress",
-            format!("{found_count}/{total_checked} files exist"),
-        )
-    } else {
-        ("pending", format!("0/{total_checked} files exist"))
-    }
+    (
+        "pending",
+        "auto-inference disabled (incident 2026-05-03)".into(),
+    )
 }
 
 #[cfg(test)]
@@ -121,70 +112,32 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    /// Disabled-mode contract: `infer_status` must return `"pending"` for
+    /// every input, regardless of whether listed files exist on disk. This
+    /// pins the stop-the-bleeding behaviour from the 2026-05-03 incident
+    /// where the prior "files exist → in_progress" heuristic flipped 17/20
+    /// pending tasks on a single plan sync. When the real
+    /// agents/branch-aware replacement lands, this test gets replaced.
     #[test]
-    fn no_file_paths_is_pending() {
-        let dir = tempdir().unwrap();
-        let (status, reason) = infer_status(dir.path(), &[], &[]);
-        assert_eq!(status, "pending");
-        assert_eq!(reason, "no file paths to check");
-    }
-
-    #[test]
-    fn missing_files_is_pending() {
-        let dir = tempdir().unwrap();
-        let (status, _) = infer_status(
-            dir.path(),
-            &["does/not/exist.rs".into(), "also/missing.ts".into()],
-            &[],
-        );
-        assert_eq!(status, "pending");
-    }
-
-    #[test]
-    fn some_files_present_is_in_progress() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.rs"), "").unwrap();
-        let (status, _) = infer_status(dir.path(), &["a.rs".into(), "missing.rs".into()], &[]);
-        assert_eq!(status, "in_progress");
-    }
-
-    #[test]
-    fn all_files_present_is_in_progress_not_completed() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.rs"), "").unwrap();
-        fs::write(dir.path().join("b.rs"), "").unwrap();
-        let (status, _) = infer_status(dir.path(), &["a.rs".into(), "b.rs".into()], &[]);
-        assert_eq!(status, "in_progress");
-    }
-
-    /// Acceptance criterion for Task 2.1: `infer_status` must never return
-    /// `"completed"`. Sweep the cases that previously triggered the ≥80%
-    /// branch (1/1, 2/2, 4/4, 4/5) and confirm none of them flip to done.
-    #[test]
-    fn infer_status_never_returns_completed() {
+    fn infer_status_always_returns_pending() {
         let dir = tempdir().unwrap();
         for name in ["a.rs", "b.rs", "c.rs", "d.rs"] {
             fs::write(dir.path().join(name), "").unwrap();
         }
 
         let cases: &[Vec<String>] = &[
-            vec!["a.rs".into()],
+            vec![],
+            vec!["does/not/exist.rs".into(), "also/missing.ts".into()],
+            vec!["a.rs".into(), "missing.rs".into()],
             vec!["a.rs".into(), "b.rs".into()],
             vec!["a.rs".into(), "b.rs".into(), "c.rs".into(), "d.rs".into()],
-            vec![
-                "a.rs".into(),
-                "b.rs".into(),
-                "c.rs".into(),
-                "d.rs".into(),
-                "missing.rs".into(),
-            ],
         ];
 
         for files in cases {
             let (status, _) = infer_status(dir.path(), files, &[]);
-            assert_ne!(
-                status, "completed",
-                "infer_status returned completed for {files:?}"
+            assert_eq!(
+                status, "pending",
+                "infer_status returned non-pending for {files:?} — should be a no-op while disabled"
             );
         }
     }
