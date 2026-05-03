@@ -173,6 +173,51 @@ function handleWsMessage(msg: { type: string; data: unknown }) {
       agentStore.fetchAgents();
       break;
     }
+    case "auto_mode_merged": {
+      // The auto-mode loop merged a task branch. The lower-level
+      // `agent_branch_merged` event also fires from the merge inner and
+      // already triggers fetchAgents; this case adds the user-facing
+      // notification with the plan/task context that's only visible at the
+      // auto-mode layer.
+      const d = msg.data as {
+        plan: string;
+        task: string;
+        sha?: string | null;
+        target?: string | null;
+      };
+      const taskLabel = lookupTaskTitle(d.plan, d.task);
+      const targetSuffix = d.target ? ` → ${d.target}` : "";
+      notify(
+        `Auto-merged: ${taskLabel}${targetSuffix}`,
+        d.plan,
+        `auto-mode-merged-${d.plan}-${d.task}`,
+      );
+      // Defensive refetch: agent_branch_merged already triggers this on the
+      // local merge path, but the SaaS path goes through a runner round-trip
+      // and may race the broadcast — refetching here keeps the UI converged
+      // regardless of which event arrives first.
+      agentStore.fetchAgents();
+      break;
+    }
+    case "auto_mode_paused": {
+      // The auto-mode loop paused itself for a plan. Phase 4 will read
+      // `pausedReason` from /api/plans/:name/config to render a banner; for
+      // now we surface the pause via a desktop notification so a watcher
+      // doesn't miss it.
+      const d = msg.data as {
+        plan: string;
+        task?: string | null;
+        reason: string;
+        target?: string | null;
+      };
+      const taskLabel = d.task ? lookupTaskTitle(d.plan, d.task) : "plan";
+      notify(
+        `Auto-mode paused: ${d.plan}`,
+        `${taskLabel} — ${d.reason}`,
+        `auto-mode-paused-${d.plan}`,
+      );
+      break;
+    }
     case "task_checked": {
       const d2 = msg.data as { plan_name: string; task_number: string; status: string };
       planStore.patchTaskStatus(d2.plan_name, d2.task_number, d2.status);
