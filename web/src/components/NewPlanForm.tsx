@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { fetchJson, postJson } from "../api.js";
+import { HttpError, fetchJson, postJson } from "../api.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
 
@@ -16,8 +16,30 @@ interface Template {
   skeleton: string;
 }
 
+interface RunnersResponse {
+  runners: Array<{ lastSeenAt?: string | null }>;
+}
+
+type RunnerStatus =
+  | { kind: "no_runner" }
+  | { kind: "unavailable"; lastSeen: string | null };
+
 interface Props {
   onClose: () => void;
+}
+
+// Mirror of AuditLog formatTimestamp: SQLite's `datetime('now')` emits a
+// naive ISO string, so append `Z` if it isn't already UTC-marked.
+function formatRelative(iso: string): string {
+  const d = new Date(iso + (iso.endsWith("Z") ? "" : "Z"));
+  const diffMs = Date.now() - d.getTime();
+  const diffMin = Math.floor(diffMs / 60000);
+  if (diffMin < 1) return "just now";
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffH = Math.floor(diffMin / 60);
+  if (diffH < 24) return `${diffH}h ago`;
+  const diffD = Math.floor(diffH / 24);
+  return `${diffD}d ago`;
 }
 
 export function NewPlanForm({ onClose }: Props) {
@@ -30,12 +52,24 @@ export function NewPlanForm({ onClose }: Props) {
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmCreate, setConfirmCreate] = useState<string | null>(null);
+  const [runnerStatus, setRunnerStatus] = useState<RunnerStatus | null>(null);
   const selectAgent = useAgentStore((s) => s.selectAgent);
   const fetchPlans = usePlanStore((s) => s.fetchPlans);
 
   useEffect(() => {
-    fetchJson<Folder[]>("/api/folders").then(setFolders).catch(() => {});
+    let cancelled = false;
+    (async () => {
+      try {
+        const list = await fetchJson<Folder[]>("/api/folders");
+        if (!cancelled) setFolders(list);
+      } catch (e) {
+        if (!cancelled) await applyRunnerErrorIfAny(e, setRunnerStatus);
+      }
+    })();
     fetchJson<Template[]>("/api/templates").then(setTemplates).catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const selectedTemplate = templates.find((t) => t.id === templateId) ?? null;
@@ -87,6 +121,9 @@ export function NewPlanForm({ onClose }: Props) {
       setTimeout(() => fetchPlans(), 30000);
       onClose();
     } catch (e) {
+      if (await applyRunnerErrorIfAny(e, setRunnerStatus)) {
+        return;
+      }
       setError(String(e));
     } finally {
       setCreating(false);
@@ -122,6 +159,7 @@ export function NewPlanForm({ onClose }: Props) {
         <label className="block text-sm font-medium text-gray-400 mb-1.5">
           Project folder
         </label>
+        {runnerStatus && <RunnerBanner status={runnerStatus} />}
         <div className="relative">
           <input
             type="text"
@@ -136,7 +174,7 @@ export function NewPlanForm({ onClose }: Props) {
             placeholder="~/my-project or /home/cpo/project"
             className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-200 placeholder:text-gray-600 focus:outline-none focus:border-indigo-600"
           />
-          {showSuggestions && filtered.length > 0 && (
+          {showSuggestions && filtered.length > 0 && !runnerStatus && (
             <div className="absolute top-full left-0 right-0 mt-1 bg-gray-800 border border-gray-700 rounded-md shadow-lg max-h-48 overflow-auto z-20">
               {filtered.map((f) => (
                 <button
@@ -245,6 +283,52 @@ export function NewPlanForm({ onClose }: Props) {
       >
         {creating ? "Starting agent..." : "Create Plan"}
       </button>
+    </div>
+  );
+}
+
+async function applyRunnerErrorIfAny(
+  e: unknown,
+  setRunnerStatus: (s: RunnerStatus) => void
+): Promise<boolean> {
+  if (!(e instanceof HttpError)) return false;
+  const errorKey = (e.body as { error?: string } | undefined)?.error;
+  if (e.status === 503 && errorKey === "no_runner_connected") {
+    setRunnerStatus({ kind: "no_runner" });
+    return true;
+  }
+  if (e.status === 504 && errorKey === "runner_unavailable") {
+    let lastSeen: string | null = null;
+    try {
+      const res = await fetchJson<RunnersResponse>("/api/runners");
+      lastSeen = res.runners[0]?.lastSeenAt ?? null;
+    } catch {
+      // best-effort — banner still renders without a relative timestamp
+    }
+    setRunnerStatus({ kind: "unavailable", lastSeen });
+    return true;
+  }
+  return false;
+}
+
+function RunnerBanner({ status }: { status: RunnerStatus }) {
+  return (
+    <div className="mb-2 p-2 bg-amber-900/20 border border-amber-700/50 rounded text-xs text-amber-400">
+      {status.kind === "no_runner" ? (
+        <p>
+          No runner connected. Install <code className="text-amber-300">branchwork-runner</code> on
+          your machine — see the{" "}
+          <a href="/runners" className="underline hover:text-amber-300">
+            Runners page
+          </a>{" "}
+          — then refresh.
+        </p>
+      ) : (
+        <p>
+          Runner is offline.
+          {status.lastSeen ? ` Last seen ${formatRelative(status.lastSeen)}.` : ""}
+        </p>
+      )}
     </div>
   );
 }
