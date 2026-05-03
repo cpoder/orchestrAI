@@ -15,7 +15,6 @@ use crate::db::Db;
 /// once an org has registered a runner, every folder op routes through one.
 /// Orgs with zero runner rows are treated as standalone deployments where
 /// the local filesystem is authoritative.
-#[allow(dead_code)] // consumers land in Phase 3.2+ of saas-folder-listing-via-runner
 pub fn org_has_runner(db: &Db, org_id: &str) -> bool {
     let conn = db.lock().unwrap();
     conn.query_row(

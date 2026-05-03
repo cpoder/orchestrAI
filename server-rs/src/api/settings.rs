@@ -1,7 +1,15 @@
+use std::time::Duration;
+
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
+use crate::auth::OptionalAuthUser;
 use crate::config::Effort;
+use crate::saas::dispatch::org_has_runner;
+use crate::saas::runner_protocol::WireMessage;
+use crate::saas::runner_rpc::{RunnerRpcError, runner_request};
+use crate::saas::runner_ws::RunnerResponse;
 use crate::state::AppState;
 
 // ── GET /api/settings ────────────────────────────────────────────────────────
@@ -56,9 +64,44 @@ pub struct FolderEntry {
     path: String,
 }
 
-pub async fn list_folders() -> impl IntoResponse {
+pub async fn list_folders(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+) -> impl IntoResponse {
+    if !org_has_runner(&state.db, auth.org_id()) {
+        return Json(local_home_folders()).into_response();
+    }
+
+    let req_id = Uuid::new_v4().to_string();
+    let message = WireMessage::ListFolders { req_id };
+    match runner_request(&state, auth.org_id(), message, Duration::from_secs(8)).await {
+        Ok(RunnerResponse::FoldersListed(entries)) => Json(entries).into_response(),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "unexpected_runner_response" })),
+        )
+            .into_response(),
+        Err(RunnerRpcError::NoConnectedRunner) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no_runner_connected" })),
+        )
+            .into_response(),
+        Err(RunnerRpcError::Timeout | RunnerRpcError::RunnerDisconnected) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({ "error": "runner_unavailable" })),
+        )
+            .into_response(),
+        Err(RunnerRpcError::InvalidRequest | RunnerRpcError::SendFailed) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "runner_request_failed" })),
+        )
+            .into_response(),
+    }
+}
+
+fn local_home_folders() -> Vec<FolderEntry> {
     let home = dirs::home_dir().unwrap_or_default();
-    let entries = match std::fs::read_dir(&home) {
+    match std::fs::read_dir(&home) {
         Ok(rd) => rd
             .flatten()
             .filter(|e| {
@@ -71,6 +114,5 @@ pub async fn list_folders() -> impl IntoResponse {
             })
             .collect(),
         Err(_) => Vec::new(),
-    };
-    Json(entries)
+    }
 }
