@@ -2,7 +2,6 @@ mod agents;
 mod api;
 mod audit;
 mod auth;
-mod auto_status;
 mod ci;
 mod config;
 mod db;
@@ -242,7 +241,6 @@ async fn run_server(cli: Cli) {
         .route("/api/events", get(api::agents::get_events))
         // Plan routes
         .route("/api/plans", get(api::plans::list_plans))
-        .route("/api/plans/sync-all", post(api::plans::sync_all))
         .route(
             "/api/plans/{name}",
             get(api::plans::get_plan).put(api::plans::update_plan),
@@ -271,10 +269,6 @@ async fn run_server(cli: Cli) {
         .route("/api/plans/create", post(api::plans::create_plan))
         .route("/api/plans/convert-all", post(api::plans::convert_all))
         .route("/api/plans/{name}/convert", post(api::plans::convert_plan))
-        .route(
-            "/api/plans/{name}/auto-status",
-            post(api::plans::auto_status),
-        )
         .route(
             "/api/plans/{name}/reset-status",
             post(api::plans::reset_plan_status),
