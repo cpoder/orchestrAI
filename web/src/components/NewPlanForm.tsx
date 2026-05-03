@@ -94,25 +94,15 @@ export function NewPlanForm({ onClose }: Props) {
     setError(null);
     setCreating(true);
     try {
-      const res = await postJson<
-        { agentId: string; folder: string } | { error: string; resolvedFolder?: string }
-      >("/api/plans/create", {
-        description,
-        folder,
-        createFolder: !!confirmCreate,
-        templateId: templateId || undefined,
-      });
-
-      if ("error" in res) {
-        if (res.error === "folder_not_found" && res.resolvedFolder) {
-          setConfirmCreate(res.resolvedFolder);
-          setCreating(false);
-          return;
+      const res = await postJson<{ agentId: string; folder: string }>(
+        "/api/plans/create",
+        {
+          description,
+          folder,
+          createFolder: !!confirmCreate,
+          templateId: templateId || undefined,
         }
-        setError((res as { error: string; message?: string }).message ?? res.error);
-        setCreating(false);
-        return;
-      }
+      );
 
       selectAgent(res.agentId);
       // Plan will appear via file watcher once the agent writes it
@@ -121,8 +111,28 @@ export function NewPlanForm({ onClose }: Props) {
       setTimeout(() => fetchPlans(), 30000);
       onClose();
     } catch (e) {
-      if (await applyRunnerErrorIfAny(e, setRunnerStatus)) {
-        return;
+      if (e instanceof HttpError) {
+        const body = (e.body ?? {}) as {
+          error?: string;
+          resolvedFolder?: string;
+          message?: string;
+        };
+        if (e.status === 400 && body.error === "folder_not_found" && body.resolvedFolder) {
+          setConfirmCreate(body.resolvedFolder);
+          return;
+        }
+        if (e.status === 400 && body.error === "create_failed") {
+          setError(body.message ?? "Runner failed to create folder.");
+          return;
+        }
+        if (e.status === 503 && body.error === "no_runner_connected") {
+          setRunnerStatus({ kind: "no_runner" });
+          return;
+        }
+        if (e.status === 504 && body.error === "runner_unavailable") {
+          setError("Runner did not respond in time. Try again.");
+          return;
+        }
       }
       setError(String(e));
     } finally {

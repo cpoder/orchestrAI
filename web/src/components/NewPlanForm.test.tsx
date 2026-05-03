@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { NewPlanForm } from "./NewPlanForm.js";
 
 type FetchHandler = (path: string) => {
@@ -129,6 +129,135 @@ describe("NewPlanForm runner banner", () => {
     await waitFor(() => {
       expect(screen.queryByText(/No runner connected/i)).toBeNull();
       expect(screen.queryByText(/Runner is offline/i)).toBeNull();
+    });
+  });
+});
+
+describe("NewPlanForm /api/plans/create error mapping", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  async function fillFormAndSubmit() {
+    const folderInput = screen.getByPlaceholderText(/~\/my-project/) as HTMLInputElement;
+    const descriptionInput = screen.getByPlaceholderText(
+      /Describe the feature/i
+    ) as HTMLTextAreaElement;
+    fireEvent.change(folderInput, { target: { value: "~/missing" } });
+    fireEvent.change(descriptionInput, { target: { value: "build a thing" } });
+    fireEvent.click(screen.getByRole("button", { name: /Create Plan/i }));
+  }
+
+  it("shows the no-runner banner when /api/plans/create returns 503", async () => {
+    installFetchMock((path) => {
+      if (path === "/api/folders") {
+        return { status: 200, body: [] };
+      }
+      if (path === "/api/templates") {
+        return { status: 200, body: [] };
+      }
+      if (path === "/api/plans/create") {
+        return { status: 503, body: { error: "no_runner_connected" } };
+      }
+      return { status: 404, body: {} };
+    });
+
+    render(<NewPlanForm onClose={() => {}} />);
+    await fillFormAndSubmit();
+
+    await waitFor(() => {
+      expect(screen.getByText(/No runner connected/i)).toBeTruthy();
+    });
+  });
+
+  it("shows 'Runner did not respond in time. Try again.' when /api/plans/create returns 504", async () => {
+    installFetchMock((path) => {
+      if (path === "/api/folders") {
+        return { status: 200, body: [] };
+      }
+      if (path === "/api/templates") {
+        return { status: 200, body: [] };
+      }
+      if (path === "/api/plans/create") {
+        return { status: 504, body: { error: "runner_unavailable" } };
+      }
+      return { status: 404, body: {} };
+    });
+
+    render(<NewPlanForm onClose={() => {}} />);
+    await fillFormAndSubmit();
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("Runner did not respond in time. Try again.")
+      ).toBeTruthy();
+    });
+    // 504 from the create path uses the inline error pane, not the banner.
+    expect(screen.queryByText(/Runner is offline/i)).toBeNull();
+  });
+
+  it("shows the runner's message verbatim on create_failed", async () => {
+    installFetchMock((path) => {
+      if (path === "/api/folders") {
+        return { status: 200, body: [] };
+      }
+      if (path === "/api/templates") {
+        return { status: 200, body: [] };
+      }
+      if (path === "/api/plans/create") {
+        return {
+          status: 400,
+          body: {
+            error: "create_failed",
+            resolvedFolder: "/home/runner/missing",
+            message: "Permission denied (os error 13)",
+          },
+        };
+      }
+      return { status: 404, body: {} };
+    });
+
+    render(<NewPlanForm onClose={() => {}} />);
+    await fillFormAndSubmit();
+
+    await waitFor(() => {
+      expect(screen.getByText("Permission denied (os error 13)")).toBeTruthy();
+    });
+  });
+
+  it("shows the create-folder confirm dialog on folder_not_found", async () => {
+    installFetchMock((path) => {
+      if (path === "/api/folders") {
+        return { status: 200, body: [] };
+      }
+      if (path === "/api/templates") {
+        return { status: 200, body: [] };
+      }
+      if (path === "/api/plans/create") {
+        return {
+          status: 400,
+          body: {
+            error: "folder_not_found",
+            resolvedFolder: "/home/runner/missing",
+            message: "Directory does not exist: /home/runner/missing",
+          },
+        };
+      }
+      return { status: 404, body: {} };
+    });
+
+    render(<NewPlanForm onClose={() => {}} />);
+    await fillFormAndSubmit();
+
+    await waitFor(() => {
+      expect(screen.getByText(/Create folder and continue/i)).toBeTruthy();
+      expect(screen.getByText("/home/runner/missing")).toBeTruthy();
     });
   });
 });
