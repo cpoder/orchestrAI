@@ -225,6 +225,63 @@ describe("AuditLog auto-mode action rendering", () => {
     expect(screen.getByText(/from T1\.4/)).toBeTruthy();
   });
 
+  it("renders agent.auto_finish with Stop hook trigger badge", async () => {
+    installFetchMock([
+      entry({
+        id: 21,
+        action: "agent.auto_finish",
+        resourceType: "agent",
+        resourceId: "ag-stop",
+        diff: JSON.stringify({ trigger: "stop_hook" }),
+      }),
+    ]);
+
+    render(<AuditLog />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Auto-finished agent/i)).toBeTruthy();
+    });
+    expect(screen.getByText("Stop hook")).toBeTruthy();
+  });
+
+  it("renders agent.auto_finish with idle timeout trigger badge", async () => {
+    installFetchMock([
+      entry({
+        id: 22,
+        action: "agent.auto_finish",
+        resourceType: "agent",
+        resourceId: "ag-idle",
+        diff: JSON.stringify({ trigger: "idle_timeout" }),
+      }),
+    ]);
+
+    render(<AuditLog />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Auto-finished agent/i)).toBeTruthy();
+    });
+    expect(screen.getByText("idle timeout")).toBeTruthy();
+  });
+
+  it("renders agent.auto_finish with generic auto badge when diff is unparseable", async () => {
+    installFetchMock([
+      entry({
+        id: 23,
+        action: "agent.auto_finish",
+        resourceType: "agent",
+        resourceId: "ag-bad",
+        diff: "not-json",
+      }),
+    ]);
+
+    render(<AuditLog />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Auto-finished agent/i)).toBeTruthy();
+    });
+    expect(screen.getByText("auto")).toBeTruthy();
+  });
+
   it("renders config.auto_mode toggle entry", async () => {
     installFetchMock([
       entry({

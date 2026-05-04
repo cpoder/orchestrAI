@@ -118,6 +118,15 @@ function parseDiff(diff: string | null): Record<string, unknown> | null {
   }
 }
 
+function autoFinishTriggerLabel(diff: string | null): string {
+  const parsed = parseDiff(diff);
+  if (!parsed) return "auto";
+  const trigger = typeof parsed.trigger === "string" ? parsed.trigger : null;
+  if (trigger === "stop_hook") return "Stop hook";
+  if (trigger === "idle_timeout") return "idle timeout";
+  return "auto";
+}
+
 function DiffSummary({ diff, action }: { diff: string | null; action: string }) {
   const parsed = parseDiff(diff);
   if (!parsed) return null;
@@ -462,6 +471,11 @@ export function AuditLog() {
                       )}
                       {ACTION_LABELS[e.action] ?? e.action}
                     </span>
+                    {e.action === "agent.auto_finish" && (
+                      <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded border border-sky-700/50 bg-sky-900/30 text-sky-200 text-[10px] uppercase tracking-wide">
+                        {autoFinishTriggerLabel(e.diff)}
+                      </span>
+                    )}
                   </td>
                   <td className="px-3 py-2 text-xs text-gray-500 whitespace-nowrap">
                     <span className="text-gray-600">{e.resourceType}</span>
