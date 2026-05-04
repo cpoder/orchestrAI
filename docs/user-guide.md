@@ -20,6 +20,7 @@ server restarts.
 - [Git flow](#git-flow) — branch naming, diff review, merge, stale branch cleanup
 - [Cost tracking & budgets](#cost-tracking--budgets)
 - [CI integration](#ci-integration)
+- [Auto-mode](#auto-mode) — auto-advance, auto-merge, the status pill, and the disabled Parallel toggle
 - [Notifications](#notifications)
 - [Settings](#settings) — effort level, `--claude-dir`, port, webhook URL
 - [Audit log](#audit-log)
@@ -518,6 +519,56 @@ on the fix branch.
 CI is best-effort: missing `gh`, no `origin` remote, no workflows, or
 permission errors all silently degrade — the merge still succeeds,
 just without CI tracking.
+
+---
+
+## Auto-mode
+
+Two opt-in toggles on the plan header turn a plan from "click Start,
+click Finish, click Merge, click Start on the next task" into a
+hands-off pipeline.
+
+- **Auto-advance** — when one task completes, automatically start the
+  next ready task in the plan. One agent at a time.
+- **Auto-mode** — auto-advance **plus** auto-merge each task on
+  completion, wait for CI, and spawn a fix agent on failure (up to
+  `max_fix_attempts` times before pausing).
+
+Flip them per plan via the toggles on the plan header (or
+`PUT /api/plans/:name/config`).
+
+### The auto-mode pill
+
+When auto-mode is on, the plan header shows a small status pill that
+mirrors the loop's state:
+
+- `auto: idle` (green) — armed, no task in flight.
+- `auto: merging task N` (amber) — merging the completed task into
+  the source branch.
+- `auto: waiting on CI` (indigo) — polling `gh run list` for the
+  merged commit.
+- `auto: fixing CI (attempt N/cap)` (orange) — a fix agent is running
+  against the failing run.
+- `auto: paused — <reason>` (red) + **Resume** — the loop hit a
+  failure it can't recover from (`merge_conflict`,
+  `agent_left_uncommitted_work`, `budget_exceeded`, …). Click
+  **Resume** to clear the pause and re-evaluate from the last
+  completed task. The reason is persisted on the plan config so a
+  fresh page load still shows the paused pill.
+
+A third **Parallel** switch sits next to the Auto-advance / Auto-mode
+toggles but is currently disabled — see
+[Parallel auto-advance](#parallel-auto-advance) for why.
+
+### Parallel auto-advance
+
+Auto-advance is **sequential by default** — one task agent per plan
+at a time. Parallel mode would let independent sibling tasks run
+concurrently, but it requires worktree-per-agent isolation (each
+agent on its own checkout) to avoid interleaved diffs on a shared
+working tree. Until that lands, the parallel toggle on the plan
+board is disabled and any API attempt to set `parallel=true` is
+rejected with `412 worktrees_required`.
 
 ---
 
