@@ -1127,6 +1127,118 @@ pub async fn try_auto_advance(
         .unwrap_or_default()
     };
 
+    // Done-set, work_dir, and budget are needed for both the intra-phase
+    // and next-phase paths, so compute them up front. Budget check returns
+    // early if exhausted — same as pre-3.1 behaviour, just hoisted.
+    let done_set = {
+        let conn = registry.db.lock().unwrap();
+        completed_task_numbers(&conn, &plan_name)
+    };
+
+    let max_budget_usd = match remaining_budget(&registry.db, &plan_name) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+
+    let work_dir: PathBuf = {
+        let home = dirs::home_dir().unwrap();
+        plan.project
+            .as_ref()
+            .map(|p| home.join(p))
+            .unwrap_or_else(|| std::env::current_dir().unwrap())
+    };
+
+    // Intra-phase scan: are any tasks in the *current* phase newly ready
+    // (pending/failed with all deps satisfied)? If so, spawn them and
+    // broadcast `task_advanced` — no phase boundary crossed.
+    let intra_ready: Vec<&PlanTask> = current_phase
+        .tasks
+        .iter()
+        .filter(|t| {
+            let status = status_map
+                .get(&t.number)
+                .map(String::as_str)
+                .unwrap_or("pending");
+            (status == "pending" || status == "failed")
+                && t.dependencies.iter().all(|d| done_set.contains(d))
+        })
+        .collect();
+
+    if !intra_ready.is_empty() {
+        // Spawn loop — mirrors the next-phase loop below. Task 3.2 will
+        // extract both into a `spawn_ready_tasks` helper.
+        let mut spawned: Vec<String> = Vec::with_capacity(intra_ready.len());
+        for task in &intra_ready {
+            if !claim_task(&registry.db, &plan_name, &task.number) {
+                continue;
+            }
+
+            broadcast_event(
+                &registry.broadcast_tx,
+                "task_status_changed",
+                serde_json::json!({
+                    "plan_name": plan_name,
+                    "task_number": task.number,
+                    "status": "in_progress",
+                }),
+            );
+
+            let cross_ctx = build_cross_plan_context(&registry.db, &plans_dir, &plan, &task.number);
+            let mcp_available = registry.drivers.injects_mcp(None, port);
+            let prompt = build_task_prompt(
+                &plan,
+                current_phase,
+                task,
+                false,
+                port,
+                cross_ctx.as_deref(),
+                mcp_available,
+            );
+            let branch_name = format!("branchwork/{}/{}", plan_name, task.number);
+
+            pty_agent::start_pty_agent(
+                &registry,
+                pty_agent::StartPtyOpts {
+                    prompt,
+                    cwd: &work_dir,
+                    plan_name: Some(&plan_name),
+                    task_id: Some(&task.number),
+                    effort,
+                    branch: Some(&branch_name),
+                    is_continue: false,
+                    max_budget_usd,
+                    driver: None,
+                    user_id: None,
+                    org_id: None,
+                },
+            )
+            .await;
+
+            spawned.push(task.number.clone());
+        }
+
+        // `task_advanced` only fires if we actually spawned at least one
+        // task. If every `intra_ready` candidate lost the `claim_task`
+        // race (concurrent auto-advance trigger), stay quiet — the other
+        // trigger already broadcast.
+        if !spawned.is_empty() {
+            broadcast_event(
+                &registry.broadcast_tx,
+                "task_advanced",
+                serde_json::json!({
+                    "plan": plan_name,
+                    "from_task": completed_task_number,
+                    "to_tasks": spawned,
+                }),
+            );
+        }
+        return;
+    }
+
+    // No ready tasks in the current phase. Either the phase is fully done
+    // (every task completed/skipped) — fall through to the next-phase
+    // scan — or some tasks are still in_progress (stuck dep chain),
+    // in which case we wait for them to finish.
     let phase_done = current_phase.tasks.iter().all(|t| {
         matches!(
             status_map.get(&t.number).map(String::as_str),
@@ -1139,11 +1251,6 @@ pub async fn try_auto_advance(
 
     // Find the next sequentially-numbered phase that has at least one ready
     // task. Skip phases that are already fully done.
-    let done_set = {
-        let conn = registry.db.lock().unwrap();
-        completed_task_numbers(&conn, &plan_name)
-    };
-
     let next_phase = plan
         .phases
         .iter()
@@ -1161,21 +1268,6 @@ pub async fn try_auto_advance(
     let next_phase = match next_phase {
         Some(p) => p,
         None => return,
-    };
-
-    // Budget check — if exhausted, give up silently. The plan's already had
-    // its other agents killed by the budget enforcement in pty_agent.
-    let max_budget_usd = match remaining_budget(&registry.db, &plan_name) {
-        Ok(b) => b,
-        Err(_) => return,
-    };
-
-    let work_dir: PathBuf = {
-        let home = dirs::home_dir().unwrap();
-        plan.project
-            .as_ref()
-            .map(|p| home.join(p))
-            .unwrap_or_else(|| std::env::current_dir().unwrap())
     };
 
     let ready_tasks: Vec<&PlanTask> = next_phase
