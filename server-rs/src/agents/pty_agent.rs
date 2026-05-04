@@ -1005,15 +1005,29 @@ mod tests {
         );
     }
 
+    // The settings-file lifecycle tests below redirect `dirs::home_dir()` to
+    // a tempdir by overriding `$HOME`. That works on Unix because the dirs
+    // crate reads `$HOME`, but on Windows `dirs::home_dir()` calls
+    // `SHGetKnownFolderPath(FOLDERID_Profile)` which ignores env vars — the
+    // override has no effect, so the production deleter unlinks a path under
+    // the runner's real profile while the test plants and asserts on the
+    // tempdir path. Cross-platform coverage of the writer/deleter lives in
+    // `agents::session_settings::tests::*`, which take an explicit `home`
+    // argument. The tests below pin only the wiring (`on_agent_exit` calls
+    // `delete_for_agent`, `start_pty_agent` calls `write_for_agent`) — gating
+    // them off on Windows leaves no production behaviour unverified.
     /// Scope-restored override of `$HOME` so that `dirs::home_dir()` calls
     /// inside `on_agent_exit` resolve to a tempdir for the test's duration.
-    /// Other tests in this crate either don't read `$HOME` or fail open if
-    /// the resolved path doesn't contain the file they expect, so the
-    /// process-global write is acceptable here.
+    /// Tests that touch `$HOME` must acquire [`HOME_TEST_LOCK`] before
+    /// constructing one — cargo runs tests in a thread pool, and a second
+    /// `HomeOverride` racing the first would silently flip the env var out
+    /// from under the in-flight test.
+    #[cfg(not(windows))]
     struct HomeOverride {
         prev: Option<std::ffi::OsString>,
     }
 
+    #[cfg(not(windows))]
     impl HomeOverride {
         fn set(new_home: &Path) -> Self {
             let prev = std::env::var_os("HOME");
@@ -1027,6 +1041,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     impl Drop for HomeOverride {
         fn drop(&mut self) {
             // SAFETY: see `HomeOverride::set`.
@@ -1039,13 +1054,35 @@ mod tests {
         }
     }
 
+    /// Serialises `$HOME`-mutating tests in this module. `cargo test` runs
+    /// test fns concurrently across a thread pool; without this lock,
+    /// overlapping `HomeOverride` scopes would clobber each other. We use
+    /// `tokio::sync::Mutex` (not `std::sync::Mutex`) so it's safe to hold
+    /// the guard across `.await` points without tripping
+    /// `clippy::await_holding_lock`.
+    #[cfg(not(windows))]
+    static HOME_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Take the home-test lock. `tokio::sync::Mutex` has no poisoning
+    /// semantics, so a panicked predecessor releases the lock cleanly.
+    #[cfg(not(windows))]
+    async fn lock_home() -> tokio::sync::MutexGuard<'static, ()> {
+        HOME_TEST_LOCK.lock().await
+    }
+
     /// Settings-cleanup path: the supervisor wrote a per-session
     /// `~/.claude/sessions/<session_id>.settings.json` at spawn time, and
     /// `on_agent_exit` must remove it so a future spawn with the same
     /// session_id doesn't re-use stale config. Mirrors the side-effect
     /// assertion pattern from `on_agent_exit_marks_supervisor_unreachable_when_pidfile_present`.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn on_agent_exit_removes_per_session_settings_file() {
+        // Hold the home-test lock for the entire test: any concurrent
+        // test using `HomeOverride` would otherwise flip `$HOME` and
+        // misroute `dirs::home_dir()`.
+        let _home_lock = lock_home().await;
+
         let (db, dir) = fresh_db();
         let sockets_dir = dir.path().join("sockets");
         std::fs::create_dir_all(&sockets_dir).unwrap();
@@ -1088,6 +1125,224 @@ mod tests {
             !settings_path.exists(),
             "on_agent_exit should remove the per-session settings file at {}",
             settings_path.display()
+        );
+    }
+
+    /// Full lifecycle for a Claude-driver agent: `start_pty_agent` writes
+    /// the per-session settings file at the path the driver's argv will
+    /// reference via `--settings`, and `on_agent_exit` cleans it up.
+    ///
+    /// The session-daemon spawn fails fast because `server_exe` points at
+    /// a nonexistent path — but `start_pty_agent` inserts the agent row
+    /// (with `session_id`) and writes the settings file *before* the
+    /// supervisor spawn, which is exactly the side effect this test
+    /// asserts on. Same insert-then-fail pattern the recovery / auto-mode
+    /// integration tests rely on.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn start_pty_agent_writes_settings_and_on_agent_exit_cleans_up_for_claude() {
+        let _home_lock = lock_home().await;
+
+        let (db, dir) = fresh_db();
+        let sockets_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(&sockets_dir).unwrap();
+        let (registry, _rx) = test_registry(db.clone(), sockets_dir.clone());
+
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        // Override `$HOME` so the writer + deleter inside `start_pty_agent`
+        // / `on_agent_exit` both resolve to our tempdir.
+        let home = TempDir::new().unwrap();
+        let _home_guard = HomeOverride::set(home.path());
+
+        let agent_id = start_pty_agent(
+            &registry,
+            StartPtyOpts {
+                prompt: "do the work".to_string(),
+                cwd: &cwd,
+                plan_name: None,
+                task_id: None,
+                effort: Effort::Medium,
+                branch: None,
+                is_continue: false,
+                max_budget_usd: None,
+                driver: Some("claude"),
+                user_id: None,
+                org_id: None,
+            },
+        )
+        .await;
+
+        // Pull the session_id the spawn path generated so we can compute
+        // the settings-file path the driver's argv will point at.
+        let session_id: String = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT session_id FROM agents WHERE id = ?1",
+                params![agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("session_id is recorded on the agents row")
+        };
+
+        // Settings file exists at the path session_settings::path_for
+        // computes (home/.claude/sessions/<session_id>.settings.json).
+        let settings_path = home
+            .path()
+            .join(".claude")
+            .join("sessions")
+            .join(format!("{session_id}.settings.json"));
+        assert!(
+            settings_path.exists(),
+            "start_pty_agent should write the per-session settings file at {}",
+            settings_path.display()
+        );
+
+        // File contents: top-level `hooks.Stop` array with at least one
+        // entry whose curl command embeds the session_id (so the receiver
+        // can route the hook back to this agent).
+        let raw = std::fs::read_to_string(&settings_path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let stop_arr = json["hooks"]["Stop"]
+            .as_array()
+            .expect("hooks.Stop is an array");
+        assert!(!stop_arr.is_empty(), "hooks.Stop is non-empty");
+        let cmd = stop_arr[0]["hooks"][0]["command"]
+            .as_str()
+            .expect("Stop[0].hooks[0].command is a string");
+        assert!(
+            cmd.contains(&session_id),
+            "stop hook command must embed session_id: {cmd}"
+        );
+
+        // Argv check: re-invoke the same driver.spawn_args the spawn path
+        // built (settings_path = the file we just verified) and confirm
+        // the resulting argv carries `--settings <path>`. This pins the
+        // T1.4 wiring — start_pty_agent passes the written path through
+        // to driver.spawn_args.
+        let driver_arc = registry.drivers.get("claude").unwrap();
+        let argv = driver_arc.spawn_args(&SpawnOpts {
+            session_id: &session_id,
+            cwd: &cwd,
+            effort: Effort::Medium,
+            max_budget_usd: None,
+            mcp_config_path: None,
+            settings_path: Some(&settings_path),
+            skip_permissions: registry
+                .skip_permissions
+                .load(std::sync::atomic::Ordering::Relaxed),
+        });
+        let i = argv
+            .iter()
+            .position(|a| a == "--settings")
+            .unwrap_or_else(|| panic!("--settings not in claude argv: {argv:?}"));
+        assert_eq!(
+            argv.get(i + 1).map(String::as_str),
+            Some(settings_path.to_string_lossy().as_ref()),
+            "--settings should be followed by the written settings path: {argv:?}"
+        );
+
+        // Lifecycle close-out: on_agent_exit removes the file. Status was
+        // 'failed' (spawn never reached 'running'), so the cleanup block
+        // is what we're really testing — it runs regardless of the
+        // running→completed flip.
+        on_agent_exit(&registry, &agent_id).await;
+        assert!(
+            !settings_path.exists(),
+            "on_agent_exit should remove the per-session settings file at {}",
+            settings_path.display()
+        );
+    }
+
+    /// Aider negative path: drivers without a `stop_hook_config` write no
+    /// settings file at spawn time, no `--settings` flag is appended, and
+    /// `on_agent_exit` runs cleanly even though there's nothing to delete
+    /// (the deleter treats NotFound as Ok).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn start_pty_agent_writes_no_settings_file_for_aider() {
+        let _home_lock = lock_home().await;
+
+        let (db, dir) = fresh_db();
+        let sockets_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(&sockets_dir).unwrap();
+        let (registry, _rx) = test_registry(db.clone(), sockets_dir.clone());
+
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let home = TempDir::new().unwrap();
+        let _home_guard = HomeOverride::set(home.path());
+
+        let agent_id = start_pty_agent(
+            &registry,
+            StartPtyOpts {
+                prompt: "do the work".to_string(),
+                cwd: &cwd,
+                plan_name: None,
+                task_id: None,
+                effort: Effort::Medium,
+                branch: None,
+                is_continue: false,
+                max_budget_usd: None,
+                driver: Some("aider"),
+                user_id: None,
+                org_id: None,
+            },
+        )
+        .await;
+
+        let session_id: String = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT session_id FROM agents WHERE id = ?1",
+                params![agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("session_id is recorded on the agents row")
+        };
+
+        // No settings file at the path Claude would have written — the
+        // sessions dir itself need not even exist (write_for_agent
+        // returns early before mkdir).
+        let settings_path = home
+            .path()
+            .join(".claude")
+            .join("sessions")
+            .join(format!("{session_id}.settings.json"));
+        assert!(
+            !settings_path.exists(),
+            "Aider must not write a settings file (got {})",
+            settings_path.display()
+        );
+
+        // Argv check: aider's spawn_args ignores settings_path entirely,
+        // so the resulting argv carries no --settings flag (even when
+        // we artificially pass Some).
+        let driver_arc = registry.drivers.get("aider").unwrap();
+        let stub_path = home.path().join("never-written.settings.json");
+        let argv = driver_arc.spawn_args(&SpawnOpts {
+            session_id: &session_id,
+            cwd: &cwd,
+            effort: Effort::Medium,
+            max_budget_usd: None,
+            mcp_config_path: None,
+            settings_path: Some(&stub_path),
+            skip_permissions: false,
+        });
+        assert!(
+            !argv.iter().any(|a| a == "--settings"),
+            "aider argv must not include --settings: {argv:?}"
+        );
+
+        // on_agent_exit on a row that never had a settings file written:
+        // the deleter sees NotFound and returns Ok, the function does not
+        // panic, and the path stays absent.
+        on_agent_exit(&registry, &agent_id).await;
+        assert!(
+            !settings_path.exists(),
+            "settings file must still not exist after on_agent_exit"
         );
     }
 
