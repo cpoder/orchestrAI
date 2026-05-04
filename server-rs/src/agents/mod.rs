@@ -1943,4 +1943,479 @@ mod tests {
     // `git_default_branch` / `git_list_branches` tests live alongside the
     // implementations in `crate::git_helpers` — they moved out with the
     // helpers when the leaf module was carved out for the runner binary.
+
+    // ── try_auto_advance tests (Task 3.4) ─────────────────────────────
+    //
+    // Pin the post-3.1/3.2 contract: `try_auto_advance` scans the
+    // current phase first (intra-phase advance) and only crosses a
+    // phase boundary when the current phase is fully done.
+    //
+    // We let `start_pty_agent` run end-to-end through `test_registry`:
+    // the supervisor spawn fails fast (server_exe is /nonexistent),
+    // but the `agents` row is INSERTed before that point — same
+    // insert-then-fail pattern the recovery / Phase 1 integration
+    // tests rely on. Each spawn writes a per-session
+    // `~/.claude/sessions/<session_id>.settings.json` (claude is the
+    // test_registry default driver) which we clean up via
+    // `SettingsCleanup`'s Drop guard so test runs don't accumulate
+    // stale files in the developer's $HOME.
+
+    /// Insert (or upsert) a `task_status` row to a fixed status.
+    /// Bypasses `claim_task`'s `IN ('pending','failed')` gate so a
+    /// test can pre-stage states the loop normally arrives at via
+    /// spawn (in_progress, completed).
+    fn set_task_status(db: &Db, plan_name: &str, task_number: &str, status: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO task_status (plan_name, task_number, status, updated_at) \
+             VALUES (?1, ?2, ?3, datetime('now')) \
+             ON CONFLICT(plan_name, task_number) DO UPDATE SET \
+                status = excluded.status, updated_at = excluded.updated_at",
+            params![plan_name, task_number, status],
+        )
+        .unwrap();
+    }
+
+    fn enable_auto_mode(db: &Db, plan_name: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO plan_auto_mode (plan_name, enabled, paused_reason, paused_at) \
+             VALUES (?1, 1, NULL, NULL)",
+            params![plan_name],
+        )
+        .unwrap();
+    }
+
+    fn enable_auto_advance(db: &Db, plan_name: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO plan_auto_advance (plan_name, enabled) VALUES (?1, 1)",
+            params![plan_name],
+        )
+        .unwrap();
+    }
+
+    /// Distinct `task_id` values currently on `agents` rows for
+    /// `plan_name`. Each successful spawn through `start_pty_agent`
+    /// inserts one row, so this is the captured "invocation list" for
+    /// `spawn_ready_tasks`.
+    fn agent_task_ids(db: &Db, plan_name: &str) -> std::collections::HashSet<String> {
+        let conn = db.lock().unwrap();
+        conn.prepare(
+            "SELECT task_id FROM agents \
+             WHERE plan_name = ?1 AND task_id IS NOT NULL",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(params![plan_name], |row| row.get::<_, String>(0))?
+                .collect::<Result<std::collections::HashSet<_>, _>>()
+        })
+        .unwrap_or_default()
+    }
+
+    /// `try_auto_advance` calls `start_pty_agent`, which writes a
+    /// per-session `~/.claude/sessions/<session_id>.settings.json` for
+    /// the claude driver. The supervisor spawn then fails (server_exe
+    /// is /nonexistent), so `on_agent_exit` never fires to clean up.
+    /// This Drop covers the leak so test runs don't accumulate stale
+    /// settings files in the developer's $HOME.
+    struct SettingsCleanup {
+        db: Db,
+        plan_name: String,
+    }
+
+    impl Drop for SettingsCleanup {
+        fn drop(&mut self) {
+            let Some(home) = dirs::home_dir() else {
+                return;
+            };
+            let session_ids: Vec<String> = {
+                let Ok(conn) = self.db.lock() else { return };
+                conn.prepare(
+                    "SELECT session_id FROM agents \
+                     WHERE plan_name = ?1 AND session_id IS NOT NULL",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map(params![&self.plan_name], |row| row.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap_or_default()
+            };
+            for sid in session_ids {
+                let _ = session_settings::delete_for_agent_with_home(&home, &sid);
+            }
+        }
+    }
+
+    /// Write a YAML plan whose `project` field resolves (via
+    /// `dirs::home_dir().join(...)` inside `try_auto_advance`) to a
+    /// path that is NOT a real git working tree —
+    /// `git_checkout_branch` inside `start_pty_agent` then fails
+    /// harmlessly instead of polluting the test runner's repo.
+    fn write_advance_plan(plans_dir: &Path, plan_name: &str, phases_yaml: &str) {
+        let path = plans_dir.join(format!("{plan_name}.yaml"));
+        let yaml = format!(
+            "title: \"{plan_name} title\"\n\
+             project: branchwork-no-such-dir-{plan_name}\n\
+             phases:\n{phases_yaml}"
+        );
+        std::fs::write(path, yaml).unwrap();
+    }
+
+    fn has_task_advanced(events: &[String], plan_name: &str) -> bool {
+        events.iter().any(|e| {
+            e.contains("\"type\":\"task_advanced\"")
+                && e.contains(&format!("\"plan\":\"{plan_name}\""))
+        })
+    }
+
+    fn has_phase_advanced(events: &[String], plan_name: &str) -> bool {
+        events.iter().any(|e| {
+            e.contains("\"type\":\"phase_advanced\"")
+                && e.contains(&format!("\"plan_name\":\"{plan_name}\""))
+        })
+    }
+
+    /// Acceptance-criteria spec: a 5-task linear chain (a→b→c→d→e)
+    /// advances exactly one task per `try_auto_advance` invocation.
+    /// Pre-stage `a=completed`; each tick must spawn exactly the next
+    /// link, broadcast `task_advanced`, and never `phase_advanced`.
+    #[tokio::test]
+    async fn linear_intra_phase_chain_completes_one_task_per_completion() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        let plan = "lin-chain";
+        write_advance_plan(
+            &plans_dir,
+            plan,
+            "  - number: 1\n\
+             \x20   title: P1\n\
+             \x20   tasks:\n\
+             \x20     - number: \"a\"\n\
+             \x20       title: A\n\
+             \x20     - number: \"b\"\n\
+             \x20       title: B\n\
+             \x20       dependencies: [\"a\"]\n\
+             \x20     - number: \"c\"\n\
+             \x20       title: C\n\
+             \x20       dependencies: [\"b\"]\n\
+             \x20     - number: \"d\"\n\
+             \x20       title: D\n\
+             \x20       dependencies: [\"c\"]\n\
+             \x20     - number: \"e\"\n\
+             \x20       title: E\n\
+             \x20       dependencies: [\"d\"]\n",
+        );
+        enable_auto_mode(&db, plan);
+
+        let _cleanup = SettingsCleanup {
+            db: db.clone(),
+            plan_name: plan.to_string(),
+        };
+
+        // a was completed externally; the loop must spawn exactly b on
+        // the next tick, then c, d, e — one new spawn per completion.
+        set_task_status(&db, plan, "a", "completed");
+
+        let chain = [("a", "b"), ("b", "c"), ("c", "d"), ("d", "e")];
+        let mut expected: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut prior_total = 0usize;
+
+        for (from, to) in chain {
+            let _ = drain_events(&mut rx);
+            try_auto_advance(
+                registry.clone(),
+                plans_dir.clone(),
+                plan.to_string(),
+                from.to_string(),
+                Effort::Medium,
+                registry.port,
+            )
+            .await;
+
+            expected.insert(to.to_string());
+            let actual = agent_task_ids(&db, plan);
+            assert_eq!(
+                actual, expected,
+                "after completing {from}, agents rows should be {expected:?}, got {actual:?}",
+            );
+            let total = actual.len();
+            let delta = total - prior_total;
+            assert_eq!(
+                delta, 1,
+                "exactly one new spawn at {from}->{to} (delta {delta})",
+            );
+            prior_total = total;
+
+            let events = drain_events(&mut rx);
+            assert!(
+                has_task_advanced(&events, plan),
+                "expected task_advanced after {from}->{to}, events: {events:?}",
+            );
+            assert!(
+                !has_phase_advanced(&events, plan),
+                "phase_advanced should not fire intra-phase ({from}->{to}): {events:?}",
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.contains(&format!("\"to_tasks\":[\"{to}\"]"))),
+                "task_advanced payload should list {to:?}: {events:?}",
+            );
+
+            // Mark `to` completed so the next tick treats it as done.
+            set_task_status(&db, plan, to, "completed");
+        }
+    }
+
+    /// Eligibility filter: when `b` completes but `e` still has an
+    /// in-progress blocker (`d`), the intra-phase scan must not spawn
+    /// `e`. Once `d` completes too, the next tick spawns `e` and only
+    /// `e`. (Fan-out where multiple siblings become ready at the same
+    /// tick is covered by Phase 3.5 — kept out of this test.)
+    #[tokio::test]
+    async fn mixed_deps_within_phase_only_spawns_when_blockers_done() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        let plan = "mixed-deps";
+        // Deps: a -> b; c -> d; e depends on {b, d}.
+        write_advance_plan(
+            &plans_dir,
+            plan,
+            "  - number: 1\n\
+             \x20   title: P1\n\
+             \x20   tasks:\n\
+             \x20     - number: \"a\"\n\
+             \x20       title: A\n\
+             \x20     - number: \"b\"\n\
+             \x20       title: B\n\
+             \x20       dependencies: [\"a\"]\n\
+             \x20     - number: \"c\"\n\
+             \x20       title: C\n\
+             \x20     - number: \"d\"\n\
+             \x20       title: D\n\
+             \x20       dependencies: [\"c\"]\n\
+             \x20     - number: \"e\"\n\
+             \x20       title: E\n\
+             \x20       dependencies: [\"b\", \"d\"]\n",
+        );
+        enable_auto_mode(&db, plan);
+
+        let _cleanup = SettingsCleanup {
+            db: db.clone(),
+            plan_name: plan.to_string(),
+        };
+
+        // Pre-stage so the first try_auto_advance call has nothing
+        // ready (a/b/c done, d in_progress, e blocked on d). a/c must
+        // be past pending so they aren't candidates either — net spawn
+        // count = 0 on the b-completion tick.
+        set_task_status(&db, plan, "a", "completed");
+        set_task_status(&db, plan, "b", "completed");
+        set_task_status(&db, plan, "c", "completed");
+        set_task_status(&db, plan, "d", "in_progress");
+
+        let _ = drain_events(&mut rx);
+        try_auto_advance(
+            registry.clone(),
+            plans_dir.clone(),
+            plan.to_string(),
+            "b".to_string(),
+            Effort::Medium,
+            registry.port,
+        )
+        .await;
+
+        assert!(
+            agent_task_ids(&db, plan).is_empty(),
+            "no spawn expected — e is still blocked on d (in_progress)",
+        );
+        let events = drain_events(&mut rx);
+        assert!(
+            !has_task_advanced(&events, plan),
+            "task_advanced must not fire when nothing was spawned: {events:?}",
+        );
+        assert!(
+            !has_phase_advanced(&events, plan),
+            "phase_advanced must not fire (phase still has in_progress + pending tasks): {events:?}",
+        );
+
+        // d completes → e becomes ready.
+        set_task_status(&db, plan, "d", "completed");
+        let _ = drain_events(&mut rx);
+        try_auto_advance(
+            registry.clone(),
+            plans_dir.clone(),
+            plan.to_string(),
+            "d".to_string(),
+            Effort::Medium,
+            registry.port,
+        )
+        .await;
+
+        let actual = agent_task_ids(&db, plan);
+        let expected: std::collections::HashSet<String> = ["e".to_string()].into_iter().collect();
+        assert_eq!(
+            actual, expected,
+            "e should spawn once both b and d are done, got {actual:?}",
+        );
+        let events = drain_events(&mut rx);
+        assert!(
+            has_task_advanced(&events, plan),
+            "task_advanced expected for e: {events:?}",
+        );
+        assert!(
+            events.iter().any(|e| e.contains("\"to_tasks\":[\"e\"]")),
+            "task_advanced payload should list e: {events:?}",
+        );
+        assert!(
+            !has_phase_advanced(&events, plan),
+            "phase_advanced should not fire intra-phase: {events:?}",
+        );
+    }
+
+    /// Phase boundary still uses the next-phase path: with phase 1
+    /// fully done, the tick spawns 2.1 and broadcasts
+    /// `phase_advanced`. `task_advanced` must NOT fire on this path —
+    /// the two events are mutually exclusive per ADR 0003 §3.
+    #[tokio::test]
+    async fn phase_boundary_still_fires_phase_advanced() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        let plan = "phase-boundary";
+        write_advance_plan(
+            &plans_dir,
+            plan,
+            "  - number: 1\n\
+             \x20   title: P1\n\
+             \x20   tasks:\n\
+             \x20     - number: \"1.1\"\n\
+             \x20       title: One-One\n\
+             \x20     - number: \"1.2\"\n\
+             \x20       title: One-Two\n\
+             \x20       dependencies: [\"1.1\"]\n\
+             \x20 - number: 2\n\
+             \x20   title: P2\n\
+             \x20   tasks:\n\
+             \x20     - number: \"2.1\"\n\
+             \x20       title: Two-One\n\
+             \x20     - number: \"2.2\"\n\
+             \x20       title: Two-Two\n\
+             \x20       dependencies: [\"2.1\"]\n",
+        );
+        enable_auto_mode(&db, plan);
+
+        let _cleanup = SettingsCleanup {
+            db: db.clone(),
+            plan_name: plan.to_string(),
+        };
+
+        // Phase 1 fully done: 1.1 + 1.2 completed.
+        set_task_status(&db, plan, "1.1", "completed");
+        set_task_status(&db, plan, "1.2", "completed");
+
+        let _ = drain_events(&mut rx);
+        try_auto_advance(
+            registry.clone(),
+            plans_dir.clone(),
+            plan.to_string(),
+            "1.2".to_string(),
+            Effort::Medium,
+            registry.port,
+        )
+        .await;
+
+        // 2.1 spawns (no deps); 2.2 stays blocked on 2.1.
+        let actual = agent_task_ids(&db, plan);
+        let expected: std::collections::HashSet<String> = ["2.1".to_string()].into_iter().collect();
+        assert_eq!(
+            actual, expected,
+            "phase boundary should spawn 2.1 only (2.2 still blocked on 2.1), got {actual:?}",
+        );
+
+        let events = drain_events(&mut rx);
+        assert!(
+            has_phase_advanced(&events, plan),
+            "phase_advanced expected on phase boundary: {events:?}",
+        );
+        assert!(
+            !has_task_advanced(&events, plan),
+            "task_advanced must not fire on the phase-boundary path: {events:?}",
+        );
+    }
+
+    /// Two-opt-in independence (non-negotiable #10): with
+    /// `plan_auto_advance.enabled=1` and no `plan_auto_mode` row,
+    /// intra-phase advance must still fire. Pins that the gate at the
+    /// top of `try_auto_advance` is OR, not AND, of the two opt-ins.
+    #[tokio::test]
+    async fn auto_advance_only_no_auto_mode_still_advances_intra_phase() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        let plan = "advance-only";
+        write_advance_plan(
+            &plans_dir,
+            plan,
+            "  - number: 1\n\
+             \x20   title: P1\n\
+             \x20   tasks:\n\
+             \x20     - number: \"a\"\n\
+             \x20       title: A\n\
+             \x20     - number: \"b\"\n\
+             \x20       title: B\n\
+             \x20       dependencies: [\"a\"]\n",
+        );
+        // Critical: enable plan_auto_advance only — no plan_auto_mode
+        // row. The two opt-ins must remain independent.
+        enable_auto_advance(&db, plan);
+        assert!(
+            auto_advance_enabled(&db, plan),
+            "auto_advance should be on for this test",
+        );
+        assert!(
+            !crate::db::auto_mode_enabled(&db, plan),
+            "auto_mode must NOT be enabled for this test",
+        );
+
+        let _cleanup = SettingsCleanup {
+            db: db.clone(),
+            plan_name: plan.to_string(),
+        };
+
+        set_task_status(&db, plan, "a", "completed");
+
+        let _ = drain_events(&mut rx);
+        try_auto_advance(
+            registry.clone(),
+            plans_dir.clone(),
+            plan.to_string(),
+            "a".to_string(),
+            Effort::Medium,
+            registry.port,
+        )
+        .await;
+
+        let actual = agent_task_ids(&db, plan);
+        let expected: std::collections::HashSet<String> = ["b".to_string()].into_iter().collect();
+        assert_eq!(
+            actual, expected,
+            "auto_advance alone should spawn b after a completes, got {actual:?}",
+        );
+        let events = drain_events(&mut rx);
+        assert!(
+            has_task_advanced(&events, plan),
+            "task_advanced expected with auto_advance-only opt-in: {events:?}",
+        );
+    }
 }
