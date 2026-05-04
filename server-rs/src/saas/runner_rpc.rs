@@ -295,8 +295,11 @@ mod tests {
         );
     }
 
+    /// Branch 1 of Task 5.1: happy path. Helper sends, the in-test reader
+    /// pulls the envelope off `command_tx`, hands it to the `respond` closure
+    /// which resolves the matching pending entry — helper returns the entries.
     #[tokio::test]
-    async fn success_path_returns_entries() {
+    async fn runner_request_happy_path_returns_entries() {
         let db = db_with_online_runner("runner-1", "org-1");
         let registry = new_runner_registry();
 
@@ -326,8 +329,11 @@ mod tests {
         }
     }
 
+    /// Branch 2 of Task 5.1: helper sends but no response is injected, so the
+    /// receiver parks until the configured timeout fires. 100ms is the spec'd
+    /// budget — well under the "in well under a second" acceptance bar.
     #[tokio::test]
-    async fn timeout_path_returns_timeout() {
+    async fn runner_request_timeout_returns_timeout_error() {
         let db = db_with_online_runner("runner-1", "org-1");
         let registry = new_runner_registry();
         // Install a runner that never replies.
@@ -336,14 +342,20 @@ mod tests {
         let req = WireMessage::ListFolders {
             req_id: "req-timeout".into(),
         };
+        let started = std::time::Instant::now();
         let result =
-            runner_request_with_registry(&db, &registry, "org-1", req, Duration::from_millis(50))
+            runner_request_with_registry(&db, &registry, "org-1", req, Duration::from_millis(100))
                 .await;
+        let elapsed = started.elapsed();
         assert!(matches!(result, Err(RunnerRpcError::Timeout)));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "timeout test took {elapsed:?}, should be well under 1s"
+        );
     }
 
     #[tokio::test]
-    async fn no_runner_path_returns_no_connected_runner() {
+    async fn runner_request_no_runner_returns_no_connected_runner() {
         let db = empty_db();
         let registry = new_runner_registry();
 
@@ -357,7 +369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn db_has_runner_but_registry_is_empty_returns_no_connected_runner() {
+    async fn runner_request_stale_db_row_returns_no_connected_runner() {
         // DB says runner is online, but in-memory registry has nothing.
         // (This is the post-server-restart state for SaaS deployments.)
         let db = db_with_online_runner("runner-1", "org-1");
@@ -373,7 +385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_request_without_req_id() {
+    async fn runner_request_without_req_id_returns_invalid_request() {
         let db = db_with_online_runner("runner-1", "org-1");
         let registry = new_runner_registry();
         install_echo_runner(&registry, "runner-1", |_msg| None).await;
@@ -385,8 +397,13 @@ mod tests {
         assert!(matches!(result, Err(RunnerRpcError::InvalidRequest)));
     }
 
+    /// Branch 3 of Task 5.1: a request is parked on the oneshot when the
+    /// runner's pending map is cleared (simulating the cleanup the WS reader
+    /// runs on disconnect). The receiver wakes immediately with `Closed`,
+    /// which the helper maps to `RunnerDisconnected` — well before the 30s
+    /// timeout we configure.
     #[tokio::test]
-    async fn runner_disconnect_mid_call_does_not_deadlock() {
+    async fn runner_request_disconnect_returns_runner_disconnected() {
         let db = db_with_online_runner("runner-1", "org-1");
         let registry = new_runner_registry();
         install_echo_runner(&registry, "runner-1", |_msg| None).await;
@@ -432,11 +449,12 @@ mod tests {
     /// `runner_request` is in flight wakes the awaiting receiver via the
     /// `pending`-map drain in the `handle_runner_ws` cleanup block.
     ///
-    /// The previous test (`runner_disconnect_mid_call_does_not_deadlock`)
-    /// simulates the cleanup by hand. This one exercises the production
-    /// cleanup code path end-to-end.
+    /// The previous test
+    /// (`runner_request_disconnect_returns_runner_disconnected`) simulates
+    /// the cleanup by hand. This one exercises the production cleanup code
+    /// path end-to-end.
     #[tokio::test]
-    async fn real_ws_disconnect_drains_pending_senders_and_wakes_receivers() {
+    async fn runner_request_real_ws_disconnect_wakes_receivers() {
         use futures_util::SinkExt;
         use std::path::PathBuf;
         use tokio_tungstenite::tungstenite::Message;
