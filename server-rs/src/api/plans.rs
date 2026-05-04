@@ -2247,9 +2247,51 @@ pub struct DeletePlanQuery {
 }
 
 /// Tables keyed by `plan_name` that the DELETE handler cascades.
-/// Audited out of the schema in `db.rs::migrate` (see plan-deletion 0.0).
-/// `agents` is intentionally absent — completed/killed rows have audit
-/// value, so the row is preserved with its dangling `plan_name`.
+///
+/// **Audit convention (plan-deletion 0.0)** — when adding a new schema
+/// in `db.rs::migrate`, classify it here so the cascade keeps up. The
+/// `cascade_audit_tests::cascade_set_matches_schema` unit test sweeps
+/// the live SQLite schema for every column literally named `plan_name`
+/// and fails the build if it finds a table that is not classified
+/// below. Any time it fires, pick the right bucket and add the table:
+///
+/// | table                | plan_name shape          | verdict   |
+/// |----------------------|--------------------------|-----------|
+/// | task_status          | NOT NULL, PK part        | cascade   |
+/// | ci_runs              | NOT NULL                 | cascade   |
+/// | plan_auto_mode       | PRIMARY KEY              | cascade   |
+/// | plan_auto_advance    | PRIMARY KEY              | cascade   |
+/// | task_fix_attempts    | NOT NULL, PK part        | cascade   |
+/// | plan_project         | PRIMARY KEY              | cascade   |
+/// | plan_verdicts        | PRIMARY KEY              | cascade   |
+/// | plan_budget          | PRIMARY KEY              | cascade   |
+/// | task_learnings       | NOT NULL                 | cascade   |
+/// | plan_org             | PRIMARY KEY              | cascade   |
+/// | agents               | nullable (no FK)         | preserve  |
+///
+/// **Cascade**: the row is meaningless once the plan is gone (status,
+/// CI runs, auto-mode toggles, fix-attempt log, project mapping,
+/// per-plan settings, learnings, org ownership). All of these are
+/// wiped inside the same transaction in step 6 of `delete_plan`.
+///
+/// **Preserve** (`agents`): completed/killed agent rows stay so the
+/// dashboard can still render their terminal output, diff, branch and
+/// stop-reason after the plan is gone. The row's `plan_name` becomes a
+/// dangling pointer; `task_status` re-reads the live `plan_name` via
+/// `LEFT JOIN`-style queries that tolerate the orphan.
+///
+/// **Edge cases worth calling out**:
+///
+/// - `audit_logs.resource_id`: holds the plan name when
+///   `resource_type='plan'` (and the agent id when `'agent'`). NOT
+///   touched — the historical audit trail is the load-bearing record
+///   the Activity tab + Undo affordance read from.
+/// - `task_fix_attempts.outcome IS NULL`: load-bearing for the
+///   `auto_mode_in_flight` gate in step 3 of `delete_plan`. Open
+///   attempts block the cascade with a 409 instead of being wiped.
+/// - `plan_snapshots` (lands in 0.3): will hold the full pre-cascade
+///   blob for Undo. The cascade itself does NOT delete snapshot rows;
+///   the retention purge job (0.5) is what eventually frees them.
 const PLAN_CASCADE_TABLES: &[&str] = &[
     "task_status",
     "ci_runs",
@@ -2262,6 +2304,15 @@ const PLAN_CASCADE_TABLES: &[&str] = &[
     "task_learnings",
     "plan_org",
 ];
+
+/// Tables that contain a `plan_name` column but are intentionally NOT
+/// cascaded by `delete_plan`. Kept as a separate constant so the
+/// `cascade_set_matches_schema` audit test can prove the union of
+/// cascade + preserve covers every `plan_name`-bearing table in the
+/// live schema. New entries here MUST also be documented in the
+/// `PLAN_CASCADE_TABLES` doc-comment table above.
+#[allow(dead_code)] // Consumed only by `cascade_audit_tests`; exists to make the audit explicit.
+const PLAN_NAME_PRESERVED_TABLES: &[&str] = &["agents"];
 
 pub async fn delete_plan(
     State(state): State<AppState>,
@@ -3377,5 +3428,187 @@ mod check_prompt_tests {
         );
         assert!(prompt.contains("Done tasks: (none)"));
         assert!(prompt.contains("Pending tasks: (none)"));
+    }
+}
+
+#[cfg(test)]
+mod cascade_audit_tests {
+    //! Plan-deletion 0.0 audit. The schema-introspection test is the
+    //! load-bearing canary: when someone adds a new `CREATE TABLE`
+    //! with a `plan_name` column to `db.rs`, this test fails with the
+    //! offending table name and forces them to either (a) add it to
+    //! `PLAN_CASCADE_TABLES` (and the doc-comment table above), or
+    //! (b) add it to `PLAN_NAME_PRESERVED_TABLES` with a written
+    //! reason. The second test proves the cascade SQL actually empties
+    //! every cascaded table while leaving preserved rows intact.
+    use super::*;
+    use rusqlite::params;
+    use tempfile::TempDir;
+
+    fn migrated_db() -> (crate::db::Db, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.db");
+        (crate::db::init(&path), dir)
+    }
+
+    /// Tables in the live SQLite schema that have a column literally
+    /// named `plan_name`. Uses `pragma_table_info` so the result tracks
+    /// the schema as it actually exists at runtime, not as it appeared
+    /// when this test was written.
+    fn tables_with_plan_name_column(conn: &rusqlite::Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.name \
+                   FROM sqlite_master m \
+                  WHERE m.type = 'table' \
+                    AND EXISTS ( \
+                        SELECT 1 FROM pragma_table_info(m.name) \
+                         WHERE name = 'plan_name' \
+                    ) \
+                  ORDER BY m.name",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn cascade_set_matches_schema() {
+        let (db, _dir) = migrated_db();
+        let conn = db.lock().unwrap();
+        let live: std::collections::BTreeSet<String> =
+            tables_with_plan_name_column(&conn).into_iter().collect();
+
+        let mut classified: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for t in PLAN_CASCADE_TABLES.iter().chain(PLAN_NAME_PRESERVED_TABLES) {
+            classified.insert((*t).to_string());
+        }
+
+        let unclassified: Vec<&String> = live.difference(&classified).collect();
+        let phantom: Vec<&String> = classified.difference(&live).collect();
+
+        assert!(
+            unclassified.is_empty(),
+            "db.rs has plan_name-keyed table(s) the cascade does not classify: \
+             {unclassified:?}. Add each to PLAN_CASCADE_TABLES (and the doc \
+             table above delete_plan) or to PLAN_NAME_PRESERVED_TABLES with \
+             a one-line reason."
+        );
+        assert!(
+            phantom.is_empty(),
+            "PLAN_CASCADE_TABLES / PLAN_NAME_PRESERVED_TABLES list table(s) \
+             that no longer exist in the schema: {phantom:?}. Drop them from \
+             the constant or restore the CREATE TABLE."
+        );
+    }
+
+    #[test]
+    fn cascade_loop_empties_every_cascaded_table_and_preserves_agents() {
+        let (db, _dir) = migrated_db();
+        let plan = "audit-test-plan";
+
+        // Seed one row per cascaded table.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO task_status (plan_name, task_number, status) \
+                 VALUES (?1, '1.1', 'completed')",
+                params![plan],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO ci_runs (plan_name, task_number, status) \
+                 VALUES (?1, '1.1', 'success')",
+                params![plan],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_mode (plan_name, enabled) VALUES (?1, 1)",
+                params![plan],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_advance (plan_name, enabled) VALUES (?1, 1)",
+                params![plan],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_fix_attempts (plan_name, task_number, attempt, outcome) \
+                 VALUES (?1, '1.1', 1, 'success')",
+                params![plan],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO plan_project (plan_name, project) VALUES (?1, 'proj')",
+                params![plan],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO plan_verdicts (plan_name, verdict) VALUES (?1, 'ok')",
+                params![plan],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO plan_budget (plan_name, max_budget_usd) VALUES (?1, 1.0)",
+                params![plan],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_learnings (plan_name, task_number, learning) \
+                 VALUES (?1, '1.1', 'noted')",
+                params![plan],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO plan_org (plan_name, org_id) \
+                 VALUES (?1, 'default-org')",
+                params![plan],
+            )
+            .unwrap();
+            // Preserved: a completed agent row that must survive the cascade.
+            conn.execute(
+                "INSERT INTO agents (id, cwd, status, plan_name, task_id) \
+                 VALUES ('agent-audit', '/tmp', 'completed', ?1, '1.1')",
+                params![plan],
+            )
+            .unwrap();
+        }
+
+        // Run the same cascade loop the handler runs in step 6 of
+        // delete_plan. Failure on any DELETE fails the test loudly.
+        {
+            let mut conn = db.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            for table in PLAN_CASCADE_TABLES {
+                let sql = format!("DELETE FROM {table} WHERE plan_name = ?1");
+                tx.execute(&sql, params![plan])
+                    .unwrap_or_else(|e| panic!("cascade DELETE on {table} failed: {e}"));
+            }
+            tx.commit().unwrap();
+        }
+
+        // Every cascaded table must be empty for this plan.
+        let conn = db.lock().unwrap();
+        for table in PLAN_CASCADE_TABLES {
+            let sql = format!("SELECT COUNT(*) FROM {table} WHERE plan_name = ?1");
+            let count: i64 = conn.query_row(&sql, params![plan], |r| r.get(0)).unwrap();
+            assert_eq!(
+                count, 0,
+                "cascade did not empty {table} for plan {plan} (still has {count} row(s))"
+            );
+        }
+
+        // Preserved tables retain the row with the (now dangling) plan_name.
+        for table in PLAN_NAME_PRESERVED_TABLES {
+            let sql = format!("SELECT COUNT(*) FROM {table} WHERE plan_name = ?1");
+            let count: i64 = conn.query_row(&sql, params![plan], |r| r.get(0)).unwrap();
+            assert!(
+                count >= 1,
+                "preserved table {table} unexpectedly empty for plan {plan} \
+                 (audit comment promises the row survives)"
+            );
+        }
     }
 }
