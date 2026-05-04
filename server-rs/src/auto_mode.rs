@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use rand::Rng;
 use rusqlite::params;
+use tokio_util::sync::CancellationToken;
 
 use crate::agents::pty_agent::StartPtyOpts;
 use crate::agents::spawn_ops::start_agent_dispatch;
@@ -297,6 +298,11 @@ async fn run_state_machine(
         CiOutcome::Stalled => {
             on_ci_stalled(state, org_id, plan_name, task_id, &merged_sha).await;
         }
+        // Cancelled: the API toggle-off has already done all the work
+        // (auto_mode.enabled cleared, in-flight fix agents killed, audit
+        // row written). The loop just bails — no further pause / merge /
+        // spawn should fire.
+        CiOutcome::Cancelled => {}
     }
 }
 
@@ -362,10 +368,10 @@ async fn on_ci_passed(
     .await;
 }
 
-/// Red branch: pause with `ci_failed: <ci_run_id>`, broadcast
-/// `auto_mode_paused`, broadcast `auto_mode_state(paused)`, audit
-/// `AUTO_MODE_CI_FAILED`. Phase 3 will replace this with a bounded fix
-/// loop; the brief is explicit that Phase 2 stops at "pause + record".
+/// Red branch on the original task agent's merged SHA. Audits
+/// `AUTO_MODE_CI_FAILED` and hands off to [`try_spawn_fix_agent_with_cap`]
+/// — that helper either spawns the next fix attempt or, if the per-task
+/// retry cap is reached, pauses the plan with reason `fix_cap_reached`.
 async fn on_ci_failed(
     state: &AppState,
     org_id: &str,
@@ -375,36 +381,36 @@ async fn on_ci_failed(
     failing_run_id: Option<&str>,
 ) {
     let id_str = failing_run_id.unwrap_or("unknown");
-    let reason = format!("ci_failed: {id_str}");
-    db::auto_mode_pause(&state.db, plan_name, &reason);
-
     let payload = serde_json::json!({
         "plan": plan_name,
         "task": task_id,
         "sha": merged_sha,
-        "reason": reason,
         "ci_run_id": failing_run_id,
     });
-    broadcast_event(&state.broadcast_tx, "auto_mode_paused", payload.clone());
-    broadcast_state(
+    {
+        let conn = state.db.lock().unwrap();
+        audit::log(
+            &conn,
+            org_id,
+            None,
+            Some("branchwork-auto-mode"),
+            actions::AUTO_MODE_CI_FAILED,
+            audit::resources::PLAN,
+            Some(plan_name),
+            Some(&payload.to_string()),
+        );
+    }
+
+    try_spawn_fix_agent_with_cap(
         state,
+        org_id,
         plan_name,
         task_id,
-        state_labels::PAUSED,
-        Some(merged_sha),
-        Some(&reason),
-    );
-    let conn = state.db.lock().unwrap();
-    audit::log(
-        &conn,
-        org_id,
-        None,
-        Some("branchwork-auto-mode"),
-        actions::AUTO_MODE_CI_FAILED,
-        audit::resources::PLAN,
-        Some(plan_name),
-        Some(&payload.to_string()),
-    );
+        merged_sha,
+        id_str,
+        failing_run_id,
+    )
+    .await;
 }
 
 /// Stalled branch: pause with `ci_stalled`, broadcast `auto_mode_paused`,
@@ -473,6 +479,11 @@ pub enum CiOutcome {
     /// Project has no GitHub Actions configured. Treated as green by the
     /// loop — there is no CI to gate on.
     NotConfigured,
+    /// The plan's [`CancellationToken`] fired before CI reached a
+    /// terminal state. Returned when the user toggles `auto_mode` off
+    /// mid-flight; the loop returns immediately without paging the
+    /// dashboard, since the toggle itself is the user's intent.
+    Cancelled,
 }
 
 /// Poll-loop tuning. Hard-coded for now per the task brief; a plan-level
@@ -520,6 +531,7 @@ pub async fn wait_for_ci(
     agent_id: &str,
     merged_sha: &str,
 ) -> CiOutcome {
+    let cancel = state.cancel_token_for(plan_name);
     wait_for_ci_inner(
         plan_name,
         task_id,
@@ -527,6 +539,7 @@ pub async fn wait_for_ci(
         || has_github_actions_dispatch(state, org_id, agent_id),
         || get_ci_run_status_dispatch(state, org_id, plan_name, task_id, merged_sha),
         WaitForCiConfig::default(),
+        &cancel,
     )
     .await
 }
@@ -543,6 +556,7 @@ async fn wait_for_ci_inner<HasFn, GetFn, HasFut, GetFut>(
     has_actions: HasFn,
     get_status: GetFn,
     config: WaitForCiConfig,
+    cancel: &CancellationToken,
 ) -> CiOutcome
 where
     HasFn: Fn() -> HasFut,
@@ -550,12 +564,18 @@ where
     GetFn: Fn() -> GetFut,
     GetFut: Future<Output = Result<Option<CiAggregate>, CiStatusError>>,
 {
+    if cancel.is_cancelled() {
+        return CiOutcome::Cancelled;
+    }
     if !has_actions().await {
         return CiOutcome::NotConfigured;
     }
 
     let deadline = Instant::now() + config.total_timeout;
     loop {
+        if cancel.is_cancelled() {
+            return CiOutcome::Cancelled;
+        }
         match get_status().await {
             Ok(Some(agg)) if agg.status == "completed" => {
                 return classify_aggregate(plan_name, task_id, merged_sha, &agg);
@@ -583,7 +603,10 @@ where
         }
 
         let sleep = jittered_interval(config.poll_interval, config.jitter_window);
-        tokio::time::sleep(sleep).await;
+        tokio::select! {
+            _ = cancel.cancelled() => return CiOutcome::Cancelled,
+            _ = tokio::time::sleep(sleep) => {}
+        }
     }
 }
 
@@ -986,6 +1009,12 @@ async fn on_fix_agent_completed(
             db::close_fix_attempt(&state.db, plan_name, &original_task, attempt, "stalled");
             on_ci_stalled(state, org_id, plan_name, fix_task_id, &merged_sha).await;
         }
+        // Cancelled: the toggle-off path already paused / killed agents.
+        // Close the attempt row so the cap accounting still reflects the
+        // fix that ran; do not spawn another attempt.
+        CiOutcome::Cancelled => {
+            db::close_fix_attempt(&state.db, plan_name, &original_task, attempt, "cancelled");
+        }
     }
 }
 
@@ -1084,14 +1113,12 @@ async fn on_fix_ci_passed(
     .await;
 }
 
-/// Red branch on a fix-agent CI: audit `AUTO_MODE_CI_FAILED` and loop
-/// into the next fix attempt (`attempt + 1`). T3.3 will gate this on the
-/// per-plan retry cap; for T3.2 each Red simply spawns another fix agent.
-///
-/// If [`spawn_fix_agent`] returns `None` (the original task agent row
-/// has gone — defensive only, this should never happen in practice), the
-/// loop pauses with `fix_spawn_failed` so the dashboard can surface the
-/// degenerate state instead of silently dropping the run.
+/// Red branch on a fix-agent CI: audit `AUTO_MODE_CI_FAILED` and hand
+/// off to [`try_spawn_fix_agent_with_cap`] so the next attempt is gated
+/// by the per-plan retry cap (T3.3). The `prior_attempt` is informational
+/// only — the helper recomputes the next attempt number from
+/// `task_fix_attempt_count` so a stale value can't accidentally double-
+/// spawn or skip a slot.
 #[allow(clippy::too_many_arguments)] // step in the loop pipeline, not API
 async fn on_fix_ci_failed(
     state: &AppState,
@@ -1126,22 +1153,87 @@ async fn on_fix_ci_failed(
         );
     }
 
-    let next_attempt = prior_attempt.saturating_add(1);
-    let new_fix_agent = spawn_fix_agent(
+    try_spawn_fix_agent_with_cap(
         state,
         org_id,
         plan_name,
         original_task,
+        merged_sha,
         id_str,
-        next_attempt,
+        failing_run_id,
     )
     .await;
+}
 
-    if let Some(new_id) = new_fix_agent {
-        let next_fix_task = format!("{original_task}-fix-{next_attempt}");
+/// Spawn the next fix agent for `(plan_name, task_id)` if the per-plan
+/// `max_fix_attempts` cap allows. Otherwise pause the plan with reason
+/// `fix_cap_reached` and emit the matching dashboard event + audit row.
+///
+/// `attempts >= cap` is the gate. With the schema default `cap = 3`:
+/// - count=0 → spawn attempt 1 (the very first fix run)
+/// - count=2 → spawn attempt 3 (the last allowed)
+/// - count=3 → cap reached, pause
+///
+/// On a successful spawn this emits `auto_mode_fix_spawned` and audits
+/// `AUTO_MODE_FIX_SPAWNED`. On a `None` return from
+/// [`spawn_fix_agent`] (original task agent row missing — defensive,
+/// should not happen in practice) the plan is paused with
+/// `fix_spawn_failed` so the dashboard can surface the degenerate state.
+async fn try_spawn_fix_agent_with_cap(
+    state: &AppState,
+    org_id: &str,
+    plan_name: &str,
+    task_id: &str,
+    merged_sha: &str,
+    failing_run_id_str: &str,
+    failing_run_id: Option<&str>,
+) {
+    let attempts = db::task_fix_attempt_count(&state.db, plan_name, task_id);
+    let cap = db::plan_max_fix_attempts(&state.db, plan_name);
+
+    if attempts >= cap {
+        let reason = "fix_cap_reached".to_string();
+        db::auto_mode_pause(&state.db, plan_name, &reason);
+
         let payload = serde_json::json!({
             "plan": plan_name,
-            "task": original_task,
+            "task": task_id,
+            "attempts": attempts,
+            "cap": cap,
+            "reason": reason,
+        });
+        broadcast_event(&state.broadcast_tx, "auto_mode_paused", payload.clone());
+        broadcast_state(
+            state,
+            plan_name,
+            task_id,
+            state_labels::PAUSED,
+            Some(merged_sha),
+            Some(&reason),
+        );
+        let conn = state.db.lock().unwrap();
+        audit::log(
+            &conn,
+            org_id,
+            None,
+            Some("branchwork-auto-mode"),
+            actions::AUTO_MODE_PAUSED,
+            audit::resources::PLAN,
+            Some(plan_name),
+            Some(&payload.to_string()),
+        );
+        return;
+    }
+
+    let next_attempt = attempts.saturating_add(1);
+    let new_fix_agent =
+        spawn_fix_agent(state, org_id, plan_name, task_id, failing_run_id_str, next_attempt).await;
+
+    if let Some(new_id) = new_fix_agent {
+        let next_fix_task = format!("{task_id}-fix-{next_attempt}");
+        let payload = serde_json::json!({
+            "plan": plan_name,
+            "task": task_id,
             "fix_task": next_fix_task,
             "fix_agent_id": new_id,
             "attempt": next_attempt,
@@ -1168,14 +1260,14 @@ async fn on_fix_ci_failed(
         db::auto_mode_pause(&state.db, plan_name, &reason);
         let payload = serde_json::json!({
             "plan": plan_name,
-            "task": original_task,
+            "task": task_id,
             "reason": reason,
         });
         broadcast_event(&state.broadcast_tx, "auto_mode_paused", payload.clone());
         broadcast_state(
             state,
             plan_name,
-            fix_task_id,
+            task_id,
             state_labels::PAUSED,
             Some(merged_sha),
             Some(&reason),
@@ -1264,6 +1356,7 @@ mod tests {
             registry,
             runners,
             settings_path: PathBuf::from("/tmp/branchwork-test-settings.json"),
+            cancellation_tokens: Arc::new(StdMutex::new(HashMap::new())),
         };
         (state, rx)
     }
@@ -1895,6 +1988,7 @@ mod tests {
                 }
             },
             fast_config(),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -1915,6 +2009,7 @@ mod tests {
             || async { true },
             || async { Ok(Some(aggregate_success())) },
             fast_config(),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -1930,6 +2025,7 @@ mod tests {
             || async { true },
             || async { Ok(Some(aggregate_failure("42"))) },
             fast_config(),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -1956,6 +2052,7 @@ mod tests {
                 async move { Ok(Some(agg)) }
             },
             fast_config(),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -1982,6 +2079,7 @@ mod tests {
                 async move { Ok(Some(agg)) }
             },
             fast_config(),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -2004,6 +2102,7 @@ mod tests {
             || async { true },
             || async { Ok(None) },
             fast_config(),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -2032,6 +2131,7 @@ mod tests {
                 }
             },
             fast_config(),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -2064,6 +2164,7 @@ mod tests {
                 }
             },
             fast_config(),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -2089,6 +2190,7 @@ mod tests {
                 async move { Ok(Some(agg)) }
             },
             fast_config(),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -2109,6 +2211,7 @@ mod tests {
             || async { true },
             || async { Ok(Some(aggregate_reglyze_three_runs())) },
             fast_config(),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -2192,6 +2295,7 @@ mod tests {
                 jitter_window: Duration::from_millis(2),
                 total_timeout: Duration::from_millis(150),
             },
+            &CancellationToken::new(),
         )
         .await;
 
@@ -2468,11 +2572,13 @@ mod tests {
         );
     }
 
-    /// Companion acceptance test from the brief:
-    /// stub CI red → no next task spawned, plan paused with the expected
-    /// reason (`ci_failed: <run_id>`).
+    /// Red CI on the first task-agent merge spawns a fix agent (T3.3
+    /// wired the cap-checked spawn into `on_ci_failed`). Asserts:
+    /// AUTO_MODE_CI_FAILED + AUTO_MODE_FIX_SPAWNED audited, a fix agent
+    /// row exists for `0.1-fix-1`, the plan is NOT paused (we are still
+    /// well under cap=3), and no `advancing` pill ever fired.
     #[tokio::test]
-    async fn red_ci_pauses_plan_and_does_not_advance() {
+    async fn red_ci_spawns_fix_agent_under_cap() {
         let (db, dir) = fresh_db();
         let org_id = "default-org";
         seed_runner_row(&db, "runner-1", org_id);
@@ -2503,6 +2609,14 @@ mod tests {
             WireMessage::GetCiRunStatus { .. } => Some(RunnerResponse::CiRunStatusResolved(Some(
                 aggregate_failure("42"),
             ))),
+            // Failure-log lookup fires from `spawn_fix_agent` for the
+            // newly-built fix prompt — return a canned reply so the
+            // dispatcher echo-back assertion in spawn_fix_agent doesn't
+            // panic on a missing run_id_used.
+            WireMessage::CiFailureLog { run_id, .. } => Some(RunnerResponse::CiFailureLogFetched {
+                log: Some("fake failure log".into()),
+                run_id_used: run_id.clone(),
+            }),
             _ => None,
         })
         .await;
@@ -2520,19 +2634,27 @@ mod tests {
 
         run_state_machine(&state, org_id, "agent-1", "p", "0.1").await;
 
-        // Acceptance: no new agent — only the original.
+        // Acceptance: original task agent + a fresh fix agent for `0.1-fix-1`.
         assert_eq!(
-            count_agents_for_plan(&db, "p"),
+            count_agents_for_plan_task(&db, "p", "0.1-fix-1"),
             1,
-            "no next task should spawn on red CI"
+            "expected a fix agent row for 0.1-fix-1 to be inserted by the spawn"
         );
 
-        // Plan paused with `ci_failed: <run_id>` (the failing run id from
-        // the failure aggregate).
-        let reason = paused_reason(&db, "p").expect("plan should be paused");
-        assert_eq!(reason, "ci_failed: 42");
+        // task_fix_attempts row recorded with attempt=1.
+        assert_eq!(
+            crate::db::task_fix_attempt_count(&db, "p", "0.1"),
+            1,
+            "expected exactly one fix-attempt row for the first red-CI spawn"
+        );
 
-        // State pill saw merging → awaiting_ci → paused. No `advancing`.
+        // Plan is NOT paused — under cap=3, we spawn rather than pause.
+        assert!(
+            paused_reason(&db, "p").is_none(),
+            "plan should not be paused on the first red CI under the cap"
+        );
+
+        // State pill saw merging → awaiting_ci. No `advancing`, no `paused`.
         let labels = drain_state_labels(&mut rx);
         assert!(
             labels.contains(&"merging".to_string()),
@@ -2543,15 +2665,15 @@ mod tests {
             "expected `awaiting_ci` in labels: {labels:?}"
         );
         assert!(
-            labels.contains(&"paused".to_string()),
-            "expected `paused` in labels: {labels:?}"
+            !labels.contains(&"advancing".to_string()),
+            "no `advancing` expected on red CI: {labels:?}"
         );
         assert!(
-            !labels.contains(&"advancing".to_string()),
-            "no `advancing` expected on red CI, got: {labels:?}"
+            !labels.contains(&"paused".to_string()),
+            "no `paused` expected when a fix agent is spawned: {labels:?}"
         );
 
-        // Audit: AUTO_MODE_MERGED then AUTO_MODE_CI_FAILED on the plan;
+        // Audit: AUTO_MODE_CI_FAILED + AUTO_MODE_FIX_SPAWNED on the plan;
         // AUTO_MODE_CI_PASSED must not be present.
         let plan_actions = audit_actions_for(&db, "p");
         assert!(
@@ -2559,6 +2681,12 @@ mod tests {
                 .iter()
                 .any(|a| a == actions::AUTO_MODE_CI_FAILED),
             "expected AUTO_MODE_CI_FAILED in plan actions: {plan_actions:?}"
+        );
+        assert!(
+            plan_actions
+                .iter()
+                .any(|a| a == actions::AUTO_MODE_FIX_SPAWNED),
+            "expected AUTO_MODE_FIX_SPAWNED in plan actions: {plan_actions:?}"
         );
         assert!(
             !plan_actions
@@ -3297,5 +3425,293 @@ mod tests {
         assert!(prompt.contains(CONTRACT_NEEDLE));
         assert!(prompt.contains("branchwork/p/1.1-fix-1"));
         assert!(prompt.contains("555"));
+    }
+
+    // ── Phase 3.3: retry cap + cancellation token ───────────────────────────
+
+    /// Set `plan_auto_mode.max_fix_attempts` for `plan_name` (UPSERT).
+    /// Used by the cap tests to drop the schema default of 3 to a smaller
+    /// value when needed; defaults to UPSERT semantics so the row may or
+    /// may not exist already.
+    fn set_max_fix_attempts(db: &Db, plan: &str, cap: u32) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO plan_auto_mode (plan_name, enabled, max_fix_attempts) \
+             VALUES (?1, 1, ?2) \
+             ON CONFLICT(plan_name) DO UPDATE SET max_fix_attempts = excluded.max_fix_attempts",
+            params![plan, cap as i64],
+        )
+        .unwrap();
+    }
+
+    /// Brief acceptance T3.3 #1: simulate 4 red CIs in a row with cap=3;
+    /// assert exactly 3 fix agents were spawned and the plan ends paused
+    /// with `fix_cap_reached`. Drives [`try_spawn_fix_agent_with_cap`]
+    /// directly so the test runs in millis instead of dragging through
+    /// 4 × wait_for_ci polls.
+    #[tokio::test]
+    async fn fix_cap_reached_after_n_attempts_pauses_plan() {
+        let (db, _dir) = fresh_db();
+        let org_id = "default-org";
+        seed_runner_row(&db, "runner-1", org_id);
+
+        // Stub runner so each spawn_fix_agent's failure-log fetch + start-
+        // agent dispatch resolves cleanly. We don't care about the agent's
+        // actual lifecycle here — only that a row appears for each spawn.
+        let runners = new_runner_registry();
+        let _outgoing = install_echo_runner(&runners, "runner-1", |msg| match msg {
+            WireMessage::CiFailureLog { run_id, .. } => Some(RunnerResponse::CiFailureLogFetched {
+                log: Some("fake log".into()),
+                run_id_used: run_id.clone(),
+            }),
+            _ => None,
+        })
+        .await;
+
+        let (state, mut rx) = test_app_state(
+            db.clone(),
+            runners,
+            PathBuf::from("/tmp/auto-mode-cap-plans"),
+        );
+
+        // Original task agent — gives spawn_fix_agent a cwd to point at.
+        seed_agent(
+            &db,
+            "agent-original",
+            Path::new("/runner/cwd"),
+            "p",
+            "0.1",
+            "branchwork/p/0.1",
+        );
+        enable_auto_mode(&db, "p");
+        set_max_fix_attempts(&db, "p", 3);
+
+        // Drive 4 red CIs: each call simulates the gate that fires from
+        // on_ci_failed (attempt 1) and on_fix_ci_failed (attempts 2..=4).
+        // Calls 1..=3 must spawn (count→cap window is open); call 4 must
+        // pause with fix_cap_reached.
+        for _ in 0..4 {
+            try_spawn_fix_agent_with_cap(
+                &state,
+                org_id,
+                "p",
+                "0.1",
+                "deadbeef",
+                "42",
+                Some("42"),
+            )
+            .await;
+        }
+
+        // Acceptance #1: exactly 3 fix-attempt rows recorded.
+        assert_eq!(
+            crate::db::task_fix_attempt_count(&db, "p", "0.1"),
+            3,
+            "expected exactly 3 task_fix_attempts rows for cap=3"
+        );
+
+        // Each spawned attempt has its own agent row (one per attempt).
+        for attempt in 1..=3 {
+            let task_id = format!("0.1-fix-{attempt}");
+            assert_eq!(
+                count_agents_for_plan_task(&db, "p", &task_id),
+                1,
+                "expected an agent row for {task_id}"
+            );
+        }
+        // No row for attempt 4 — cap reached, spawn skipped.
+        assert_eq!(
+            count_agents_for_plan_task(&db, "p", "0.1-fix-4"),
+            0,
+            "no agent row should exist for attempt 4 — cap was reached"
+        );
+
+        // Acceptance #2: plan paused with reason `fix_cap_reached`.
+        assert_eq!(
+            paused_reason(&db, "p").as_deref(),
+            Some("fix_cap_reached"),
+            "plan should be paused with fix_cap_reached"
+        );
+
+        // Acceptance #3: `auto_mode_paused` event was broadcast carrying
+        // {attempts, cap}; the dashboard relies on these to render the
+        // banner with the actual numbers.
+        let mut saw_cap_payload = false;
+        while let Ok(msg) = rx.try_recv() {
+            let v: serde_json::Value = match serde_json::from_str(&msg) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if v.get("type").and_then(|t| t.as_str()) != Some("auto_mode_paused") {
+                continue;
+            }
+            let data = match v.get("data") {
+                Some(d) => d,
+                None => continue,
+            };
+            if data.get("reason").and_then(|r| r.as_str()) == Some("fix_cap_reached")
+                && data.get("attempts").and_then(|a| a.as_u64()) == Some(3)
+                && data.get("cap").and_then(|c| c.as_u64()) == Some(3)
+            {
+                saw_cap_payload = true;
+                break;
+            }
+        }
+        assert!(
+            saw_cap_payload,
+            "expected an auto_mode_paused event with reason=fix_cap_reached, attempts=3, cap=3"
+        );
+
+        // Audit row mirrors the broadcast.
+        let plan_actions = audit_actions_for(&db, "p");
+        assert!(
+            plan_actions
+                .iter()
+                .filter(|a| *a == actions::AUTO_MODE_FIX_SPAWNED)
+                .count()
+                == 3,
+            "expected exactly 3 AUTO_MODE_FIX_SPAWNED audit rows: {plan_actions:?}"
+        );
+        assert!(
+            plan_actions.iter().any(|a| a == actions::AUTO_MODE_PAUSED),
+            "expected AUTO_MODE_PAUSED in plan actions: {plan_actions:?}"
+        );
+    }
+
+    /// Brief acceptance T3.3 #2: spawn a fix agent, toggle auto-mode off
+    /// mid-flight; assert the fix agent is killed and no merge runs.
+    /// Drives the `cancel_plan` + `kill_agent_dispatch` chain that
+    /// [`crate::api::plans::put_plan_config`] performs when `autoMode`
+    /// flips to false.
+    #[tokio::test]
+    async fn toggle_auto_mode_off_kills_in_flight_fix_agent_and_cancels_wait() {
+        let (db, dir) = fresh_db();
+        let org_id = "default-org";
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (state, _rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+
+        // Seed: a fix agent already running (status='running', fix-task
+        // marker in task_id). The toggle-off path looks for exactly this
+        // shape via `task_id LIKE '%-fix-%'` AND status IN ('running',
+        // 'starting').
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents \
+                    (id, session_id, cwd, status, mode, plan_name, task_id, branch, source_branch, org_id) \
+                 VALUES (?1, ?1, '/tmp/cwd', 'running', 'pty', 'p', '0.1-fix-1', \
+                         'branchwork/p/0.1-fix-1', 'master', ?2)",
+                params!["fix-agent-1", org_id],
+            )
+            .unwrap();
+        }
+        enable_auto_mode(&db, "p");
+
+        // Prime the cancel token so we can observe it being fired. Future
+        // wait_for_ci_inner calls would clone this token and select on it.
+        let token = state.cancel_token_for("p");
+        assert!(!token.is_cancelled());
+
+        // Drive the same flow `put_plan_config` performs when toggling
+        // off: flip `enabled=0`, snapshot in-flight fix agents, cancel
+        // the per-plan token, then kill each fix agent. Done inline
+        // rather than over HTTP so the test stays a unit test.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE plan_auto_mode SET enabled = 0 WHERE plan_name = 'p'",
+                [],
+            )
+            .unwrap();
+        }
+        let in_flight: Vec<(String, String)> = {
+            let conn = db.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, COALESCE(org_id, 'default-org') FROM agents \
+                     WHERE plan_name = ?1 AND task_id LIKE '%-fix-%' \
+                       AND status IN ('running', 'starting')",
+                )
+                .unwrap();
+            stmt.query_map(params!["p"], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .flatten()
+            .collect()
+        };
+        assert_eq!(in_flight.len(), 1, "should snapshot exactly the one fix agent");
+        state.cancel_plan("p");
+        for (agent_id, agent_org) in &in_flight {
+            let _ =
+                crate::agents::spawn_ops::kill_agent_dispatch(&state, agent_org, agent_id).await;
+        }
+
+        // Acceptance #1: token observable on the cloned handle is now cancelled.
+        assert!(
+            token.is_cancelled(),
+            "the cancel token cloned earlier must observe cancellation"
+        );
+
+        // Acceptance #2: agent row flipped to 'killed'.
+        let status: String = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT status FROM agents WHERE id = ?1",
+                params!["fix-agent-1"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(status, "killed", "fix agent row should be in status='killed'");
+
+        // Acceptance #3: no merge runs. The auto_mode_enabled() gate at
+        // the entry of `on_task_agent_completed` returns false (enabled=0
+        // by the toggle-off above), so even if the agent's exit hook were
+        // to fire it would be a silent no-op.
+        assert!(
+            !crate::db::auto_mode_enabled(&db, "p"),
+            "auto_mode must be disabled after toggle-off"
+        );
+    }
+
+    /// Cancellation propagates into the wait_for_ci poll: a token fired
+    /// while the loop is mid-tick returns [`CiOutcome::Cancelled`] within
+    /// one poll interval (no merge / no spawn / no pause downstream).
+    #[tokio::test]
+    async fn wait_for_ci_inner_returns_cancelled_when_token_fires_mid_poll() {
+        // Slow poll, fast cancel: the loop would otherwise time out at
+        // `total_timeout`; we want to prove the cancel arm wins.
+        let cfg = WaitForCiConfig {
+            poll_interval: Duration::from_millis(500),
+            jitter_window: Duration::from_millis(0),
+            total_timeout: Duration::from_secs(30),
+        };
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+
+        // Fire the cancel after one poll interval so the loop is parked
+        // in the select! sleep arm when cancellation lands.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            token_clone.cancel();
+        });
+
+        let outcome = wait_for_ci_inner(
+            "p",
+            "0.1",
+            "sha-1",
+            || async { true },
+            // Always returns Some(in_progress) so the loop keeps polling
+            // — without cancellation it would run until the 30s timeout.
+            || async { Ok(Some(aggregate_in_progress())) },
+            cfg,
+            &token,
+        )
+        .await;
+
+        assert_eq!(outcome, CiOutcome::Cancelled);
     }
 }

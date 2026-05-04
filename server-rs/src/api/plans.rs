@@ -542,72 +542,111 @@ pub async fn put_plan_config(
     Path(name): Path<String>,
     Json(body): Json<PlanConfigBody>,
 ) -> impl IntoResponse {
-    let db = state.db.lock().unwrap();
+    // Snapshot in-flight fix agents to kill BEFORE the enabled flag
+    // flips, so a concurrent agent-completion path can't slip a fresh
+    // fix agent in past the disable. Only populated when the request is
+    // explicitly turning auto_mode off.
+    let fix_agents_to_kill: Vec<(String, String)> = {
+        let db = state.db.lock().unwrap();
 
-    if let Some(enabled) = body.auto_advance {
-        db.execute(
-            "INSERT INTO plan_auto_advance (plan_name, enabled, updated_at) \
-             VALUES (?1, ?2, datetime('now')) \
-             ON CONFLICT(plan_name) \
-             DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at",
-            params![name, enabled as i64],
-        )
-        .ok();
-
-        crate::audit::log(
-            &db,
-            auth.org_id(),
-            auth.0.as_ref().map(|u| u.id.as_str()),
-            auth.0.as_ref().map(|u| u.email.as_str()),
-            crate::audit::actions::CONFIG_AUTO_ADVANCE,
-            crate::audit::resources::PLAN,
-            Some(&name),
-            Some(&serde_json::json!({"enabled": enabled}).to_string()),
-        );
-    }
-
-    if body.auto_mode.is_some() || body.max_fix_attempts.is_some() {
-        // UPSERT each provided field independently so partial updates
-        // don't clobber the other column. COALESCE keeps the existing
-        // value when the caller omits it.
-        if let Some(enabled) = body.auto_mode {
+        if let Some(enabled) = body.auto_advance {
             db.execute(
-                "INSERT INTO plan_auto_mode (plan_name, enabled) \
-                 VALUES (?1, ?2) \
-                 ON CONFLICT(plan_name) DO UPDATE SET enabled = excluded.enabled",
+                "INSERT INTO plan_auto_advance (plan_name, enabled, updated_at) \
+                 VALUES (?1, ?2, datetime('now')) \
+                 ON CONFLICT(plan_name) \
+                 DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at",
                 params![name, enabled as i64],
             )
             .ok();
-        }
-        if let Some(max) = body.max_fix_attempts {
-            db.execute(
-                "INSERT INTO plan_auto_mode (plan_name, max_fix_attempts) \
-                 VALUES (?1, ?2) \
-                 ON CONFLICT(plan_name) DO UPDATE SET max_fix_attempts = excluded.max_fix_attempts",
-                params![name, max as i64],
-            )
-            .ok();
+
+            crate::audit::log(
+                &db,
+                auth.org_id(),
+                auth.0.as_ref().map(|u| u.id.as_str()),
+                auth.0.as_ref().map(|u| u.email.as_str()),
+                crate::audit::actions::CONFIG_AUTO_ADVANCE,
+                crate::audit::resources::PLAN,
+                Some(&name),
+                Some(&serde_json::json!({"enabled": enabled}).to_string()),
+            );
         }
 
-        let mut audit_payload = serde_json::Map::new();
-        if let Some(enabled) = body.auto_mode {
-            audit_payload.insert("enabled".to_string(), serde_json::json!(enabled));
+        let mut to_kill: Vec<(String, String)> = Vec::new();
+        if body.auto_mode.is_some() || body.max_fix_attempts.is_some() {
+            // UPSERT each provided field independently so partial updates
+            // don't clobber the other column. COALESCE keeps the existing
+            // value when the caller omits it.
+            if let Some(enabled) = body.auto_mode {
+                db.execute(
+                    "INSERT INTO plan_auto_mode (plan_name, enabled) \
+                     VALUES (?1, ?2) \
+                     ON CONFLICT(plan_name) DO UPDATE SET enabled = excluded.enabled",
+                    params![name, enabled as i64],
+                )
+                .ok();
+
+                // Toggle-off: collect any in-flight fix agents for this
+                // plan so we can kill them after dropping the lock.
+                if !enabled
+                    && let Ok(mut stmt) = db.prepare(
+                        "SELECT id, COALESCE(org_id, 'default-org') FROM agents \
+                         WHERE plan_name = ?1 \
+                           AND task_id LIKE '%-fix-%' \
+                           AND status IN ('running', 'starting')",
+                    )
+                    && let Ok(rows) = stmt.query_map(params![name], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                {
+                    for r in rows.flatten() {
+                        to_kill.push(r);
+                    }
+                }
+            }
+            if let Some(max) = body.max_fix_attempts {
+                db.execute(
+                    "INSERT INTO plan_auto_mode (plan_name, max_fix_attempts) \
+                     VALUES (?1, ?2) \
+                     ON CONFLICT(plan_name) DO UPDATE SET max_fix_attempts = excluded.max_fix_attempts",
+                    params![name, max as i64],
+                )
+                .ok();
+            }
+
+            let mut audit_payload = serde_json::Map::new();
+            if let Some(enabled) = body.auto_mode {
+                audit_payload.insert("enabled".to_string(), serde_json::json!(enabled));
+            }
+            if let Some(max) = body.max_fix_attempts {
+                audit_payload.insert("maxFixAttempts".to_string(), serde_json::json!(max));
+            }
+            crate::audit::log(
+                &db,
+                auth.org_id(),
+                auth.0.as_ref().map(|u| u.id.as_str()),
+                auth.0.as_ref().map(|u| u.email.as_str()),
+                crate::audit::actions::CONFIG_AUTO_MODE,
+                crate::audit::resources::PLAN,
+                Some(&name),
+                Some(&serde_json::Value::Object(audit_payload).to_string()),
+            );
         }
-        if let Some(max) = body.max_fix_attempts {
-            audit_payload.insert("maxFixAttempts".to_string(), serde_json::json!(max));
+        to_kill
+    };
+
+    // Outside the DB lock: cancel any pending wait_for_ci poll for this
+    // plan, then kill the in-flight fix agents collected above. Cancel
+    // first so the loop sees Cancelled and bails before any
+    // agent-completion side-effect could race the kill — the fix
+    // branches are abandoned (no merge runs).
+    if matches!(body.auto_mode, Some(false)) {
+        state.cancel_plan(&name);
+        for (agent_id, org_id) in &fix_agents_to_kill {
+            let _ = crate::agents::spawn_ops::kill_agent_dispatch(&state, org_id, agent_id).await;
         }
-        crate::audit::log(
-            &db,
-            auth.org_id(),
-            auth.0.as_ref().map(|u| u.id.as_str()),
-            auth.0.as_ref().map(|u| u.email.as_str()),
-            crate::audit::actions::CONFIG_AUTO_MODE,
-            crate::audit::resources::PLAN,
-            Some(&name),
-            Some(&serde_json::Value::Object(audit_payload).to_string()),
-        );
     }
 
+    let db = state.db.lock().unwrap();
     let cfg = read_plan_config(&db, &name);
     (StatusCode::OK, Json(cfg)).into_response()
 }

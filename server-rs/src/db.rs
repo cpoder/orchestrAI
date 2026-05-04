@@ -84,6 +84,22 @@ pub fn auto_mode_resume(db: &Db, plan_name: &str) {
     .ok();
 }
 
+/// Per-plan retry cap for fix agents. Mirrors the schema default (3) so
+/// plans without a `plan_auto_mode` row return the same value the loop
+/// would see if one had been UPSERTed with defaults. The auto-mode loop
+/// gates each `spawn_fix_agent` on `task_fix_attempt_count >= cap`.
+#[allow(dead_code)] // wired in by later auto-mode-loop tasks
+pub fn plan_max_fix_attempts(db: &Db, plan_name: &str) -> u32 {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT max_fix_attempts FROM plan_auto_mode WHERE plan_name = ?1",
+        params![plan_name],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|v| v as u32)
+    .unwrap_or(3)
+}
+
 /// Number of fix attempts already recorded for `(plan_name, task_number)`.
 /// The loop compares this against `plan_auto_mode.max_fix_attempts`
 /// before spawning another fix agent.
