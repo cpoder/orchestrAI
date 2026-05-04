@@ -7,11 +7,20 @@ use uuid::Uuid;
 use crate::auth::OptionalAuthUser;
 use crate::config::Effort;
 use crate::persisted_settings::PersistedSettings;
+use crate::plan_curate::DEFAULT_RETENTION_DAYS;
 use crate::saas::dispatch::org_has_runner;
 use crate::saas::runner_protocol::WireMessage;
 use crate::saas::runner_rpc::{RunnerRpcError, runner_request};
 use crate::saas::runner_ws::RunnerResponse;
 use crate::state::AppState;
+
+/// Inclusive bounds enforced server-side on
+/// `plan_archive_retention_days`. 0 collapses soft delete to hard
+/// delete (snapshot is written, then purged on the next tick); 365
+/// caps single-org retention at one year so the snapshot table does
+/// not grow without bound.
+pub const RETENTION_DAYS_MIN: i64 = 0;
+pub const RETENTION_DAYS_MAX: i64 = 365;
 
 // ── GET /api/settings ────────────────────────────────────────────────────────
 
@@ -30,6 +39,12 @@ pub struct SettingsBody {
     /// `serde_json::Value` so we can distinguish missing vs. null.
     #[serde(default)]
     webhook_url: serde_json::Value,
+    /// Days a soft-deleted plan's snapshot survives before the
+    /// retention purger removes it. Validated server-side against
+    /// `RETENTION_DAYS_MIN..=RETENTION_DAYS_MAX`; out-of-range
+    /// values produce a 400. Missing means "no change" — the
+    /// existing on-disk value (or the default) is preserved.
+    plan_archive_retention_days: Option<i64>,
 }
 
 pub async fn put_settings(
@@ -81,9 +96,29 @@ pub async fn put_settings(
         _ => { /* missing or wrong type → leave alone */ }
     }
 
+    // plan_archive_retention_days lives only on disk (read by
+    // `plan_curate::snapshot_plan` per delete via PersistedSettings::load).
+    // Range-check up front; out-of-range PUTs are 400 and never persist.
+    if let Some(days) = body.plan_archive_retention_days
+        && !(RETENTION_DAYS_MIN..=RETENTION_DAYS_MAX).contains(&days)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "plan_archive_retention_days must be between {RETENTION_DAYS_MIN} and {RETENTION_DAYS_MAX}",
+                ),
+            })),
+        )
+            .into_response();
+    }
+
     // Persist the *current* in-memory state (not just the diff) so the file
     // always reflects what the server is using right now.
-    let snap = snapshot_for_persist(&state);
+    let mut snap = snapshot_for_persist(&state);
+    if let Some(days) = body.plan_archive_retention_days {
+        snap.plan_archive_retention_days = Some(days);
+    }
     if let Err(e) = snap.save(&state.settings_path) {
         eprintln!(
             "[settings] failed to persist to {}: {e}",
@@ -101,10 +136,18 @@ fn snapshot(state: &AppState) -> serde_json::Value {
         .skip_permissions
         .load(std::sync::atomic::Ordering::Relaxed);
     let webhook_url = state.registry.webhook_url.read().unwrap().clone();
+    // Read retention straight off disk — it's not cached on AppState
+    // because the only consumer (`plan_curate::snapshot_plan`) is also
+    // the cold path, and reading once per admin GET keeps the source
+    // of truth single.
+    let plan_archive_retention_days = PersistedSettings::load(&state.settings_path)
+        .plan_archive_retention_days
+        .unwrap_or(DEFAULT_RETENTION_DAYS);
     serde_json::json!({
         "effort": effort,
         "skip_permissions": skip_permissions,
         "webhook_url": webhook_url,
+        "plan_archive_retention_days": plan_archive_retention_days,
     })
 }
 

@@ -56,6 +56,12 @@ pub mod actions {
     /// `{snapshot_id, plan_name, kind, replayed_rows}`. Resource is the
     /// restored plan name.
     pub const PLAN_RESTORE: &str = "plan.restore";
+    /// The retention purger (`plan_curate::purge_expired`) hard-deleted
+    /// an expired `plan_snapshots` row past its `expires_at`. Diff
+    /// carries `{snapshot_id, kind, archive_path}`; resource is the
+    /// snapshotted plan's name. Append-only: no second-level undo for
+    /// purged snapshots.
+    pub const PLAN_SNAPSHOT_PURGED: &str = "plan.snapshot_purged";
     pub const AUTH_SIGNUP: &str = "auth.signup";
     pub const AUTH_LOGIN: &str = "auth.login";
     pub const SSO_LOGIN: &str = "sso.login";

@@ -207,6 +207,11 @@ async fn run_server(cli: Cli) {
     // `docs/reference/configuration.md` under "Auto-mode (idle finish)".
     auto_mode::spawn_idle_poller(state.clone(), auto_mode::IdleFinishConfig::from_env());
 
+    // Hourly retention purger: hard-deletes plan_snapshots rows past
+    // `expires_at` (and their archive YAML), audits one
+    // `plan.snapshot_purged` row per snapshot.
+    plan_curate::spawn_purger(state.clone());
+
     // Start file watcher
     let _watcher =
         file_watcher::start(&config.plans_dir, broadcast_tx).expect("failed to start file watcher");

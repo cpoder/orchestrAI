@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::{Connection, Transaction, params, params_from_iter};
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,11 @@ use crate::db::Db;
 use crate::persisted_settings::PersistedSettings;
 use crate::plan_parser;
 use crate::state::AppState;
+
+/// How often [`spawn_purger`] wakes up to scan for expired snapshots.
+/// Hourly is plenty — retention is configured in days, so the worst-
+/// case lag between `expires_at` and actual delete is one tick.
+pub const PURGE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Default snapshot retention window in days when
 /// `PersistedSettings.plan_archive_retention_days` is unset. The
@@ -368,6 +374,130 @@ fn json_value_to_sql_value(v: &serde_json::Value) -> rusqlite::types::Value {
     }
 }
 
+/// One row from `plan_snapshots` selected for purging. Materialised
+/// inside the read transaction so the on-disk file deletes happen
+/// outside the SQLite lock and are decoupled from the row deletes.
+struct ExpiredSnapshot {
+    id: i64,
+    plan_name: String,
+    kind: String,
+    archive_path: Option<String>,
+    org_id: String,
+}
+
+/// Background task that hard-deletes expired snapshots once an hour.
+///
+/// Each tick: scan `plan_snapshots` for rows with
+/// `expires_at < now() AND restored_at IS NULL`, drop their archive
+/// YAML (if any), then delete the row. Every deleted row writes a
+/// `plan.snapshot_purged` audit entry — purges are append-only with no
+/// second-level undo, so the audit row is the only forensic trail.
+///
+/// Sleep-then-work means the first scan happens
+/// [`PURGE_INTERVAL`] after server start; restart loops do not thrash
+/// the table.
+pub fn spawn_purger(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(PURGE_INTERVAL).await;
+            purge_expired(&state).await;
+        }
+    });
+}
+
+/// One pass of the purger. Public so tests can drive it directly
+/// without the hourly wait. Errors are swallowed and logged — a
+/// transient SQLite blip should not crash the server.
+pub async fn purge_expired(state: &AppState) {
+    let count = purge_expired_once(&state.db);
+    if count > 0 {
+        eprintln!("[plan_curate] purged {count} expired snapshot row(s)");
+    }
+}
+
+/// Sync core of [`purge_expired`]. Returns the number of snapshot rows
+/// removed. Filesystem deletes are best-effort: a missing archive
+/// file is treated as "already gone" rather than a hard error so the
+/// purger eventually frees the row.
+fn purge_expired_once(db: &Db) -> i64 {
+    let candidates = match select_expired(db) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[plan_curate] purge: select failed: {e}");
+            return 0;
+        }
+    };
+    let mut purged = 0i64;
+    for snap in candidates {
+        if let Some(ref path) = snap.archive_path {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => eprintln!(
+                    "[plan_curate] purge: unable to delete archive {path}: {e}; row will be retried next tick",
+                ),
+            }
+        }
+        let conn = db.lock().unwrap();
+        let n = match conn.execute("DELETE FROM plan_snapshots WHERE id = ?1", params![snap.id]) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("[plan_curate] purge: delete row {} failed: {e}", snap.id);
+                continue;
+            }
+        };
+        if n == 0 {
+            // Concurrent restore raced us — drop the audit too.
+            continue;
+        }
+        crate::audit::log(
+            &conn,
+            &snap.org_id,
+            None,
+            None,
+            crate::audit::actions::PLAN_SNAPSHOT_PURGED,
+            crate::audit::resources::PLAN,
+            Some(&snap.plan_name),
+            Some(
+                &serde_json::json!({
+                    "snapshot_id": snap.id,
+                    "kind": snap.kind,
+                    "archive_path": snap.archive_path,
+                })
+                .to_string(),
+            ),
+        );
+        purged += 1;
+    }
+    purged
+}
+
+fn select_expired(db: &Db) -> Result<Vec<ExpiredSnapshot>, rusqlite::Error> {
+    let conn = db.lock().unwrap();
+    // `<=` (not `<`) so retention=0 — which sets `expires_at == now()`
+    // — purges on the same tick that created it. SQLite datetime() has
+    // 1-second resolution, so the difference is at most one second of
+    // grace; the tighter comparison would silently leave retention=0
+    // rows alive until the next-second tick.
+    let mut stmt = conn.prepare(
+        "SELECT id, plan_name, kind, archive_path, org_id \
+           FROM plan_snapshots \
+          WHERE expires_at <= datetime('now') AND restored_at IS NULL",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(ExpiredSnapshot {
+                id: r.get(0)?,
+                plan_name: r.get(1)?,
+                kind: r.get(2)?,
+                archive_path: r.get(3)?,
+                org_id: r.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,5 +809,212 @@ mod tests {
             SnapshotError::PlanNotFound(name) => assert_eq!(name, "missing"),
             other => panic!("expected PlanNotFound, got {other:?}"),
         }
+    }
+
+    /// Helper: write an `archive` directory + a fake archived YAML on
+    /// disk so the purger has something to delete.
+    fn make_archive_file(plans_dir: &Path, name: &str) -> PathBuf {
+        let archive_dir = plans_dir.join("archive");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        let path = archive_dir.join(format!("{name}.yaml"));
+        std::fs::write(&path, "title: archived\nphases: []\n").unwrap();
+        path
+    }
+
+    fn snapshot_count(db: &Db) -> i64 {
+        db.lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM plan_snapshots", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn audit_count(db: &Db, action: &str) -> i64 {
+        db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_logs WHERE action = ?1",
+                params![action],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn purge_expired_removes_expired_snapshots_and_archive_files() {
+        let (db, plans_dir, _tmp) = migrated_setup();
+        let plan = "expired-plan";
+        write_plan_file(&plans_dir, plan, "title: t\nphases: []\n");
+        let archive = make_archive_file(&plans_dir, plan);
+
+        // retention=0 → expires_at == now() so the very next purge tick
+        // removes the row.
+        let id = snapshot_plan_with_retention(
+            &db,
+            &plans_dir,
+            plan,
+            SnapshotKind::Delete,
+            Some(&archive),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot_count(&db),
+            1,
+            "precondition: snapshot row inserted"
+        );
+        assert!(archive.exists(), "precondition: archive file present");
+
+        let n = purge_expired_once(&db);
+        assert_eq!(n, 1, "exactly one expired row purged");
+        assert_eq!(snapshot_count(&db), 0, "snapshot row deleted");
+        assert!(!archive.exists(), "archive file deleted");
+
+        // Audit captures the purge per-row.
+        assert_eq!(
+            audit_count(&db, crate::audit::actions::PLAN_SNAPSHOT_PURGED),
+            1
+        );
+        let conn = db.lock().unwrap();
+        let (resource_id, diff_json): (String, String) = conn
+            .query_row(
+                "SELECT resource_id, diff FROM audit_logs \
+                 WHERE action = 'plan.snapshot_purged'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(resource_id, plan, "audit resource_id is the plan name");
+        let diff: serde_json::Value = serde_json::from_str(&diff_json).unwrap();
+        assert_eq!(diff["snapshot_id"], id);
+        assert_eq!(diff["kind"], "delete");
+        assert_eq!(diff["archive_path"], archive.to_str().unwrap());
+    }
+
+    #[test]
+    fn purge_expired_keeps_restored_rows_even_when_expired() {
+        let (db, plans_dir, _tmp) = migrated_setup();
+        let plan = "restored-plan";
+        write_plan_file(&plans_dir, plan, "title: t\nphases: []\n");
+
+        let id = snapshot_plan_with_retention(&db, &plans_dir, plan, SnapshotKind::Delete, None, 0)
+            .unwrap();
+        // Stamp the row as already-restored. The purger MUST leave it
+        // alone — `restored_at IS NOT NULL` is the audit flag that
+        // `POST /api/snapshots/:id/restore` already replayed it.
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE plan_snapshots SET restored_at = datetime('now') WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        let n = purge_expired_once(&db);
+        assert_eq!(n, 0, "restored snapshot must not be purged");
+        assert_eq!(snapshot_count(&db), 1, "snapshot row still present");
+        assert_eq!(
+            audit_count(&db, crate::audit::actions::PLAN_SNAPSHOT_PURGED),
+            0,
+            "no purge audit emitted"
+        );
+    }
+
+    #[test]
+    fn purge_expired_keeps_unexpired_rows() {
+        let (db, plans_dir, _tmp) = migrated_setup();
+        let plan = "future-plan";
+        write_plan_file(&plans_dir, plan, "title: t\nphases: []\n");
+
+        // 30-day retention → expires_at well in the future.
+        snapshot_plan_with_retention(
+            &db,
+            &plans_dir,
+            plan,
+            SnapshotKind::Delete,
+            None,
+            DEFAULT_RETENTION_DAYS,
+        )
+        .unwrap();
+
+        let n = purge_expired_once(&db);
+        assert_eq!(n, 0, "unexpired snapshot must not be purged");
+        assert_eq!(snapshot_count(&db), 1);
+    }
+
+    #[test]
+    fn purge_expired_handles_missing_archive_file() {
+        let (db, plans_dir, _tmp) = migrated_setup();
+        let plan = "ghost-archive";
+        write_plan_file(&plans_dir, plan, "title: t\nphases: []\n");
+        // archive_path is recorded but the file never existed (or was
+        // deleted by something else). Purger must still drop the row.
+        let phantom = plans_dir.join("archive").join("ghost.yaml");
+
+        let id = snapshot_plan_with_retention(
+            &db,
+            &plans_dir,
+            plan,
+            SnapshotKind::Delete,
+            Some(&phantom),
+            0,
+        )
+        .unwrap();
+
+        let n = purge_expired_once(&db);
+        assert_eq!(n, 1, "missing archive file is not a hard error");
+        assert_eq!(snapshot_count(&db), 0, "row removed despite NotFound");
+        // Audit row still records the archive path that was attempted.
+        let conn = db.lock().unwrap();
+        let diff_json: String = conn
+            .query_row(
+                "SELECT diff FROM audit_logs \
+                 WHERE action = 'plan.snapshot_purged' AND resource_id = ?1 \
+                 ORDER BY id DESC LIMIT 1",
+                params![plan],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let diff: serde_json::Value = serde_json::from_str(&diff_json).unwrap();
+        assert_eq!(diff["archive_path"], phantom.to_str().unwrap());
+        let _ = id;
+    }
+
+    #[test]
+    fn purge_expired_inherits_org_id_from_snapshot_row() {
+        let (db, plans_dir, _tmp) = migrated_setup();
+        let plan = "org-tagged-purge";
+        write_plan_file(&plans_dir, plan, "title: t\nphases: []\n");
+        // Seed a custom org through plan_org so the snapshot inherits it.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO organizations (id, name, slug) \
+                 VALUES ('org-purge', 'Purge Org', 'purge-org')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO plan_org (plan_name, org_id) VALUES (?1, 'org-purge')",
+                params![plan],
+            )
+            .unwrap();
+        }
+
+        snapshot_plan_with_retention(&db, &plans_dir, plan, SnapshotKind::Delete, None, 0).unwrap();
+        purge_expired_once(&db);
+
+        let stored_org: String = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT org_id FROM audit_logs WHERE action = 'plan.snapshot_purged'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored_org, "org-purge",
+            "purge audit row must inherit the snapshot row's org_id"
+        );
     }
 }
