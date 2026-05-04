@@ -477,6 +477,26 @@ pub async fn set_auto_advance(
 // surfaces `paused_reason` so the UI can show a banner explaining why the
 // loop self-paused. The dedicated `/auto-advance` route stays unchanged.
 
+/// Compile-time gate for fan-out spawn: until worktree-per-agent isolation
+/// (ADR 0002) ships, all `parallel = true` PUTs are rejected. Flip this to
+/// `true` once `pty_agent.rs` carries a `git worktree`-based spawn path so
+/// the enable side of the toggle becomes available again. Kept as a `pub`
+/// const so the grep target is stable for the worktree implementer.
+pub const WORKTREES_SHIPPED: bool = false;
+
+/// Read the per-project worktree opt-in flag. Returns `false` when no
+/// `plan_project` row exists for the plan or the column is 0. The toggling
+/// endpoint ships with the worktree plan; until then the column is forward-
+/// compatible storage that can only be set to 1 via direct SQL.
+fn project_worktree_opt_in(db: &rusqlite::Connection, name: &str) -> bool {
+    db.query_row(
+        "SELECT worktree_isolation_opt_in FROM plan_project WHERE plan_name = ?1",
+        params![name],
+        |row| row.get::<_, i64>(0).map(|v| v != 0),
+    )
+    .unwrap_or(false)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PlanConfig {
@@ -571,7 +591,47 @@ pub async fn put_plan_config(
     auth: OptionalAuthUser,
     Path(name): Path<String>,
     Json(body): Json<PlanConfigBody>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    // Worktree gate (Task 3.5.3): reject `parallel = true` until both
+    //   (1) worktree-per-agent isolation has shipped (compile-time const), and
+    //   (2) the project has opted in via `plan_project.worktree_isolation_opt_in`.
+    // Audit every refused attempt so a sysadmin can see the trail. Disabling
+    // (`parallel: false`) is never gated — turning the knob off must always
+    // succeed even if it somehow got flipped on.
+    if matches!(body.parallel, Some(true)) {
+        let opted_in = {
+            let db = state.db.lock().unwrap();
+            project_worktree_opt_in(&db, &name)
+        };
+        if !WORKTREES_SHIPPED || !opted_in {
+            let db = state.db.lock().unwrap();
+            crate::audit::log(
+                &db,
+                auth.org_id(),
+                auth.0.as_ref().map(|u| u.id.as_str()),
+                auth.0.as_ref().map(|u| u.email.as_str()),
+                crate::audit::actions::CONFIG_PARALLEL_REFUSED,
+                crate::audit::resources::PLAN,
+                Some(&name),
+                Some(
+                    &serde_json::json!({
+                        "requested": true,
+                        "reason": "worktrees_not_ready",
+                    })
+                    .to_string(),
+                ),
+            );
+            return (
+                StatusCode::PRECONDITION_FAILED,
+                Json(serde_json::json!({
+                    "error": "worktrees_required",
+                    "message": "Parallel auto-advance requires worktree-per-agent isolation. Enable it on the project once it ships.",
+                })),
+            )
+                .into_response();
+        }
+    }
+
     // Snapshot in-flight fix agents to kill BEFORE the enabled flag
     // flips, so a concurrent agent-completion path can't slip a fresh
     // fix agent in past the disable. Only populated when the request is

@@ -665,6 +665,18 @@ fn migrate(conn: &Connection) {
     )
     .ok();
 
+    // Per-project opt-in for worktree-per-agent isolation (ADR 0002). The
+    // plan-config PUT (3.5.3) gates `parallel = true` on this column AND
+    // the compile-time `WORKTREES_SHIPPED` const. The toggling endpoint
+    // ships with the worktree plan; until then the column is forward-
+    // compatible storage that can only be 1 via direct SQL. Lives on
+    // `plan_project` because plan-name is the project handle in standalone
+    // Branchwork.
+    conn.execute_batch(
+        "ALTER TABLE plan_project ADD COLUMN worktree_isolation_opt_in INTEGER NOT NULL DEFAULT 0;",
+    )
+    .ok();
+
     // Seed the default org and migrate orphaned users/plans into it.
     crate::auth::orgs::ensure_default_org(conn);
 

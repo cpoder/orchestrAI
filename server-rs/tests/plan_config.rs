@@ -193,23 +193,54 @@ fn parallel_defaults_to_false_in_get_response() {
     assert_eq!(body["parallel"], false, "row exists, parallel=0: {body}");
 }
 
+/// Seed `parallel = 1` on both auto-mode/auto-advance rows for `plan` by
+/// going around the API — the unified PUT now refuses `parallel = true`
+/// (Task 3.5.3) until worktrees ship, so any test that needs to start
+/// with the column flipped on must drive the DB directly. Mirrors what a
+/// historical row would look like once the worktree plan eventually
+/// flips `WORKTREES_SHIPPED` to true and an opted-in project enabled the
+/// toggle.
+fn seed_parallel_via_sql(db_path: &std::path::Path, plan: &str) {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute(
+        "INSERT INTO plan_auto_mode (plan_name, parallel) VALUES (?1, 1) \
+         ON CONFLICT(plan_name) DO UPDATE SET parallel = 1",
+        params![plan],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO plan_auto_advance (plan_name, parallel, updated_at) \
+         VALUES (?1, 1, datetime('now')) \
+         ON CONFLICT(plan_name) DO UPDATE SET parallel = 1",
+        params![plan],
+    )
+    .unwrap();
+}
+
 #[test]
-fn put_parallel_round_trips_via_unified_config() {
+fn put_parallel_disable_round_trips_via_unified_config() {
+    // Enable side is gated until worktrees ship (3.5.3); we still need
+    // proof that the disable path keeps both tables in lockstep so a
+    // stuck `parallel = 1` row can be flipped off via the API.
     let d = TestDashboard::new();
     d.create_plan("cfg-par-rt", &minimal_plan("cfg-par-rt", &d.project));
 
-    // PUT parallel=true, observe it in the response and on a fresh GET.
-    let (s, body) = d.put("/api/plans/cfg-par-rt/config", json!({"parallel": true}));
-    assert_eq!(s, 200, "body: {body}");
-    assert_eq!(body["parallel"], true);
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    seed_parallel_via_sql(&db_path, "cfg-par-rt");
 
     let (s, body) = d.get("/api/plans/cfg-par-rt/config");
     assert_eq!(s, 200);
-    assert_eq!(body["parallel"], true);
+    assert_eq!(
+        body["parallel"], true,
+        "seeded value must be visible: {body}"
+    );
 
-    // Both tables carry the value (kept in lockstep so each spawn helper
-    // sees the same answer).
-    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    // PUT parallel=false flips both tables back. No worktree gate fires
+    // on disable — turning the toggle off must always succeed.
+    let (s, body) = d.put("/api/plans/cfg-par-rt/config", json!({"parallel": false}));
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["parallel"], false);
+
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     let am: i64 = conn
         .query_row(
@@ -218,7 +249,7 @@ fn put_parallel_round_trips_via_unified_config() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(am, 1, "plan_auto_mode.parallel must be set");
+    assert_eq!(am, 0, "plan_auto_mode.parallel must be cleared");
     let aa: i64 = conn
         .query_row(
             "SELECT parallel FROM plan_auto_advance WHERE plan_name = ?1",
@@ -226,30 +257,22 @@ fn put_parallel_round_trips_via_unified_config() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(aa, 1, "plan_auto_advance.parallel must be set");
-    drop(conn);
-
-    // PUT parallel=false flips both tables back.
-    let (s, body) = d.put("/api/plans/cfg-par-rt/config", json!({"parallel": false}));
-    assert_eq!(s, 200, "body: {body}");
-    assert_eq!(body["parallel"], false);
+    assert_eq!(aa, 0, "plan_auto_advance.parallel must be cleared");
 }
 
 #[test]
 fn put_partial_preserves_parallel() {
     // PUT-ing other fields without `parallel` must not flip `parallel`
-    // back to its default.
+    // back to its default. Seeded via SQL because the API path that
+    // would set it is gated until worktrees ship (3.5.3).
     let d = TestDashboard::new();
     d.create_plan(
         "cfg-par-partial",
         &minimal_plan("cfg-par-partial", &d.project),
     );
 
-    let (s, _) = d.put(
-        "/api/plans/cfg-par-partial/config",
-        json!({"parallel": true}),
-    );
-    assert_eq!(s, 200);
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    seed_parallel_via_sql(&db_path, "cfg-par-partial");
 
     // PUT autoMode without parallel — parallel must remain true.
     let (s, body) = d.put(
@@ -267,6 +290,150 @@ fn put_partial_preserves_parallel() {
     assert_eq!(s, 200, "body: {body}");
     assert_eq!(body["parallel"], true, "parallel clobbered: {body}");
     assert_eq!(body["maxFixAttempts"], 7);
+}
+
+// ── 3.5.3 worktree gate tests ───────────────────────────────────────────
+
+#[test]
+fn put_parallel_true_returns_412_when_worktrees_not_shipped() {
+    // Acceptance: PUT with `parallel=true` returns 412 with the documented
+    // body when `WORKTREES_SHIPPED = false` (the build's default).
+    let d = TestDashboard::new();
+    d.create_plan("cfg-par-gate", &minimal_plan("cfg-par-gate", &d.project));
+
+    let (s, body) = d.put("/api/plans/cfg-par-gate/config", json!({"parallel": true}));
+    assert_eq!(s, 412, "body: {body}");
+    assert_eq!(body["error"], "worktrees_required", "body: {body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("worktree")),
+        "message must mention worktrees: {body}",
+    );
+
+    // The DB columns must NOT have flipped — refused requests have no
+    // side-effect on plan state.
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let am: Option<i64> = conn
+        .query_row(
+            "SELECT parallel FROM plan_auto_mode WHERE plan_name = ?1",
+            params!["cfg-par-gate"],
+            |row| row.get(0),
+        )
+        .ok();
+    assert!(
+        am.is_none() || am == Some(0),
+        "plan_auto_mode.parallel must not be set on refusal: {am:?}",
+    );
+    let aa: Option<i64> = conn
+        .query_row(
+            "SELECT parallel FROM plan_auto_advance WHERE plan_name = ?1",
+            params!["cfg-par-gate"],
+            |row| row.get(0),
+        )
+        .ok();
+    assert!(
+        aa.is_none() || aa == Some(0),
+        "plan_auto_advance.parallel must not be set on refusal: {aa:?}",
+    );
+
+    // Subsequent GET still reports parallel=false; the refusal didn't
+    // accidentally persist anything.
+    let (s, body) = d.get("/api/plans/cfg-par-gate/config");
+    assert_eq!(s, 200);
+    assert_eq!(body["parallel"], false);
+}
+
+#[test]
+fn put_parallel_true_with_opt_in_still_412_when_const_false() {
+    // Both gates must agree before parallel=true is allowed. Seed the
+    // per-project opt-in to 1 to confirm WORKTREES_SHIPPED=false alone
+    // is enough to refuse the toggle (defence-in-depth, AND semantics).
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cfg-par-optedin",
+        &minimal_plan("cfg-par-optedin", &d.project),
+    );
+
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO plan_project (plan_name, project, worktree_isolation_opt_in) \
+         VALUES (?1, ?2, 1) \
+         ON CONFLICT(plan_name) DO UPDATE SET worktree_isolation_opt_in = 1",
+        params!["cfg-par-optedin", d.project.to_string_lossy()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (s, body) = d.put(
+        "/api/plans/cfg-par-optedin/config",
+        json!({"parallel": true}),
+    );
+    assert_eq!(s, 412, "body: {body}");
+    assert_eq!(body["error"], "worktrees_required", "body: {body}");
+}
+
+#[test]
+fn put_parallel_true_audits_refused_attempt() {
+    // The refusal must be visible in the audit log so a sysadmin can see
+    // the trail of attempts. action = config.parallel_refused, diff
+    // carries `{requested: true, reason: "worktrees_not_ready"}`.
+    let d = TestDashboard::new();
+    d.create_plan("cfg-par-audit", &minimal_plan("cfg-par-audit", &d.project));
+
+    let (s, _) = d.put("/api/plans/cfg-par-audit/config", json!({"parallel": true}));
+    assert_eq!(s, 412);
+
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT diff FROM audit_logs \
+             WHERE action = 'config.parallel_refused' \
+               AND resource_type = 'plan' \
+               AND resource_id = ?1",
+        )
+        .unwrap();
+    let diffs: Vec<String> = stmt
+        .query_map(params!["cfg-par-audit"], |row| {
+            row.get::<_, Option<String>>(0)
+                .map(|o| o.unwrap_or_default())
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    assert_eq!(
+        diffs.len(),
+        1,
+        "expected one refused-attempt row, got: {diffs:?}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&diffs[0]).unwrap();
+    assert_eq!(parsed["requested"], true, "diff: {parsed}");
+    assert_eq!(parsed["reason"], "worktrees_not_ready", "diff: {parsed}");
+}
+
+#[test]
+fn put_parallel_false_is_never_gated() {
+    // Disabling the toggle must always succeed regardless of worktree
+    // state. The gate only blocks turning it on; turning it off must
+    // remain reachable so an operator can clear a stuck value.
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cfg-par-disable",
+        &minimal_plan("cfg-par-disable", &d.project),
+    );
+
+    // No seeding necessary — even on a clean state, disable is a no-op
+    // success path. (Seeding-then-disabling is covered by the round-trip
+    // test above.)
+    let (s, body) = d.put(
+        "/api/plans/cfg-par-disable/config",
+        json!({"parallel": false}),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["parallel"], false);
 }
 
 #[test]

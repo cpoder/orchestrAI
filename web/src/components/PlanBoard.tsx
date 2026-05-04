@@ -731,6 +731,12 @@ const AUTO_MODE_TOOLTIP =
   "Auto-mode: merges each task on completion, waits for CI, fixes failures up to N times before pausing.";
 const AUTO_ADVANCE_TOOLTIP =
   "Auto-advance: when a task completes, automatically start the next ready task in the plan.";
+/// Hover text for the disabled Parallel switch. The toggle is rendered but
+/// inert until worktree-per-agent isolation (ADR 0002) ships and the
+/// project opts in. PUTs of `parallel: true` are rejected 412 in the
+/// meantime — keeping the switch visible documents the future capability
+/// without letting an operator trip the gate by accident.
+const PARALLEL_DISABLED_TOOLTIP = "Available once worktree isolation ships";
 
 /// Plan-level auto-mode + auto-advance toggles. Reads/writes
 /// `/api/plans/:name/config`. The `max_fix_attempts` input only renders
@@ -810,6 +816,13 @@ function AutoModeControls({ planName }: { planName: string }) {
             checked={config.autoMode}
             disabled={busy}
             onChange={(v) => update({ autoMode: v })}
+          />
+          <Switch
+            label="Parallel"
+            title={PARALLEL_DISABLED_TOOLTIP}
+            checked={config.parallel}
+            disabled
+            onChange={() => {}}
           />
           {config.autoMode && (
             <label

@@ -90,12 +90,17 @@ export interface PlanConfig {
   autoMode: boolean;
   maxFixAttempts: number;
   pausedReason: string | null;
+  /// Per-plan opt-in for fan-out spawn (3.5.2). Toggling to true is rejected
+  /// at the API layer with 412 until worktree-per-agent isolation ships
+  /// (3.5.3) — the UI renders the switch disabled until then.
+  parallel: boolean;
 }
 
 export interface PlanConfigPatch {
   autoAdvance?: boolean;
   autoMode?: boolean;
   maxFixAttempts?: number;
+  parallel?: boolean;
   /// Explicit `null` clears the loop's self-pause and re-evaluates from the
   /// last completed task. Only the loop sets non-null values; the wire
   /// silently ignores non-null patches here.

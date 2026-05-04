@@ -15,6 +15,7 @@ function defaultConfig(overrides: Partial<PlanConfig> = {}): PlanConfig {
     autoMode: true,
     maxFixAttempts: 3,
     pausedReason: null,
+    parallel: false,
     ...overrides,
   };
 }
