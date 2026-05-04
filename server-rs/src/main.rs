@@ -198,6 +198,11 @@ async fn run_server(cli: Cli) {
         config.plans_dir.clone(),
     );
 
+    // Start the auto-mode idle poller (drivers without a Stop hook fall
+    // back to a 60 s tick + idle threshold). Off by default; set
+    // `BRANCHWORK_AUTO_FINISH_IDLE=1` to enable.
+    auto_mode::spawn_idle_poller(state.clone());
+
     // Start file watcher
     let _watcher =
         file_watcher::start(&config.plans_dir, broadcast_tx).expect("failed to start file watcher");

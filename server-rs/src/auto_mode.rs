@@ -1293,6 +1293,212 @@ async fn try_spawn_fix_agent_with_cap(
     }
 }
 
+// ── Idle poller ─────────────────────────────────────────────────────────────
+//
+// Background fallback for drivers that don't expose a Stop-hook surface.
+// Phase 1 wired Claude through `Driver::stop_hook_config` + per-session
+// settings file + `hooks::handle_stop_hook`, so Claude agents always trigger
+// auto-finish via the hook. Other drivers (Aider, Codex, Gemini today; any
+// future driver whose `stop_hook_config` returns `None`) have no programmatic
+// way to call back into us when their CLI returns to idle. This poller
+// closes the gap: every 60 s it scans `running` agents whose `last_activity_at`
+// has not advanced for `BRANCHWORK_AUTO_FINISH_IDLE_SECS` and fires the same
+// graceful-exit + audit + broadcast path the Stop hook uses, with
+// `trigger: "idle_timeout"` on the audit diff and broadcast payload.
+//
+// Off by default — set `BRANCHWORK_AUTO_FINISH_IDLE=1` on the server to
+// enable. ADR 0003 §"Failure modes" treats the timer as a stopgap that only
+// opt-in users see; driver-specific instrumentation is the long-term fix.
+
+const IDLE_POLL_INTERVAL_SECS: u64 = 60;
+const IDLE_THRESHOLD_DEFAULT_SECS: i64 = 300;
+
+/// Spawn the idle-poller background task. Runs forever; cancellation is
+/// process-exit only. Call once from `main::run_server`.
+pub fn spawn_idle_poller(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(IDLE_POLL_INTERVAL_SECS));
+        // The first .tick() fires immediately; consume it so the first
+        // real pass happens 60 s after server start, matching the CI
+        // poller's "sleep before work" cadence.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if std::env::var("BRANCHWORK_AUTO_FINISH_IDLE").as_deref() != Ok("1") {
+                continue;
+            }
+            let threshold_secs = std::env::var("BRANCHWORK_AUTO_FINISH_IDLE_SECS")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(IDLE_THRESHOLD_DEFAULT_SECS);
+            run_idle_pass(&state, threshold_secs).await;
+        }
+    });
+}
+
+/// One pass of the idle poller. Factored out from [`spawn_idle_poller`] so
+/// unit tests can drive it with synthetic threshold values without
+/// mutating the process-wide env var.
+///
+/// Mirrors the Stop-hook decision tree in
+/// [`crate::hooks::handle_stop_hook`] (filter on auto-mode-enabled, check
+/// tree state, dirty pauses with `agent_left_uncommitted_work`, clean
+/// fires `graceful_exit` + `AGENT_AUTO_FINISH` audit + `auto_finish_triggered`
+/// broadcast). The only differences:
+///   - upstream filter on `driver.stop_hook_config(...)` returning `None`
+///     so Claude agents (which always go through the hook) are skipped, and
+///   - `trigger` discriminator is `idle_timeout` instead of `stop_hook`.
+///
+/// Idempotency uses the same `auto_finish_dedupe` set as the Stop handler
+/// so the two triggers can't double-fire on the same agent.
+async fn run_idle_pass(state: &AppState, threshold_secs: i64) {
+    type Row = (
+        String,         // agent_id
+        String,         // session_id
+        Option<String>, // plan_name
+        Option<String>, // task_id
+        String,         // org_id
+        Option<String>, // driver name
+        i64,            // idle seconds (now - last_activity_at)
+    );
+    // SQL math: `strftime('%s','now') - strftime('%s', last_activity_at)`
+    // gives whole-second idle. last_activity_at is written via
+    // `datetime('now')` in `hooks::receive_hook` so both are UTC unix
+    // epoch seconds; no timezone math needed.
+    let rows: Vec<Row> = {
+        let conn = state.db.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, session_id, plan_name, task_id, org_id, driver, \
+             CAST(strftime('%s','now') - strftime('%s', last_activity_at) AS INTEGER) \
+             FROM agents \
+             WHERE status = 'running' AND last_activity_at IS NOT NULL",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[idle-poller] prepare failed: {e}");
+                return;
+            }
+        };
+        let iter = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        });
+        match iter {
+            Ok(it) => it.filter_map(Result::ok).collect(),
+            Err(e) => {
+                eprintln!("[idle-poller] query failed: {e}");
+                return;
+            }
+        }
+    };
+
+    let hook_url = format!("http://localhost:{}/hooks", state.port);
+    for (agent_id, session_id, plan_name, task_id, org_id, driver_name, idle_secs) in rows {
+        let Some(plan_name) = plan_name else {
+            continue;
+        };
+        // Driver registry lookup keeps the contract aligned with Phase 1:
+        // any driver that returns `Some(...)` from `stop_hook_config` owns
+        // its own auto-finish path (via the Claude `Stop` hook today, or
+        // an equivalent surface tomorrow) and must not be double-triggered
+        // by this poller.
+        let (_resolved, driver_arc) = state
+            .registry
+            .drivers
+            .get_or_default(driver_name.as_deref());
+        if driver_arc
+            .stop_hook_config(&session_id, &hook_url)
+            .is_some()
+        {
+            continue;
+        }
+        if !db::auto_mode_enabled(&state.db, &plan_name) {
+            continue;
+        }
+        if idle_secs < threshold_secs {
+            continue;
+        }
+        match crate::agents::check_tree_clean_for_completion(
+            &state.db,
+            &state.plans_dir,
+            &plan_name,
+        ) {
+            crate::agents::TreeState::Dirty { files } => {
+                let trimmed: Vec<&String> = files.iter().take(5).collect();
+                db::auto_mode_pause(&state.db, &plan_name, "agent_left_uncommitted_work");
+                let payload = serde_json::json!({
+                    "plan": plan_name,
+                    "task": task_id,
+                    "reason": "agent_left_uncommitted_work",
+                    "files": trimmed,
+                });
+                broadcast_event(&state.broadcast_tx, "auto_mode_paused", payload.clone());
+                let conn = state.db.lock().unwrap();
+                audit::log(
+                    &conn,
+                    &org_id,
+                    None,
+                    Some("branchwork-auto-mode"),
+                    actions::AUTO_MODE_PAUSED,
+                    audit::resources::PLAN,
+                    Some(&plan_name),
+                    Some(&payload.to_string()),
+                );
+                continue;
+            }
+            crate::agents::TreeState::Clean | crate::agents::TreeState::Unknown => {}
+        }
+
+        // Dedupe with the Stop-hook handler. The first trigger (whichever
+        // path fires first) wins for the lifetime of this `agent_id`.
+        let first_call = state
+            .auto_finish_dedupe
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone());
+        if !first_call {
+            continue;
+        }
+
+        let registry = state.registry.clone();
+        let agent_id_for_spawn = agent_id.clone();
+        tokio::spawn(async move {
+            registry.graceful_exit(&agent_id_for_spawn).await;
+        });
+        {
+            let conn = state.db.lock().unwrap();
+            audit::log(
+                &conn,
+                &org_id,
+                None,
+                Some("branchwork-auto-mode"),
+                audit::actions::AGENT_AUTO_FINISH,
+                audit::resources::AGENT,
+                Some(&agent_id),
+                Some(&serde_json::json!({ "trigger": "idle_timeout" }).to_string()),
+            );
+        }
+        broadcast_event(
+            &state.broadcast_tx,
+            "auto_finish_triggered",
+            serde_json::json!({
+                "agent_id": agent_id,
+                "plan": plan_name,
+                "task": task_id,
+                "trigger": "idle_timeout",
+            }),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Integration-style tests for the auto-mode merge-on-completion hook.
@@ -3720,5 +3926,292 @@ mod tests {
         .await;
 
         assert_eq!(outcome, CiOutcome::Cancelled);
+    }
+
+    // ── Idle poller ─────────────────────────────────────────────────────────
+
+    /// Insert a `running` agent with an explicit `driver` and a controlled
+    /// `last_activity_at` (`idle_secs` seconds in the past) so the idle
+    /// poller can be exercised deterministically.
+    fn seed_running_agent_idle(
+        db: &Db,
+        id: &str,
+        cwd: &Path,
+        plan: &str,
+        task: &str,
+        driver: &str,
+        idle_secs: u32,
+    ) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents \
+                (id, session_id, cwd, status, mode, plan_name, task_id, driver, \
+                 last_activity_at, org_id) \
+             VALUES (?1, ?1, ?2, 'running', 'pty', ?3, ?4, ?5, \
+                     datetime('now', ?6), 'default-org')",
+            params![
+                id,
+                cwd.to_string_lossy(),
+                plan,
+                task,
+                driver,
+                format!("-{idle_secs} seconds"),
+            ],
+        )
+        .unwrap();
+    }
+
+    fn map_plan_to_project(db: &Db, plan: &str, project: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO plan_project (plan_name, project) VALUES (?1, ?2) \
+             ON CONFLICT(plan_name) DO UPDATE SET project = excluded.project",
+            params![plan, project],
+        )
+        .unwrap();
+    }
+
+    fn audit_diff_for(db: &Db, resource_id: &str, action: &str) -> Option<String> {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT diff FROM audit_logs WHERE resource_id = ?1 AND action = ?2 \
+             ORDER BY id LIMIT 1",
+            params![resource_id, action],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    }
+
+    fn drain_events(rx: &mut broadcast::Receiver<String>) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) {
+                out.push(v);
+            }
+        }
+        out
+    }
+
+    /// Claude agents are owned by the Stop-hook path; the idle poller
+    /// must skip them so the two triggers can't double-fire on the same
+    /// agent. Filter is the registry lookup
+    /// (`stop_hook_config(...).is_some()`), not a driver-name string match,
+    /// so future drivers that opt into the hook surface inherit the
+    /// exclusion automatically.
+    #[tokio::test]
+    async fn idle_poller_skips_drivers_with_stop_hook_config() {
+        let (db, dir) = fresh_db();
+        let cwd = dir.path().join("project");
+        git_init_master(&cwd);
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+
+        seed_running_agent_idle(&db, "a-1", &cwd, "p", "1.1", "claude", 1000);
+        enable_auto_mode(&db, "p");
+        map_plan_to_project(&db, "p", &cwd.to_string_lossy());
+
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+
+        run_idle_pass(&state, 60).await;
+
+        let evs = drain_event_types(&mut rx);
+        assert!(
+            !evs.iter().any(|t| t == "auto_finish_triggered"),
+            "claude agent must be skipped, got: {evs:?}"
+        );
+        assert!(audit_actions_for(&db, "a-1").is_empty());
+    }
+
+    /// Threshold gate: an agent whose `last_activity_at` is more recent
+    /// than the configured idle window must not be touched.
+    #[tokio::test]
+    async fn idle_poller_skips_under_threshold() {
+        let (db, dir) = fresh_db();
+        let cwd = dir.path().join("project");
+        git_init_master(&cwd);
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+
+        seed_running_agent_idle(&db, "a-1", &cwd, "p", "1.1", "aider", 30);
+        enable_auto_mode(&db, "p");
+        map_plan_to_project(&db, "p", &cwd.to_string_lossy());
+
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+
+        run_idle_pass(&state, 300).await;
+
+        let evs = drain_event_types(&mut rx);
+        assert!(
+            !evs.iter().any(|t| t == "auto_finish_triggered"),
+            "agent under threshold must not fire auto-finish, got: {evs:?}"
+        );
+    }
+
+    /// Auto-mode-off gate: even a long-idle agent on a plan whose
+    /// auto-mode is disabled must stay untouched (the poller shares this
+    /// gate with the Stop hook for parity).
+    #[tokio::test]
+    async fn idle_poller_skips_when_auto_mode_off() {
+        let (db, dir) = fresh_db();
+        let cwd = dir.path().join("project");
+        git_init_master(&cwd);
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+
+        seed_running_agent_idle(&db, "a-1", &cwd, "p", "1.1", "aider", 1000);
+        // Deliberately no enable_auto_mode — gate stays false.
+        map_plan_to_project(&db, "p", &cwd.to_string_lossy());
+
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+
+        run_idle_pass(&state, 60).await;
+
+        let evs = drain_event_types(&mut rx);
+        assert!(
+            !evs.iter().any(|t| t == "auto_finish_triggered"),
+            "auto-mode-off plan must not fire, got: {evs:?}"
+        );
+    }
+
+    /// Happy path: idle agent + auto-mode on + clean tree + non-Claude
+    /// driver → graceful_exit fired (proxy: AGENT_AUTO_FINISH audit row),
+    /// `auto_finish_triggered` broadcast carries `trigger: "idle_timeout"`,
+    /// and the plan stays unpaused.
+    #[tokio::test]
+    async fn idle_poller_clean_tree_fires_graceful_exit_and_audit() {
+        let (db, dir) = fresh_db();
+        let cwd = dir.path().join("project");
+        git_init_master(&cwd);
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+
+        seed_running_agent_idle(&db, "a-1", &cwd, "p", "1.1", "aider", 1000);
+        enable_auto_mode(&db, "p");
+        map_plan_to_project(&db, "p", &cwd.to_string_lossy());
+
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+
+        run_idle_pass(&state, 60).await;
+        // Give the spawned graceful_exit task a tick (no-op without a live
+        // PTY, but we want to make sure it doesn't panic).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let actions = audit_actions_for(&db, "a-1");
+        assert!(
+            actions
+                .iter()
+                .any(|a| a == audit::actions::AGENT_AUTO_FINISH),
+            "expected AGENT_AUTO_FINISH in {actions:?}"
+        );
+        let diff = audit_diff_for(&db, "a-1", audit::actions::AGENT_AUTO_FINISH)
+            .expect("AGENT_AUTO_FINISH should have a diff");
+        assert!(
+            diff.contains("\"trigger\":\"idle_timeout\""),
+            "diff should pin trigger to idle_timeout, got: {diff}"
+        );
+
+        let evs = drain_events(&mut rx);
+        let triggered = evs
+            .iter()
+            .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("auto_finish_triggered"))
+            .expect("expected auto_finish_triggered broadcast");
+        let data = triggered.get("data").unwrap();
+        assert_eq!(
+            data.get("trigger").and_then(|v| v.as_str()),
+            Some("idle_timeout")
+        );
+        assert_eq!(data.get("agent_id").and_then(|v| v.as_str()), Some("a-1"));
+        assert_eq!(data.get("plan").and_then(|v| v.as_str()), Some("p"));
+        assert_eq!(data.get("task").and_then(|v| v.as_str()), Some("1.1"));
+
+        assert!(
+            paused_reason(&db, "p").is_none(),
+            "clean-tree path must not pause the plan"
+        );
+    }
+
+    /// Dirty-tree path: idle non-Claude agent left uncommitted work →
+    /// pause the plan with `agent_left_uncommitted_work`, broadcast
+    /// `auto_mode_paused`, log `AUTO_MODE_PAUSED` against the plan, no
+    /// `AGENT_AUTO_FINISH` row, no `auto_finish_triggered` broadcast.
+    /// Mirrors the Stop-hook dirty-tree branch in `hooks::handle_stop_hook`.
+    #[tokio::test]
+    async fn idle_poller_dirty_tree_pauses_plan() {
+        let (db, dir) = fresh_db();
+        let cwd = dir.path().join("project");
+        git_init_master(&cwd);
+        // Modify a tracked file without committing — porcelain reports it.
+        std::fs::write(cwd.join("README.md"), "modified but not committed").unwrap();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+
+        seed_running_agent_idle(&db, "a-1", &cwd, "p", "1.1", "aider", 1000);
+        enable_auto_mode(&db, "p");
+        map_plan_to_project(&db, "p", &cwd.to_string_lossy());
+
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+
+        run_idle_pass(&state, 60).await;
+
+        assert_eq!(
+            paused_reason(&db, "p").as_deref(),
+            Some("agent_left_uncommitted_work")
+        );
+        let evs = drain_event_types(&mut rx);
+        assert!(evs.iter().any(|t| t == "auto_mode_paused"));
+        assert!(
+            !evs.iter().any(|t| t == "auto_finish_triggered"),
+            "dirty-tree path must not fire auto_finish_triggered"
+        );
+
+        let plan_actions = audit_actions_for(&db, "p");
+        assert!(plan_actions.iter().any(|a| a == actions::AUTO_MODE_PAUSED));
+        let agent_actions = audit_actions_for(&db, "a-1");
+        assert!(
+            !agent_actions
+                .iter()
+                .any(|a| a == audit::actions::AGENT_AUTO_FINISH),
+            "AGENT_AUTO_FINISH must not fire on the dirty path"
+        );
+    }
+
+    /// Two passes for the same long-idle agent: the second pass must be a
+    /// dedupe no-op because the agent's `status` is still `running`
+    /// (the row only flips to `completed` inside `on_agent_exit` after
+    /// the PTY actually closes — we don't drive a real PTY here).
+    /// Counter-proxy: AGENT_AUTO_FINISH audit count == 1.
+    #[tokio::test]
+    async fn idle_poller_dedupes_across_two_passes() {
+        let (db, dir) = fresh_db();
+        let cwd = dir.path().join("project");
+        git_init_master(&cwd);
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+
+        seed_running_agent_idle(&db, "a-1", &cwd, "p", "1.1", "aider", 1000);
+        enable_auto_mode(&db, "p");
+        map_plan_to_project(&db, "p", &cwd.to_string_lossy());
+
+        let (state, _rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+
+        run_idle_pass(&state, 60).await;
+        run_idle_pass(&state, 60).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let count: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM audit_logs WHERE resource_id = 'a-1' AND action = ?1",
+                params![audit::actions::AGENT_AUTO_FINISH],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            count, 1,
+            "AGENT_AUTO_FINISH must be written exactly once across two passes"
+        );
+        assert!(state.auto_finish_dedupe.lock().unwrap().contains("a-1"));
     }
 }
