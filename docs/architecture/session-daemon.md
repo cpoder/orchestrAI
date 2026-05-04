@@ -131,17 +131,18 @@ The daemon-to-client transport is abstracted through the
   there's nothing to unlink — `ListenerOptions::try_overwrite(true)`
   is documented as a no-op there.
 
-The same `Path` is used to derive three sibling files on both
+The same `Path` is used to derive four sibling files on both
 platforms:
 
-| Path                | Owner                  | Lifetime                                                                                |
-| ------------------- | ---------------------- | --------------------------------------------------------------------------------------- |
-| `<socket>`          | The daemon (listener). | Created on bind, unlinked on clean shutdown (Unix only — named pipes vanish on close).  |
-| `<socket>.pid`      | The daemon.            | Written after detach, removed on clean shutdown. **Presence after exit ⇒ crash.**       |
-| `<socket>.log`      | The daemon.            | Open-append for the daemon's lifetime, fsync-on-write for every chunk. Survives exit. |
-| `<socket>.mcp.json` | The server (spawner).  | Written by `start_pty_agent` when the driver advertises an MCP config.                  |
+| Path                     | Owner                  | Lifetime                                                                                |
+| ------------------------ | ---------------------- | --------------------------------------------------------------------------------------- |
+| `<socket>`               | The daemon (listener). | Created on bind, unlinked on clean shutdown (Unix only — named pipes vanish on close).  |
+| `<socket>.pid`           | The daemon.            | Written after detach, removed on clean shutdown. **Presence after exit ⇒ crash.**       |
+| `<socket>.log`           | The daemon.            | Open-append for the daemon's lifetime, fsync-on-write for every chunk. Survives exit. |
+| `<socket>.mcp.json`      | The server (spawner).  | Written by `start_pty_agent` when the driver advertises an MCP config.                  |
+| `<socket>.settings.json` | The server (spawner).  | Written by `start_pty_agent` when the driver supplies an unattended-mode hook config (see [Per-session settings file](#per-session-settings-file)); removed best-effort on agent exit, with a `cleanup_and_reattach` sweep for crash leaks. |
 
-Default location is `<sockets_dir>/<agent-id>.{sock,log,pid,mcp.json}`
+Default location is `<sockets_dir>/<agent-id>.{sock,log,pid,mcp.json,settings.json}`
 where `sockets_dir` is configurable on `AgentRegistry`; the typical
 self-hosted layout puts these under `~/.claude/sessions/` (see
 user-guide.md for the full `~/.claude/` tree).
@@ -276,6 +277,56 @@ The on-disk log is **never** truncated by the daemon. It is the only
 record of what the agent actually printed, and it is what makes
 post-mortem debugging of crashed agents possible.
 
+## Per-session settings file
+
+For self-hosted unattended auto-mode ([ADR 0003](../adrs/0003-unattended-auto-mode.md))
+each agent gets a private `claude` settings file at
+`<sockets_dir>/<agent_id>.settings.json` — same naming convention as
+the `<agent_id>.mcp.json` sibling. The server writes it before spawn
+inside [`start_pty_agent`](../../server-rs/src/agents/pty_agent.rs)
+(next to the existing `mcp.json` write at `pty_agent.rs:116`) and
+removes it best-effort on agent exit; `cleanup_and_reattach` sweeps
+crash-leaked files for orphaned agent rows on startup.
+
+**Insertion point in argv.** The `--settings <path>` flag is appended
+inside the driver-built argv, *not* the `branchwork-server session`
+argv. Concretely it lands in
+[`ClaudeDriver::spawn_args`](../../server-rs/src/agents/driver.rs)
+(the `impl AgentDriver for ClaudeDriver` block, around the
+`spawn_args` method that today emits `--session-id`, `--add-dir`,
+`--verbose`, `--effort`, then the conditional `--dangerously-skip-permissions`,
+`--max-budget-usd`, `--mcp-config` arms). The `--settings` arm sits
+alongside `--mcp-config` since both are conditional, per-session,
+path-valued flags whose path is computed by `start_pty_agent` and
+threaded in via `SpawnOpts` (the Claude-specific
+`SpawnOpts.settings_path` field is added at the same time as the flag).
+The result is a `Vec<String>` that `start_pty_agent` then hands to
+[`supervisor::spawn_session_daemon`](../../server-rs/src/agents/supervisor.rs)
+verbatim as `cli_cmd` (`pty_agent.rs:146`).
+
+**No shell-escape hazard.** `spawn_session_daemon` builds the daemon
+invocation with `Command::new(exe).args(...)` — no `/bin/sh -c`, no
+string interpolation. Inside the daemon, `run_daemon` constructs a
+`portable_pty::CommandBuilder` (`CommandBuilder::new(&cmd[0])` followed
+by one `builder.arg(a)` per remaining element at `supervisor.rs:301-304`)
+and spawns the CLI with `pair.slave.spawn_command(builder)` —
+`execve`-style spawn, one element per argv slot. A settings path
+containing spaces, quotes, backslashes, or other shell metacharacters
+is therefore handled correctly without any escaping on the producer
+side. This is the same property the existing `--mcp-config` and
+`--add-dir` flags already rely on.
+
+**Scope: standalone only.** The runner-side spawn path
+([runner.md → Spawning agents](runner.md#spawning-agents-and-reusing-the-session-daemon))
+constructs its own `claude` argv and would need a separate plumbing
+pass to honour the settings file — see ADR 0003's
+"Scope: standalone only" subsection and the saas-compat-* backlog.
+
+For the full unattended-mode contract — file lifecycle, settings
+contents (a single `Stop` hook posting to `http://localhost:<port>/hooks`),
+and the auto-finish gate that runs in `hooks.rs::receive_hook` — see
+[ADR 0003](../adrs/0003-unattended-auto-mode.md).
+
 ## Sequence: attach → type → exit
 
 ```mermaid
@@ -310,5 +361,6 @@ sequenceDiagram
 
 - [overview.md](overview.md) — the three-binary diagram, the persistence table, and the end-to-end Start-task walkthroughs.
 - [server.md](server.md) — `cleanup_and_reattach`, `AgentRegistry`, and how the dashboard fits the supervisor into its lifecycle.
+- [ADR 0003](../adrs/0003-unattended-auto-mode.md) — full contract for the per-session settings file (Stop-hook payload, lifecycle, scope).
 - protocols.md _(stub)_ — full session frame format, runner WireMessage tagged union, hook POST shape, dashboard WS event vocabulary.
 - [`server-rs/src/agents/supervisor.rs`](../../server-rs/src/agents/supervisor.rs), [`session_protocol.rs`](../../server-rs/src/agents/session_protocol.rs), [`bin/session_daemon.rs`](../../server-rs/src/bin/session_daemon.rs) — the canonical implementation.
