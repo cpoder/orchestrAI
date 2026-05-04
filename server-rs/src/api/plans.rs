@@ -2979,6 +2979,55 @@ mod check_prompt_tests {
     }
 
     #[test]
+    fn prompt_shape_has_no_lifecycle_vocabulary() {
+        let plan = sample_plan();
+        let phase = plan_parser::PlanPhase {
+            number: 1,
+            title: "Phase One".into(),
+            description: String::new(),
+            tasks: vec![],
+        };
+        let task = sample_task(
+            "1.3",
+            vec![
+                "server-rs/src/api/plans.rs".into(),
+                "web/src/foo.tsx".into(),
+            ],
+        );
+        let prompt = build_check_prompt(
+            "dashboard-polish",
+            &plan,
+            &phase,
+            &task,
+            std::path::Path::new("/tmp/proj"),
+        );
+        assert!(
+            !prompt.contains("branch"),
+            "prompt must not contain \"branch\""
+        );
+        assert!(
+            !prompt.contains("git log"),
+            "prompt must not contain \"git log\""
+        );
+        assert!(
+            !prompt.contains("task branch"),
+            "prompt must not contain \"task branch\""
+        );
+        assert!(
+            !prompt.contains("committed"),
+            "prompt must not contain \"committed\""
+        );
+        assert!(
+            !prompt.contains("--not master"),
+            "prompt must not contain \"--not master\""
+        );
+        assert!(
+            !prompt.contains("--not main"),
+            "prompt must not contain \"--not main\""
+        );
+    }
+
+    #[test]
     fn plan_check_prompt_includes_verification_and_task_split() {
         let mut plan = sample_plan();
         plan.verification = Some("1. The endpoint returns 200.\n2. The verdict is stored.".into());
