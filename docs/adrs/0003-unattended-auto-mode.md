@@ -115,6 +115,50 @@ Refactor `agents::mod::try_auto_advance` (currently `server-rs/src/agents/mod.rs
 
 Eligibility is the same `(status pending|failed) && deps in done_set` predicate already used for the cross-phase scan. The shared helper is extracted as `spawn_ready_tasks(phase, done_set, …)` so both call sites use one source of truth.
 
+#### WS event shapes (locked in by Task 0.4)
+
+Two distinct events with two distinct payload shapes — the UI must be able to tell "advancing within phase" apart from "phase boundary crossed" without inspecting plan state.
+
+**`phase_advanced`** — kept verbatim from today (`server-rs/src/agents/mod.rs:1251-1259`). Meaning: a phase is fully done and the auto-advance scan has just spawned the first batch of tasks in the next phase.
+
+```json
+{
+  "plan_name": "saas-folder-listing-via-runner",
+  "from_phase": 4,
+  "to_phase": 5
+}
+```
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `plan_name` | string | Plan slug. Field name preserved for backward compatibility with the existing pill UI and any external listeners. |
+| `from_phase` | integer | The phase that just finished. |
+| `to_phase` | integer | The phase whose tasks were just spawned. |
+
+**`task_advanced`** — new event introduced by Phase 3. Meaning: a task within a phase has finished and the auto-advance scan has just spawned one or more newly-ready tasks **within the same phase** (no phase boundary crossed).
+
+```json
+{
+  "plan": "saas-folder-listing-via-runner",
+  "from_task": "5.1",
+  "to_tasks": ["5.2"]
+}
+```
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `plan` | string | Plan slug. Field name follows the `auto_mode.rs` broadcast convention (`auto_mode_merged`, `auto_mode_paused`, `auto_mode_state`, …) — `task_advanced` is wired alongside that loop, so the field name aligns there rather than mirroring `phase_advanced`'s legacy `plan_name`. |
+| `from_task` | string | The task that just completed and triggered this scan (e.g. `"5.1"`). Always set — `task_advanced` is only emitted in response to a completion. |
+| `to_tasks` | array of strings | Task numbers of every task that became ready *and* was successfully spawned in this scan (i.e. that won the `claim_task` race). Always non-empty — if the scan finds no ready tasks the event is **not** broadcast. |
+
+The two events are deliberately non-overlapping:
+
+- A single auto-advance scan emits **either** `task_advanced` (intra-phase) **or** `phase_advanced` (cross-phase), never both.
+- `phase_advanced` keeps its current `plan_name`/`from_phase`/`to_phase` shape so existing dashboards and the phase-pill UI (`web/src/components/PlanBoard.tsx`) keep working without changes.
+- `task_advanced` carries no phase numbers — within-phase advances don't change the phase pill, so the pill UI ignores the event. The plan board re-renders task pills off `task_status_changed` (already broadcast at `agents/mod.rs:1207-1215`); `task_advanced` is the *trigger* the frontend uses to refetch plan-level config (e.g. paused-reason, fix-attempt counters) without polling.
+
+Phase 3 broadcasts both events from the rework site. Phase 6 (Frontend / UX surfacing — see §5 below) handles `task_advanced` on the dashboard side.
+
 ### 4. Per-driver fallback to idle timer (off by default)
 
 The Stop hook is Claude-specific. For other drivers a new trait method:
@@ -129,7 +173,9 @@ returns `Some(...)` for Claude and `None` for Aider/Codex/Gemini. When `None` is
 
 ### 5. UX surfacing
 
-- Frontend handles the new `task_advanced` event by refreshing the plan view (no banner needed — task pills already animate on status change).
+Phase 6 (Frontend / UX surfacing) wires these:
+
+- Frontend handles the new `task_advanced` event (shape pinned in §3 above) by refetching plan-level config — no banner, no pill change, since per-task pills already animate off `task_status_changed`.
 - Frontend handles a new `auto_finish_triggered` broadcast event with a small pill on the agent row (`auto-finished`) distinct from the manual `finished` pill.
 - Audit log UI renders a trigger badge (`stop_hook` / `idle_timeout`) on `agent.auto_finish` rows.
 - Plan-detail banner shows `Paused: agent left uncommitted work` for plans paused by the tree gate, with a one-click "Inspect" link to the agent's worktree.
@@ -186,6 +232,8 @@ The hook URL contract pinned in Decision §1 (`http://localhost:<port>/hooks` wi
 - Existing intra-phase early-return: `server-rs/src/agents/mod.rs:1089-1138`.
 - Existing hook receiver: `server-rs/src/hooks.rs:18`.
 - Existing graceful exit (the call we re-enter from the Stop handler): `server-rs/src/agents/mod.rs:605`.
+- Existing `phase_advanced` broadcast (whose shape Decision §3 pins verbatim): `server-rs/src/agents/mod.rs:1251-1259`.
+- Existing `auto_mode.rs` broadcast convention that `task_advanced` follows on the `plan` field name: `server-rs/src/auto_mode.rs:152` (`auto_mode_merged`), `:189` (`auto_mode_paused`), `:222` (`auto_mode_state`).
 - Existing per-agent file siblings already living in the chosen directory: `AgentRegistry::socket_for` / `mcp_config_for` (`server-rs/src/agents/mod.rs:308-319`), pidfile via `supervisor::pidfile_path` (`server-rs/src/agents/supervisor.rs:174`), `sockets_dir` initialized at `server-rs/src/main.rs:74`.
 - `claude --settings <file-or-json>` flag verified via `claude --help` on 2026-05-04 (Claude Code CLI installed locally). Decision §1 also notes why we do **not** pair it with `--setting-sources`.
 - Hook URL contract sources: `AgentRegistry.port` field (`server-rs/src/agents/mod.rs:245`), threaded into drivers at `pty_agent.rs:116` (`driver.mcp_config_json(registry.port)`), and reused by the Claude driver to build `http://127.0.0.1:<port>/mcp` at `server-rs/src/agents/driver.rs:280` — same `<port>` the Stop hook URL targets.
