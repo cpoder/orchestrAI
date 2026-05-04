@@ -76,11 +76,7 @@ impl AppState {
     /// [`Self::cancel_token_for`] call will create a fresh one. Idempotent
     /// — a missing key is a no-op (nothing in flight to abort).
     pub fn cancel_plan(&self, plan_name: &str) {
-        let token = self
-            .cancellation_tokens
-            .lock()
-            .unwrap()
-            .remove(plan_name);
+        let token = self.cancellation_tokens.lock().unwrap().remove(plan_name);
         if let Some(token) = token {
             token.cancel();
         }

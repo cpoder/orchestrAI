@@ -1226,8 +1226,15 @@ async fn try_spawn_fix_agent_with_cap(
     }
 
     let next_attempt = attempts.saturating_add(1);
-    let new_fix_agent =
-        spawn_fix_agent(state, org_id, plan_name, task_id, failing_run_id_str, next_attempt).await;
+    let new_fix_agent = spawn_fix_agent(
+        state,
+        org_id,
+        plan_name,
+        task_id,
+        failing_run_id_str,
+        next_attempt,
+    )
+    .await;
 
     if let Some(new_id) = new_fix_agent {
         let next_fix_task = format!("{task_id}-fix-{next_attempt}");
@@ -3491,16 +3498,8 @@ mod tests {
         // Calls 1..=3 must spawn (count→cap window is open); call 4 must
         // pause with fix_cap_reached.
         for _ in 0..4 {
-            try_spawn_fix_agent_with_cap(
-                &state,
-                org_id,
-                "p",
-                "0.1",
-                "deadbeef",
-                "42",
-                Some("42"),
-            )
-            .await;
+            try_spawn_fix_agent_with_cap(&state, org_id, "p", "0.1", "deadbeef", "42", Some("42"))
+                .await;
         }
 
         // Acceptance #1: exactly 3 fix-attempt rows recorded.
@@ -3642,7 +3641,11 @@ mod tests {
             .flatten()
             .collect()
         };
-        assert_eq!(in_flight.len(), 1, "should snapshot exactly the one fix agent");
+        assert_eq!(
+            in_flight.len(),
+            1,
+            "should snapshot exactly the one fix agent"
+        );
         state.cancel_plan("p");
         for (agent_id, agent_org) in &in_flight {
             let _ =
@@ -3665,7 +3668,10 @@ mod tests {
             )
             .unwrap()
         };
-        assert_eq!(status, "killed", "fix agent row should be in status='killed'");
+        assert_eq!(
+            status, "killed",
+            "fix agent row should be in status='killed'"
+        );
 
         // Acceptance #3: no merge runs. The auto_mode_enabled() gate at
         // the entry of `on_task_agent_completed` returns false (enabled=0
