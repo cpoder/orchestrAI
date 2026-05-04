@@ -243,6 +243,8 @@ export function PlanBoard() {
         )}
       </div>
 
+      <UncommittedWorkBanner planName={plan.name} />
+
       {/* Status filter */}
       <div className="flex items-center gap-1 mb-4">
         <span className="text-[10px] text-gray-600 mr-1">Filter</span>
@@ -858,6 +860,67 @@ function AutoModeControls({ planName }: { planName: string }) {
           {error}
         </span>
       )}
+    </div>
+  );
+}
+
+/// Banner above the board for the `agent_left_uncommitted_work` pause.
+/// The Stop hook fires before graceful_exit in this case (per the
+/// non-negotiable in the auto-mode plan), so the task agent's row is
+/// still `running` and the user needs to inspect, then commit/discard,
+/// then click Resume on the pill above. The "Inspect agent" button opens
+/// the running agent's terminal panel so they can do exactly that.
+export function UncommittedWorkBanner({ planName }: { planName: string }) {
+  const config = usePlanStore((s) => s.planConfigs[planName] ?? null);
+  const agents = useAgentStore((s) => s.agents);
+  const selectAgent = useAgentStore((s) => s.selectAgent);
+
+  if (config?.pausedReason !== "agent_left_uncommitted_work") return null;
+
+  // Per the non-negotiable, the Stop-hook handler does NOT fire
+  // graceful_exit when the tree is dirty — so the task agent that
+  // triggered the pause is still in `running` (or transiently
+  // `starting`). Sequential gate (3.5.1) keeps at most one task agent
+  // alive per plan, so the first match is the one to inspect.
+  const runningAgent = agents.find(
+    (a) =>
+      a.plan_name === planName &&
+      a.task_id !== null &&
+      (a.status === "running" || a.status === "starting"),
+  );
+
+  return (
+    <div
+      role="alert"
+      className="mb-4 flex items-start gap-3 rounded border border-red-700/50 bg-red-900/20 px-4 py-3 text-sm"
+    >
+      <span
+        aria-hidden="true"
+        className="mt-0.5 inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-red-700/60 text-xs font-bold text-red-100"
+      >
+        !
+      </span>
+      <div className="flex-1 text-red-100">
+        <div className="font-medium">
+          Auto-mode paused: agent left uncommitted work.
+        </div>
+        <div className="mt-0.5 text-red-200/80">
+          Inspect and either commit, discard, or click Resume.
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={() => runningAgent && selectAgent(runningAgent.id)}
+        disabled={!runningAgent}
+        className="flex-shrink-0 self-center rounded border border-red-700/60 bg-red-900/40 px-3 py-1 text-xs text-red-100 transition hover:bg-red-800/50 hover:text-white disabled:opacity-50 disabled:hover:bg-red-900/40 disabled:hover:text-red-100"
+        title={
+          runningAgent
+            ? "Open the agent's terminal panel"
+            : "No running agent found for this plan"
+        }
+      >
+        Inspect agent
+      </button>
     </div>
   );
 }
