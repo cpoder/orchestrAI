@@ -55,10 +55,21 @@ export function PhaseCard({ phase, planName, statusFilter }: Props) {
           : "border-gray-800 bg-gray-900"
       }`}
     >
-      {/* Phase header — always visible, clickable */}
-      <button
+      {/* Phase header — always visible, clickable. Uses a div instead of a
+        * button so the nested "Check" <button> below stays HTML-valid (a
+        * <button> cannot legally contain another <button>; React flags it
+        * as a hydration error in dev). */}
+      <div
+        role="button"
+        tabIndex={0}
         onClick={() => setExpanded(!expanded)}
-        className="w-full text-left p-3 hover:bg-gray-800/30 transition rounded-lg"
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            setExpanded(!expanded);
+          }
+        }}
+        className="w-full text-left p-3 hover:bg-gray-800/30 transition rounded-lg cursor-pointer"
       >
         <div className="flex items-center gap-3">
           {/* Expand arrow */}
@@ -129,7 +140,7 @@ export function PhaseCard({ phase, planName, statusFilter }: Props) {
             </span>
           </div>
         </div>
-      </button>
+      </div>
 
       {/* Expanded: show tasks */}
       {expanded && filteredTasks.length > 0 && (
