@@ -2526,4 +2526,453 @@ mod tests {
             "to_tasks must be a 1-element array, event was: {task_advanced}",
         );
     }
+
+    // ── Task 3.5.5 — sequential gate under fan-out + ignored toggle ──
+    //
+    // Three regression tests pinning that the 3.5.1 break in
+    // `spawn_ready_tasks` is the load-bearing safety today:
+    //   1. The phase-boundary path also spawns one-per-tick when
+    //      multiple dep-free tasks land in the next phase.
+    //   2. Forcing `plan_auto_mode.parallel=1` via direct SQL
+    //      (bypassing the API gate) does not relax the loop —
+    //      the runtime ignores the column for now, and that is
+    //      exactly what keeps a single working tree safe from
+    //      racing agents until worktree isolation ships.
+    //   3. A linear chain crossing a phase boundary calls
+    //      `claim_task` exactly once per advance — proxy: agents
+    //      row delta of 1 per `try_auto_advance`. Pins that the
+    //      intra-phase and cross-phase paths share the gate.
+    //
+    // The PUT-side rejection test (412 + audit row) lives with
+    // 3.5.3 in `tests/plan_config.rs` since it's HTTP-shaped:
+    //   - put_parallel_true_returns_412_when_worktrees_not_shipped
+    //   - put_parallel_true_audits_refused_attempt
+    //
+    // That HTTP audit row IS the post-mortem trail the brief
+    // refers to. The SQL-bypass scenario in #2 below
+    // intentionally produces no audit row of its own (no API
+    // call ran); its job is to prove the sequential break holds
+    // even when the audit trail is missing.
+
+    /// Task 3.5.5 #1 — sequential gate also holds on the
+    /// phase-boundary path. With phase 1 fully done and phase 2
+    /// holding 5 dep-free tasks, the first
+    /// `try_auto_advance` tick spawns only `2.1` (YAML
+    /// declaration order); the other four stay `pending`. Each
+    /// subsequent completion advances exactly one more task —
+    /// five sequential spawns, never five in parallel.
+    #[tokio::test]
+    async fn phase_boundary_with_5_ready_tasks_spawns_only_one() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        let plan = "phase-boundary-fanout";
+        write_advance_plan(
+            &plans_dir,
+            plan,
+            "  - number: 1\n\
+             \x20   title: P1\n\
+             \x20   tasks:\n\
+             \x20     - number: \"1.1\"\n\
+             \x20       title: One-One\n\
+             \x20 - number: 2\n\
+             \x20   title: P2\n\
+             \x20   tasks:\n\
+             \x20     - number: \"2.1\"\n\
+             \x20       title: Two-One\n\
+             \x20     - number: \"2.2\"\n\
+             \x20       title: Two-Two\n\
+             \x20     - number: \"2.3\"\n\
+             \x20       title: Two-Three\n\
+             \x20     - number: \"2.4\"\n\
+             \x20       title: Two-Four\n\
+             \x20     - number: \"2.5\"\n\
+             \x20       title: Two-Five\n",
+        );
+        enable_auto_mode(&db, plan);
+
+        let _cleanup = SettingsCleanup {
+            db: db.clone(),
+            plan_name: plan.to_string(),
+        };
+
+        // Phase 1 fully done: only 1.1 in it, mark it
+        // completed externally (simulating the user/agent that
+        // closed it out).
+        set_task_status(&db, plan, "1.1", "completed");
+
+        // Tick 1 — phase boundary. Five dep-free tasks become
+        // ready in phase 2; only 2.1 (YAML-first) spawns.
+        let _ = drain_events(&mut rx);
+        try_auto_advance(
+            registry.clone(),
+            plans_dir.clone(),
+            plan.to_string(),
+            "1.1".to_string(),
+            Effort::Medium,
+            registry.port,
+        )
+        .await;
+
+        let actual = agent_task_ids(&db, plan);
+        let expected: std::collections::HashSet<String> = ["2.1".to_string()].into_iter().collect();
+        assert_eq!(
+            actual, expected,
+            "phase boundary fan-out: only 2.1 should spawn on tick 1, got {actual:?}",
+        );
+
+        // 2.2..2.5 must still be pending — no `task_status`
+        // row at all is equivalent to pending in this schema.
+        for tid in ["2.2", "2.3", "2.4", "2.5"] {
+            let conn = db.lock().unwrap();
+            let status: Option<String> = conn
+                .query_row(
+                    "SELECT status FROM task_status WHERE plan_name = ?1 AND task_number = ?2",
+                    params![plan, tid],
+                    |row| row.get(0),
+                )
+                .ok();
+            assert!(
+                status.is_none() || status.as_deref() == Some("pending"),
+                "{tid} should still be pending after tick 1, got {status:?}",
+            );
+        }
+
+        let events = drain_events(&mut rx);
+        assert!(
+            has_phase_advanced(&events, plan),
+            "phase_advanced expected on tick 1: {events:?}",
+        );
+        assert!(
+            !has_task_advanced(&events, plan),
+            "task_advanced must NOT fire on the phase-boundary tick: {events:?}",
+        );
+
+        // Drive the remaining four spawns. Each is intra-phase
+        // (we're already in phase 2 after tick 1), so every
+        // tick must emit `task_advanced`, never
+        // `phase_advanced`.
+        let chain = [
+            ("2.1", "2.2"),
+            ("2.2", "2.3"),
+            ("2.3", "2.4"),
+            ("2.4", "2.5"),
+        ];
+        let mut prior_total = 1usize;
+        for (from, to) in chain {
+            set_task_status(&db, plan, from, "completed");
+            let _ = drain_events(&mut rx);
+            try_auto_advance(
+                registry.clone(),
+                plans_dir.clone(),
+                plan.to_string(),
+                from.to_string(),
+                Effort::Medium,
+                registry.port,
+            )
+            .await;
+            let total = agent_task_ids(&db, plan).len();
+            let delta = total - prior_total;
+            assert_eq!(
+                delta, 1,
+                "exactly one new spawn at {from}->{to} (delta {delta})",
+            );
+            prior_total = total;
+
+            let events = drain_events(&mut rx);
+            assert!(
+                has_task_advanced(&events, plan),
+                "intra-phase {from}->{to}: task_advanced expected, events: {events:?}",
+            );
+            assert!(
+                !has_phase_advanced(&events, plan),
+                "intra-phase {from}->{to}: phase_advanced must NOT fire, events: {events:?}",
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.contains(&format!("\"to_tasks\":[\"{to}\"]"))),
+                "task_advanced payload must list {to:?}: {events:?}",
+            );
+        }
+
+        // End state: all 5 phase-2 tasks have been spawned —
+        // but across 5 sequential ticks, never 5 in parallel.
+        assert_eq!(
+            agent_task_ids(&db, plan).len(),
+            5,
+            "all 5 phase-2 tasks must be spawned across 5 ticks",
+        );
+    }
+
+    /// Task 3.5.5 #2 — `plan_auto_mode.parallel=1` set
+    /// directly via SQL (bypassing the API PUT-time gate from
+    /// 3.5.3) does NOT relax the sequential break in
+    /// `spawn_ready_tasks`. The 3.5.1 break is unconditional —
+    /// the loop does not consult the column at all today, so a
+    /// hand-edited DB or a stuck row from a future migration
+    /// glitch cannot accidentally fan out parallel agents onto
+    /// a single working tree.
+    ///
+    /// The HTTP-shaped audit trail
+    /// (`config.parallel_refused`) lives in
+    /// `tests/plan_config.rs`. This test deliberately bypasses
+    /// the PUT path so no audit row is written here — the
+    /// behavioural property under test is "gate held without
+    /// audit too".
+    #[tokio::test]
+    async fn parallel_true_db_with_worktrees_off_still_sequential() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        let plan = "parallel-bypass";
+        // Three siblings (b, c, d) all depend on a — completing
+        // a makes all three ready at the same tick (fan-out
+        // shape).
+        write_advance_plan(
+            &plans_dir,
+            plan,
+            "  - number: 1\n\
+             \x20   title: P1\n\
+             \x20   tasks:\n\
+             \x20     - number: \"a\"\n\
+             \x20       title: A\n\
+             \x20     - number: \"b\"\n\
+             \x20       title: B\n\
+             \x20       dependencies: [\"a\"]\n\
+             \x20     - number: \"c\"\n\
+             \x20       title: C\n\
+             \x20       dependencies: [\"a\"]\n\
+             \x20     - number: \"d\"\n\
+             \x20       title: D\n\
+             \x20       dependencies: [\"a\"]\n",
+        );
+
+        // Force `enabled=1, parallel=1` directly. The API PUT
+        // path would refuse `parallel=true` with 412
+        // (worktrees_required) and audit
+        // `config.parallel_refused`; this test simulates a
+        // post-rollback / hand-edit scenario where the column
+        // is set but the runtime gate must still hold.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_mode (plan_name, enabled, parallel, paused_reason) \
+                 VALUES (?1, 1, 1, NULL) \
+                 ON CONFLICT(plan_name) DO UPDATE SET \
+                     enabled = excluded.enabled, \
+                     parallel = excluded.parallel, \
+                     paused_reason = excluded.paused_reason",
+                params![plan],
+            )
+            .unwrap();
+        }
+        // Sanity: confirm the row really has parallel=1 so a
+        // future migration that drops the column can't quietly
+        // make this test pass for the wrong reason.
+        {
+            let conn = db.lock().unwrap();
+            let (enabled, parallel): (i64, i64) = conn
+                .query_row(
+                    "SELECT enabled, parallel FROM plan_auto_mode WHERE plan_name = ?1",
+                    params![plan],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(enabled, 1, "auto-mode must be enabled");
+            assert_eq!(parallel, 1, "parallel column must be set in DB");
+        }
+
+        let _cleanup = SettingsCleanup {
+            db: db.clone(),
+            plan_name: plan.to_string(),
+        };
+
+        set_task_status(&db, plan, "a", "completed");
+
+        let _ = drain_events(&mut rx);
+        try_auto_advance(
+            registry.clone(),
+            plans_dir.clone(),
+            plan.to_string(),
+            "a".to_string(),
+            Effort::Medium,
+            registry.port,
+        )
+        .await;
+
+        // Despite `parallel=1` in the DB, the sequential break
+        // holds: exactly one of {b, c, d} spawns, never
+        // multiple. The runtime gate ignores the column until
+        // worktree isolation ships — that's the whole point of
+        // 3.5.3's WORKTREES_SHIPPED const + this regression.
+        let actual = agent_task_ids(&db, plan);
+        assert_eq!(
+            actual.len(),
+            1,
+            "parallel=1 in DB must NOT relax the sequential gate, got {actual:?}",
+        );
+        assert!(
+            actual.iter().all(|t| ["b", "c", "d"].contains(&t.as_str())),
+            "spawned task must be one of the ready siblings, got {actual:?}",
+        );
+
+        let events = drain_events(&mut rx);
+        let task_advanced = events
+            .iter()
+            .find(|e| e.contains("\"type\":\"task_advanced\""))
+            .expect("task_advanced event present");
+        let one_of_singletons = ["[\"b\"]", "[\"c\"]", "[\"d\"]"]
+            .iter()
+            .any(|s| task_advanced.contains(s));
+        assert!(
+            one_of_singletons,
+            "to_tasks must be a 1-element array even with parallel=1, event was: {task_advanced}",
+        );
+
+        // Defensive: no `phase_advanced` here — we're still in
+        // phase 1 after tick 1 because b/c/d haven't all
+        // completed.
+        assert!(
+            !has_phase_advanced(&events, plan),
+            "phase_advanced must not fire when only one task spawned: {events:?}",
+        );
+    }
+
+    /// Task 3.5.5 #3 — pin that the same sequential gate
+    /// covers BOTH intra-phase and cross-phase advances. Drive
+    /// a 5-task linear chain that straddles a phase boundary
+    /// (phase 1: 1.1→1.2→1.3, phase 2: 2.1→2.2 with
+    /// 2.1 depending on 1.3); each `try_auto_advance` call
+    /// must result in exactly one new `claim_task` success.
+    /// Counter proxy: agents-row delta is 1 per tick (each
+    /// successful claim leads to a `start_pty_agent` insert),
+    /// so a delta of 1 on every tick is the load-bearing
+    /// assertion that 3.5.1's break path was taken on each
+    /// path.
+    ///
+    /// Tick layout:
+    ///   - Tick 1 (after 1.1): intra-phase — spawn 1.2 (`task_advanced`)
+    ///   - Tick 2 (after 1.2): intra-phase — spawn 1.3 (`task_advanced`)
+    ///   - Tick 3 (after 1.3): cross-phase — spawn 2.1 (`phase_advanced`)
+    ///   - Tick 4 (after 2.1): intra-phase — spawn 2.2 (`task_advanced`)
+    #[tokio::test]
+    async fn linear_chain_completes_one_per_completion() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        let plan = "lin-chain-cross-phase";
+        write_advance_plan(
+            &plans_dir,
+            plan,
+            "  - number: 1\n\
+             \x20   title: P1\n\
+             \x20   tasks:\n\
+             \x20     - number: \"1.1\"\n\
+             \x20       title: One-One\n\
+             \x20     - number: \"1.2\"\n\
+             \x20       title: One-Two\n\
+             \x20       dependencies: [\"1.1\"]\n\
+             \x20     - number: \"1.3\"\n\
+             \x20       title: One-Three\n\
+             \x20       dependencies: [\"1.2\"]\n\
+             \x20 - number: 2\n\
+             \x20   title: P2\n\
+             \x20   tasks:\n\
+             \x20     - number: \"2.1\"\n\
+             \x20       title: Two-One\n\
+             \x20       dependencies: [\"1.3\"]\n\
+             \x20     - number: \"2.2\"\n\
+             \x20       title: Two-Two\n\
+             \x20       dependencies: [\"2.1\"]\n",
+        );
+        enable_auto_mode(&db, plan);
+
+        let _cleanup = SettingsCleanup {
+            db: db.clone(),
+            plan_name: plan.to_string(),
+        };
+
+        set_task_status(&db, plan, "1.1", "completed");
+
+        // (from, to, is_phase_boundary). The "from"
+        // completed-task arg is metadata used only to locate
+        // the current phase; the actual spawn decision is
+        // driven by the `done_set` snapshot.
+        let chain = [
+            ("1.1", "1.2", false),
+            ("1.2", "1.3", false),
+            ("1.3", "2.1", true),
+            ("2.1", "2.2", false),
+        ];
+        let mut prior_total = 0usize;
+        for (from, to, is_phase_boundary) in chain {
+            let _ = drain_events(&mut rx);
+            try_auto_advance(
+                registry.clone(),
+                plans_dir.clone(),
+                plan.to_string(),
+                from.to_string(),
+                Effort::Medium,
+                registry.port,
+            )
+            .await;
+
+            // Counter for `claim_task`: agents-row delta is 1
+            // per successful claim (each claim leads to a
+            // `start_pty_agent` row insert before the spawn
+            // fails on the test_registry's fake server_exe).
+            // A delta of 1 on every tick — both intra-phase
+            // and cross-phase — proves both paths ride the
+            // 3.5.1 break.
+            let total = agent_task_ids(&db, plan).len();
+            let delta = total - prior_total;
+            assert_eq!(
+                delta, 1,
+                "claim_task must succeed exactly once at {from}->{to} (delta {delta}, intra+cross share the gate)",
+            );
+            prior_total = total;
+
+            let events = drain_events(&mut rx);
+            if is_phase_boundary {
+                assert!(
+                    has_phase_advanced(&events, plan),
+                    "phase boundary {from}->{to}: phase_advanced expected, events: {events:?}",
+                );
+                assert!(
+                    !has_task_advanced(&events, plan),
+                    "phase boundary {from}->{to}: task_advanced must NOT fire, events: {events:?}",
+                );
+            } else {
+                assert!(
+                    has_task_advanced(&events, plan),
+                    "intra-phase {from}->{to}: task_advanced expected, events: {events:?}",
+                );
+                assert!(
+                    !has_phase_advanced(&events, plan),
+                    "intra-phase {from}->{to}: phase_advanced must NOT fire, events: {events:?}",
+                );
+            }
+
+            // Mark the spawned task completed so the next tick
+            // sees it as done in `status_map` (the loop's
+            // claim flipped it to `in_progress`; a real agent
+            // would close it out as `completed`).
+            set_task_status(&db, plan, to, "completed");
+        }
+
+        // Five-task chain, 1.1 pre-staged + 4 spawned by the
+        // loop = 4 successful claims total. Never more.
+        assert_eq!(
+            agent_task_ids(&db, plan).len(),
+            4,
+            "linear chain across phase boundary: 4 claims total",
+        );
+    }
 }
