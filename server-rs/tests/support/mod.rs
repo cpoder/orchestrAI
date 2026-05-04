@@ -220,11 +220,14 @@ fn free_port() -> u16 {
 }
 
 fn wait_healthy(base_url: &str) {
-    // 30s. Linux boots the server in <1s, but Windows CI under four parallel
+    // 60s. Linux boots the server in <1s, but Windows CI under four parallel
     // spawns + Defender AV scan on the fresh .exe routinely takes 6–10s and
-    // has flaked at exactly the 10s mark. Generous headroom, still fails
-    // fast enough if the server genuinely crashed.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // has flaked at exactly the 10s mark. plan_config has 14 tests so cargo
+    // runs them four-at-a-time; runs that hit the perfect storm of slow
+    // runner + AV scan + parallel spawns have exhausted the 30s budget too
+    // (see CI run 25335717345 where 8/14 tests failed with status=0). 60s
+    // still fails fast enough if the server genuinely crashed.
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut last_status: u16 = 0;
     let mut last_body = serde_json::Value::Null;
     while Instant::now() < deadline {
