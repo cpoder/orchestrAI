@@ -19,6 +19,15 @@ pub struct PersistedSettings {
     pub skip_permissions: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub webhook_url: Option<String>,
+    /// Days a soft-deleted plan's snapshot survives before the
+    /// retention purger removes it. `None` means use the default
+    /// (`plan_curate::DEFAULT_RETENTION_DAYS`). `Some(0)` means
+    /// snapshot rows expire immediately — soft delete behaves like
+    /// hard delete from the user's perspective but still leaves an
+    /// audit trail. The admin-tab editor + clamping (0..=365) lands
+    /// in plan-deletion 0.5.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_archive_retention_days: Option<i64>,
 }
 
 impl PersistedSettings {

@@ -12,6 +12,7 @@ mod hooks;
 mod mcp;
 mod notifications;
 mod persisted_settings;
+mod plan_curate;
 mod plan_parser;
 mod saas;
 mod state;

@@ -567,6 +567,27 @@ fn migrate(conn: &Connection) {
             nonce       TEXT,
             created_at  TEXT NOT NULL DEFAULT (datetime('now'))
         );
+
+        -- ── Plan snapshots ───────────────────────────────────────────────
+        -- Captures the full pre-cascade state of a plan (YAML body +
+        -- every plan_name-keyed row) before a destructive primitive
+        -- mutates it. Kinds: delete | merge | rename | archive |
+        -- rewrite_context. The retention purger (plan-deletion 0.5)
+        -- uses `expires_at` to free rows; until then they are the
+        -- substrate for the Activity-tab Undo affordance.
+        CREATE TABLE IF NOT EXISTS plan_snapshots (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_name     TEXT NOT NULL,
+            kind          TEXT NOT NULL,
+            created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+            expires_at    TEXT NOT NULL,
+            org_id        TEXT NOT NULL DEFAULT 'default-org',
+            archive_path  TEXT,
+            yaml_body     TEXT NOT NULL,
+            cascade_json  TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_plan_snapshots_expires ON plan_snapshots(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_plan_snapshots_plan ON plan_snapshots(plan_name);
         ",
     )
     .expect("failed to run schema migration");
@@ -774,6 +795,77 @@ mod tests {
         assert!(tables.contains(&"org_members".to_string()));
         assert!(tables.contains(&"plan_org".to_string()));
         assert!(tables.contains(&"audit_logs".to_string()));
+        assert!(tables.contains(&"plan_snapshots".to_string()));
+    }
+
+    #[test]
+    fn plan_snapshots_migration_idempotent_on_existing_db() {
+        // Run migrate once, write a row to a pre-existing table, then
+        // re-init from the same path. The CREATE TABLE IF NOT EXISTS
+        // pattern (and idempotent CREATE INDEX) must leave the seeded
+        // data intact and still produce a usable plan_snapshots table.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.db");
+
+        {
+            let db = init(&path);
+            let conn = db.lock().unwrap();
+            // `source='manual'` so `cleanup_stale_auto_completed`
+            // (which purges legacy auto-inferred rows) leaves it
+            // alone — we want to verify migration idempotence, not
+            // legacy cleanup behaviour.
+            conn.execute(
+                "INSERT INTO task_status (plan_name, task_number, status, source) \
+                 VALUES ('survives', '1.1', 'completed', 'manual')",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Second init must not drop existing data and must leave
+        // plan_snapshots in place.
+        let db = init(&path);
+        let conn = db.lock().unwrap();
+        let task_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_status WHERE plan_name = 'survives'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(task_count, 1, "existing data was dropped on re-migrate");
+
+        // plan_snapshots must be present and writable.
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(tables.contains(&"plan_snapshots".to_string()));
+
+        conn.execute(
+            "INSERT INTO plan_snapshots \
+                 (plan_name, kind, expires_at, yaml_body, cascade_json) \
+             VALUES ('p', 'delete', datetime('now', '+30 days'), 'body', '{}')",
+            [],
+        )
+        .unwrap();
+
+        // Both indexes must exist (used by the purge job + plan lookup).
+        let indexes: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' \
+                 AND tbl_name='plan_snapshots'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(indexes.contains(&"idx_plan_snapshots_expires".to_string()));
+        assert!(indexes.contains(&"idx_plan_snapshots_plan".to_string()));
     }
 
     #[test]

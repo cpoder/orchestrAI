@@ -290,7 +290,21 @@ fn delete_soft_archives_yaml_and_cascades_db_rows() {
         .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&diff).unwrap();
     assert_eq!(parsed["hard"], false);
-    assert!(parsed["snapshot_id"].is_null(), "snapshot stub: {parsed}");
+    // 0.3 wires `plan_curate::snapshot_plan` so soft delete now
+    // surfaces the new `plan_snapshots` row id rather than the
+    // pre-0.3 null placeholder.
+    let snapshot_id = parsed["snapshot_id"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("soft delete must record a snapshot id: {parsed}"));
+    assert!(snapshot_id > 0);
+    let snap_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM plan_snapshots WHERE id = ?1 AND plan_name = ?2 AND kind = 'delete'",
+            params![snapshot_id, plan],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(snap_count, 1, "snapshot row must exist after soft delete");
     assert_eq!(parsed["archive_path"].as_str(), Some(archive_path));
     assert!(
         parsed["cascaded_rows"]["task_status"].as_i64().unwrap() >= 1,

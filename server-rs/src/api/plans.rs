@@ -2268,6 +2268,7 @@ pub struct DeletePlanQuery {
 /// | task_learnings       | NOT NULL                 | cascade   |
 /// | plan_org             | PRIMARY KEY              | cascade   |
 /// | agents               | nullable (no FK)         | preserve  |
+/// | plan_snapshots       | NOT NULL                 | preserve  |
 ///
 /// **Cascade**: the row is meaningless once the plan is gone (status,
 /// CI runs, auto-mode toggles, fix-attempt log, project mapping,
@@ -2289,10 +2290,13 @@ pub struct DeletePlanQuery {
 /// - `task_fix_attempts.outcome IS NULL`: load-bearing for the
 ///   `auto_mode_in_flight` gate in step 3 of `delete_plan`. Open
 ///   attempts block the cascade with a 409 instead of being wiped.
-/// - `plan_snapshots` (lands in 0.3): will hold the full pre-cascade
-///   blob for Undo. The cascade itself does NOT delete snapshot rows;
-///   the retention purge job (0.5) is what eventually frees them.
-const PLAN_CASCADE_TABLES: &[&str] = &[
+/// - `plan_snapshots`: holds the full pre-cascade blob for Undo
+///   (written by `plan_curate::snapshot_plan` in step 5 of
+///   `delete_plan`, BEFORE the cascade runs). Listed in
+///   `PLAN_NAME_PRESERVED_TABLES` so the cascade itself does NOT
+///   delete snapshot rows; the retention purge job (0.5) is what
+///   eventually frees them.
+pub(crate) const PLAN_CASCADE_TABLES: &[&str] = &[
     "task_status",
     "ci_runs",
     "plan_auto_mode",
@@ -2312,7 +2316,7 @@ const PLAN_CASCADE_TABLES: &[&str] = &[
 /// live schema. New entries here MUST also be documented in the
 /// `PLAN_CASCADE_TABLES` doc-comment table above.
 #[allow(dead_code)] // Consumed only by `cascade_audit_tests`; exists to make the audit explicit.
-const PLAN_NAME_PRESERVED_TABLES: &[&str] = &["agents"];
+const PLAN_NAME_PRESERVED_TABLES: &[&str] = &["agents", "plan_snapshots"];
 
 pub async fn delete_plan(
     State(state): State<AppState>,
@@ -2391,14 +2395,7 @@ pub async fn delete_plan(
         .into_response();
     }
 
-    // 4. Snapshot prior state. The `plan_curate::snapshot_plan` helper
-    //    that produces a `plan_snapshots` row lands in 0.3; until then
-    //    soft delete only writes the archive YAML and the snapshot id is
-    //    null. The audit + WS event already carry a `snapshot_id` field
-    //    so 0.3 can wire it without a schema change here.
-    let snapshot_id: Option<i64> = None;
-
-    // 5. Build the archive path (soft delete only). Created lazily right
+    // 4. Build the archive path (soft delete only). Created lazily right
     //    before the rename so a hard delete never touches the FS.
     let archive_path: Option<std::path::PathBuf> = if q.hard {
         None
@@ -2419,6 +2416,34 @@ pub async fn delete_plan(
             .and_then(|s| s.to_str())
             .unwrap_or("yaml");
         Some(archive_dir.join(format!("{name}.{ts}.{ext}")))
+    };
+
+    // 5. Snapshot prior state. Soft delete snapshots before the cascade
+    //    so a mid-cascade failure still leaves a recovery row in
+    //    `plan_snapshots`. Hard delete skips the snapshot per the brief
+    //    — `?hard=true` is the explicit "no undo" path. Snapshot
+    //    failure aborts: the user retries and only after that succeeds
+    //    do we destroy data.
+    let snapshot_id: Option<i64> = if q.hard {
+        None
+    } else {
+        match crate::plan_curate::snapshot_plan(
+            &state,
+            &name,
+            crate::plan_curate::SnapshotKind::Delete,
+            archive_path.as_deref(),
+        ) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("snapshot failed: {e}"),
+                    })),
+                )
+                    .into_response();
+            }
+        }
     };
 
     // 6. Cascade DB rows in a single transaction so a partial failure
@@ -3571,6 +3596,16 @@ mod cascade_audit_tests {
             conn.execute(
                 "INSERT INTO agents (id, cwd, status, plan_name, task_id) \
                  VALUES ('agent-audit', '/tmp', 'completed', ?1, '1.1')",
+                params![plan],
+            )
+            .unwrap();
+            // Preserved: a plan_snapshots row IS the recovery substrate
+            // for Undo, so the cascade must not touch it.
+            conn.execute(
+                "INSERT INTO plan_snapshots \
+                     (plan_name, kind, expires_at, yaml_body, cascade_json) \
+                 VALUES (?1, 'delete', datetime('now', '+30 days'), \
+                         'body', '{}')",
                 params![plan],
             )
             .unwrap();

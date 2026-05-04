@@ -109,16 +109,21 @@ fn snapshot(state: &AppState) -> serde_json::Value {
 }
 
 fn snapshot_for_persist(state: &AppState) -> PersistedSettings {
-    PersistedSettings {
-        effort: Some(*state.effort.lock().unwrap()),
-        skip_permissions: Some(
-            state
-                .registry
-                .skip_permissions
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ),
-        webhook_url: state.registry.webhook_url.read().unwrap().clone(),
-    }
+    // Preserve any setting written by code paths that don't live on
+    // AppState yet (e.g. `plan_archive_retention_days`, which lands
+    // on the admin tab in plan-deletion 0.5). Loading-then-overwriting
+    // is the forward-compatible pattern: this fn never clobbers a
+    // field it doesn't know about.
+    let mut existing = PersistedSettings::load(&state.settings_path);
+    existing.effort = Some(*state.effort.lock().unwrap());
+    existing.skip_permissions = Some(
+        state
+            .registry
+            .skip_permissions
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    existing.webhook_url = state.registry.webhook_url.read().unwrap().clone();
+    existing
 }
 
 // ── GET /api/folders ─────────────────────────────────────────────────────────
