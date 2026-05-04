@@ -36,6 +36,11 @@ pub struct SpawnOpts<'a> {
     /// add the appropriate flag (e.g. `--mcp-config <path>`) to their argv.
     /// The caller is responsible for having written the file before spawn.
     pub mcp_config_path: Option<&'a Path>,
+    /// Path to a per-session settings JSON file (Stop hook + future keys).
+    /// When set, drivers that consume it append the appropriate flag
+    /// (e.g. Claude's `--settings <path>`). Other drivers ignore it.
+    /// The caller is responsible for having written the file before spawn.
+    pub settings_path: Option<&'a Path>,
     /// When true, drivers that support an unattended/skip-permissions mode
     /// pass the corresponding flag (e.g. Claude's `--dangerously-skip-permissions`).
     /// Drivers without such a concept ignore this.
@@ -282,6 +287,10 @@ impl AgentDriver for ClaudeDriver {
         }
         if let Some(path) = opts.mcp_config_path {
             cmd.push("--mcp-config".to_string());
+            cmd.push(path.to_string_lossy().to_string());
+        }
+        if let Some(path) = opts.settings_path {
+            cmd.push("--settings".to_string());
             cmd.push(path.to_string_lossy().to_string());
         }
         cmd
@@ -769,6 +778,7 @@ mod tests {
             effort: Effort::High,
             max_budget_usd: None,
             mcp_config_path: None,
+            settings_path: None,
             skip_permissions: true,
         });
         assert_eq!(args.first().map(String::as_str), Some("claude"));
@@ -781,6 +791,7 @@ mod tests {
         assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"));
         assert!(!args.iter().any(|a| a == "--max-budget-usd"));
         assert!(!args.iter().any(|a| a == "--mcp-config"));
+        assert!(!args.iter().any(|a| a == "--settings"));
     }
 
     #[test]
@@ -793,6 +804,7 @@ mod tests {
             effort: Effort::High,
             max_budget_usd: None,
             mcp_config_path: None,
+            settings_path: None,
             skip_permissions: false,
         });
         assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"));
@@ -808,6 +820,7 @@ mod tests {
             effort: Effort::Low,
             max_budget_usd: Some(2.50),
             mcp_config_path: None,
+            settings_path: None,
             skip_permissions: true,
         });
         let i = args.iter().position(|a| a == "--max-budget-usd").unwrap();
@@ -825,10 +838,29 @@ mod tests {
             effort: Effort::Low,
             max_budget_usd: None,
             mcp_config_path: Some(&mcp_path),
+            settings_path: None,
             skip_permissions: true,
         });
         let i = args.iter().position(|a| a == "--mcp-config").unwrap();
         assert_eq!(args[i + 1], "/tmp/agent-abc.mcp.json");
+    }
+
+    #[test]
+    fn claude_spawn_args_appends_settings_when_set() {
+        let driver = ClaudeDriver::new();
+        let cwd = PathBuf::from("/tmp/project");
+        let settings_path = PathBuf::from("/tmp/agent-abc.settings.json");
+        let args = driver.spawn_args(&SpawnOpts {
+            session_id: "s",
+            cwd: &cwd,
+            effort: Effort::Low,
+            max_budget_usd: None,
+            mcp_config_path: None,
+            settings_path: Some(&settings_path),
+            skip_permissions: true,
+        });
+        let i = args.iter().position(|a| a == "--settings").unwrap();
+        assert_eq!(args[i + 1], "/tmp/agent-abc.settings.json");
     }
 
     #[test]
@@ -936,6 +968,7 @@ mod tests {
             effort: Effort::High,
             max_budget_usd: Some(5.0),
             mcp_config_path: None,
+            settings_path: None,
             skip_permissions: true,
         });
         assert_eq!(args, vec!["aider".to_string(), "--yes-always".to_string()]);
@@ -987,6 +1020,7 @@ Tokens: 200 sent, 75 received. Cost: $0.0150 message, $0.0250 session.
             effort: Effort::High,
             max_budget_usd: Some(1.0),
             mcp_config_path: None,
+            settings_path: None,
             skip_permissions: true,
         };
         assert_eq!(CodexDriver::new().spawn_args(&opts), vec!["codex"]);

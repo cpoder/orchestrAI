@@ -20,6 +20,7 @@ use tokio::sync::Notify;
 
 use crate::agents::driver::{AgentDriver, SpawnOpts};
 use crate::agents::session_protocol::{self, Message as SessionMessage};
+use crate::agents::session_settings;
 use crate::agents::supervisor;
 use crate::agents::{
     AgentRegistry, ManagedAgent, git_checkout_branch, git_default_branch, git_head_sha,
@@ -128,6 +129,25 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
         }
     });
 
+    // If the driver declares a Stop hook (Claude only today), write a
+    // per-session settings file so the spawned CLI POSTs to /hooks on exit.
+    // Same best-effort posture as the MCP config: log and continue on error.
+    let hook_url = format!("http://localhost:{}/hooks", registry.port);
+    let settings_path = match session_settings::write_for_agent(
+        &session_id,
+        driver.as_ref(),
+        &hook_url,
+    ) {
+        Ok(maybe_path) => maybe_path,
+        Err(e) => {
+            eprintln!(
+                "[agent {}] Failed to write per-session settings: {e} — continuing without Stop hook",
+                &id[..8.min(id.len())],
+            );
+            None
+        }
+    };
+
     // Build the CLI argv via the driver. No shell involved — `portable-pty`
     // spawns it directly in the daemon, so we don't need to escape spaces.
     let skip_permissions = registry
@@ -139,6 +159,7 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
         effort,
         max_budget_usd,
         mcp_config_path: mcp_config_path.as_deref(),
+        settings_path: settings_path.as_deref(),
         skip_permissions,
     });
     let formatted_prompt = driver.format_prompt(&prompt);
