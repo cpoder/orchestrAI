@@ -140,6 +140,31 @@ export function handleWsMessage(msg: { type: string; data: unknown }) {
       }, 2000);
       break;
     }
+    case "plan_deleted": {
+      // The server emits this right after the cascade commits in
+      // delete_plan (api/plans.rs). Drop the plan from the summary list
+      // and clear `selectedPlan` if the user was viewing it — App.tsx
+      // routes back to ProjectDashboard the moment selectedPlan is null.
+      // Soft delete carries `snapshot_id`; we surface it as an Undo
+      // action so the renderer can POST /api/snapshots/{id}/restore.
+      // Hard delete (`hard: true`) has no snapshot_id and no Undo.
+      const d = msg.data as {
+        plan: string;
+        snapshot_id?: string | null;
+        hard?: boolean;
+      };
+      planStore.removePlan(d.plan);
+      const snapshotId = d.snapshot_id ?? undefined;
+      planStore.pushToast({
+        kind: "info",
+        message: `Deleted plan ${d.plan}`,
+        action: snapshotId
+          ? { label: "Undo", snapshotId }
+          : undefined,
+        ttlMs: 30_000,
+      });
+      break;
+    }
     case "agent_started": {
       agentStore.fetchAgents();
       break;

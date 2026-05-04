@@ -133,6 +133,34 @@ export interface AutoModeRuntime {
   attempt?: number;
 }
 
+export type ToastKind = "info" | "error" | "success";
+
+/// Optional inline action attached to a toast. When `snapshotId` is set
+/// the renderer wires the button to `POST /api/snapshots/{snapshotId}/restore`
+/// (the Undo affordance for soft-deleted plans). Kept generic so future
+/// destructive primitives that snapshot can reuse the same shape.
+export interface ToastAction {
+  label: string;
+  snapshotId?: string;
+}
+
+export interface Toast {
+  id: string;
+  kind: ToastKind;
+  message: string;
+  action?: ToastAction;
+}
+
+export interface PushToastInput {
+  id?: string;
+  kind: ToastKind;
+  message: string;
+  action?: ToastAction;
+  /// Auto-dismiss after this many ms. Omit (or 0) to keep the toast
+  /// pinned until `dismissToast` is called.
+  ttlMs?: number;
+}
+
 interface PlanStore {
   plans: PlanSummary[];
   selectedPlan: ParsedPlan | null;
@@ -146,10 +174,19 @@ interface PlanStore {
   /// not persisted across page reloads. The persistent slice (paused vs
   /// not) lives in `planConfigs[plan].pausedReason`.
   autoModeRuntimes: Record<string, AutoModeRuntime | null>;
+  /// Transient toast queue. Driven by ws-store on destructive
+  /// operations (e.g. `plan_deleted` pushes an "Undo" toast). The
+  /// renderer reads this slice; auto-dismiss is wired into `pushToast`
+  /// via `ttlMs`.
+  toasts: Toast[];
   fetchPlans: () => Promise<void>;
   selectPlan: (name: string) => Promise<void>;
   clearSelectedPlan: () => void;
   updatePlan: (plan: ParsedPlan) => void;
+  /// Drop a plan from the summary list and clear `selectedPlan` if it
+  /// matches the gone name (so App.tsx routes back to ProjectDashboard).
+  /// Driven by the `plan_deleted` WS event.
+  removePlan: (planName: string) => void;
   patchTaskStatus: (planName: string, taskNumber: string, status: string) => void;
   patchTaskCi: (planName: string, taskNumber: string, ci: CiStatus) => void;
   patchPlanVerdict: (planName: string, verdict: PlanVerdict) => void;
@@ -160,6 +197,8 @@ interface PlanStore {
   setPlanConfig: (planName: string, config: PlanConfig) => void;
   patchPlanConfig: (planName: string, patch: Partial<PlanConfig>) => void;
   setAutoModeRuntime: (planName: string, runtime: AutoModeRuntime | null) => void;
+  pushToast: (toast: PushToastInput) => string;
+  dismissToast: (id: string) => void;
 }
 
 export const usePlanStore = create<PlanStore>((set, get) => ({
@@ -169,6 +208,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
   warnings: [],
   planConfigs: {},
   autoModeRuntimes: {},
+  toasts: [],
 
   fetchPlans: async () => {
     // Only flicker the global loading flag on the first load — refetches
@@ -223,6 +263,14 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
     if (selectedPlan?.name === plan.name) {
       set({ selectedPlan: plan });
     }
+  },
+
+  removePlan: (planName: string) => {
+    set((s) => ({
+      plans: s.plans.filter((p) => p.name !== planName),
+      selectedPlan:
+        s.selectedPlan?.name === planName ? null : s.selectedPlan,
+    }));
   },
 
   patchTaskCi: (planName, taskNumber, ci) => {
@@ -366,5 +414,29 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
     set((s) => ({
       autoModeRuntimes: { ...s.autoModeRuntimes, [planName]: runtime },
     }));
+  },
+
+  pushToast: ({ id, kind, message, action, ttlMs }) => {
+    const toastId =
+      id ?? `toast-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    set((s) => ({
+      toasts: [
+        ...s.toasts.filter((t) => t.id !== toastId),
+        { id: toastId, kind, message, action },
+      ],
+    }));
+    if (ttlMs && ttlMs > 0) {
+      // Auto-dismiss. If the user already dismissed manually (or the
+      // toast was pre-empted by an id collision), the filter in
+      // dismissToast becomes a no-op.
+      setTimeout(() => {
+        get().dismissToast(toastId);
+      }, ttlMs);
+    }
+    return toastId;
+  },
+
+  dismissToast: (id: string) => {
+    set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
   },
 }));
