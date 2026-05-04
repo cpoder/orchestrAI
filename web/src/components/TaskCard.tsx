@@ -370,13 +370,16 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
               const c = ciConfig[task.ci.status] ?? ciConfig.unknown;
               const className = `text-[10px] px-1.5 py-0.5 rounded flex items-center gap-1 ${c.bg}`;
               const viaFix = task.ci.viaFixAttempt ?? null;
-              const fixSuffix = viaFix != null ? ` (via fix attempt ${viaFix})` : "";
+              const tooltip =
+                viaFix != null
+                  ? `passed via fix attempt ${viaFix}`
+                  : c.title;
               const inner = (
                 <>
                   <span className={`w-1.5 h-1.5 rounded-full ${c.dot}`} />
                   {c.label}
                   {viaFix != null && (
-                    <span className="opacity-70">· fix {viaFix}</span>
+                    <span className="opacity-70">fix #{viaFix}</span>
                   )}
                 </>
               );
@@ -386,13 +389,13 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                   target="_blank"
                   rel="noreferrer noopener"
                   className={`${className} hover:opacity-80`}
-                  title={`${c.title}${fixSuffix} — open run`}
+                  title={`${tooltip} — open run`}
                   onClick={(e) => e.stopPropagation()}
                 >
                   {inner}
                 </a>
               ) : (
-                <span className={className} title={`${c.title}${fixSuffix}`}>{inner}</span>
+                <span className={className} title={tooltip}>{inner}</span>
               );
               const dismissable =
                 task.ci.status === "failure" ||
