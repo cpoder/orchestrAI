@@ -81,7 +81,16 @@ Two coordinated changes in the runtime, plus a small frontend piece for observab
 | Cleanup contract | `pty_agent::on_agent_exit` (currently `server-rs/src/agents/pty_agent.rs:529-531`) gains one more `let _ = std::fs::remove_file(...)` line for the settings path, alongside the existing socket + pidfile removals. Same best-effort semantics: silently ignore `NotFound` and IO errors so cleanup can never fail an exit. |
 | Crash leak sweep | `AgentRegistry::cleanup_and_reattach` (`server-rs/src/agents/mod.rs:335`) sweeps stale settings files for orphaned agent rows on startup, same code path that already handles stale sockets. |
 
-Branchwork writes the settings file at agent-spawn time containing a `Stop` hook that POSTs to `POST /hooks` (the existing endpoint at `server-rs/src/hooks.rs:18`). The Claude PTY is launched with `--settings <path>`. Branchwork deliberately does **not** pass `--setting-sources` — that flag would replace the layered `user,project,local` sources, but we want our settings to be purely additive on top of the user's global config (the user's `~/.claude/settings.json` keeps loading from the `user` source).
+**Hook URL contract (locked in by Task 0.3):**
+
+| | Value |
+| --- | --- |
+| URL template | `http://localhost:<port>/hooks` |
+| Port source | `AgentRegistry.port` (`server-rs/src/agents/mod.rs:245`) — set at startup from the same `--port` flag the dashboard binds to and threaded through to drivers at spawn time (`server-rs/src/agents/pty_agent.rs:116`). |
+| Why this wire path | The Branchwork driver already builds `http://127.0.0.1:<port>/mcp` from this exact field via `AgentDriver::mcp_config_json(port)` (`server-rs/src/agents/driver.rs:280`). The Stop-hook URL reuses the same `<port>` so anything that reaches the dashboard's MCP endpoint already reaches `/hooks` — no new reachability assumption beyond what MCP injection already requires. |
+| Scope | **Standalone only.** SaaS reachability across runner ↔ server is explicitly out of scope — see Consequences §*Scope: standalone only*. |
+
+Branchwork writes the settings file at agent-spawn time containing a `Stop` hook that POSTs to `http://localhost:<port>/hooks` (the existing receiver at `server-rs/src/hooks.rs:18`, mounted at `POST /hooks` on the dashboard's HTTP listener). The Claude PTY is launched with `--settings <path>`. Branchwork deliberately does **not** pass `--setting-sources` — that flag would replace the layered `user,project,local` sources, but we want our settings to be purely additive on top of the user's global config (the user's `~/.claude/settings.json` keeps loading from the `user` source).
 
 The path lives under the same `claude_dir.join("sessions")` directory used for sockets / MCP configs / PTY logs (`server-rs/src/main.rs:74`). That directory is Branchwork-owned in practice — no Claude-internal feature writes there, so the `<agent_id>.settings.json` namespace is collision-free.
 
@@ -144,6 +153,12 @@ This ADR moves to **Accepted** once Phases 1–3 of the implementation plan are 
 - **Stop hook event volume.** Every Claude turn emits a Stop event, not just the final one. The handler's gate (`status == 'running'` + auto-mode + clean tree) is the filter; expect a small uptick in `hook_events` row inserts proportional to turns-per-task.
 - **Idle-poller is best-effort.** A driver that emits no telemetry has no `last_activity_at`, so the fallback can fire prematurely. Defaulted off, opt-in only, env-flag documented.
 
+### Scope: standalone only
+
+The hook URL contract pinned in Decision §1 (`http://localhost:<port>/hooks` with `<port>` taken from `AgentRegistry.port`) assumes the spawned CLI driver can reach the dashboard's HTTP listener directly on `localhost`. This holds for the standalone deployment where the dashboard, the supervisor daemon, and the agent PTY all live on the same host — exactly the same assumption the existing MCP injection at `http://127.0.0.1:<port>/mcp` already relies on (`server-rs/src/agents/driver.rs:280`).
+
+**SaaS deployments are explicitly out of scope for this ADR.** In SaaS, the agent runs on a customer-side runner process while `/hooks` is served by the SaaS server across a WebSocket back-channel — `localhost:<port>` from the runner does not reach the server. The fix is to hand the hook URL through the runner's existing back-channel (the same WS the runner already uses for `StartAgent` / `AgentOutput` / etc.) rather than embedding a server-side URL in the per-session settings file. That work is tracked under the `saas-compat-*` backlog plans (`~/.claude/plans/backlog/saas-compat-*.yaml`, audit at `docs/architecture/saas-compat-audit.md`); this ADR does not block on it, and any standalone-mode-only plan landing first is fine.
+
 ## Failure modes (explicit)
 
 1. **Agent leaves uncommitted work.** Tree gate trips, plan pauses with `agent_left_uncommitted_work`, agent stays at the prompt for human review. No silent auto-merge.
@@ -151,7 +166,8 @@ This ADR moves to **Accepted** once Phases 1–3 of the implementation plan are 
 3. **Stop event arrives after the agent already finished from another path.** Idempotency guard (`agents.status != 'running'`) makes the second invocation a no-op. The handler also debounces inside a short window so a same-turn duplicate doesn't double-fire even before the status update has landed.
 4. **Orphan-phase tasks** (a task whose dependencies are met but its phase is otherwise complete and the next phase has already been scanned). Out of scope for this ADR; current behaviour preserved — those tasks wait for a human nudge or the next plan-level scan trigger.
 5. **Per-session settings file collides with another file.** The naming source is `agent_id`, a fresh per-spawn UUID; collision probability is zero in practice. The directory (`claude_dir.join("sessions")`) is Branchwork-owned — no Claude-internal feature writes there. Path template + cleanup contract are pinned in Decision §1 (Task 0.2), and the same `path_for(agent_id)` helper is used at write-time and exit-time so write/cleanup can't drift.
-6. **SaaS deployments where the runner can't reach the server's `/hooks` URL.** Out of scope — covered by the `saas-compat-*` backlog plans, which hand the hook URL through the runner's existing back-channel rather than assuming the agent can reach the server directly.
+
+(SaaS deployments where the runner can't reach the server's `/hooks` URL are not a failure mode of this ADR — they're an explicit non-goal. See Consequences §*Scope: standalone only*.)
 
 ## Out of scope
 
@@ -160,6 +176,7 @@ This ADR moves to **Accepted** once Phases 1–3 of the implementation plan are 
 - Time-bounded execution caps (separate concern from "did the agent finish its turn").
 - Distinguishing Claude paused-on-prompt from Claude finished-cleanly — Stop fires on both; the tree-committable gate is the discriminator.
 - Aider/Codex/Gemini Stop-hook investigation beyond the trait-stub work in Phase 5.
+- SaaS reachability for the hook URL (runner ↔ server back-channel). Tracked under the `saas-compat-*` backlog plans; see Consequences §*Scope: standalone only*.
 
 ## References
 
@@ -171,4 +188,6 @@ This ADR moves to **Accepted** once Phases 1–3 of the implementation plan are 
 - Existing graceful exit (the call we re-enter from the Stop handler): `server-rs/src/agents/mod.rs:605`.
 - Existing per-agent file siblings already living in the chosen directory: `AgentRegistry::socket_for` / `mcp_config_for` (`server-rs/src/agents/mod.rs:308-319`), pidfile via `supervisor::pidfile_path` (`server-rs/src/agents/supervisor.rs:174`), `sockets_dir` initialized at `server-rs/src/main.rs:74`.
 - `claude --settings <file-or-json>` flag verified via `claude --help` on 2026-05-04 (Claude Code CLI installed locally). Decision §1 also notes why we do **not** pair it with `--setting-sources`.
+- Hook URL contract sources: `AgentRegistry.port` field (`server-rs/src/agents/mod.rs:245`), threaded into drivers at `pty_agent.rs:116` (`driver.mcp_config_json(registry.port)`), and reused by the Claude driver to build `http://127.0.0.1:<port>/mcp` at `server-rs/src/agents/driver.rs:280` — same `<port>` the Stop hook URL targets.
+- SaaS-compat audit (the back-channel work that would carry the hook URL through the runner): `docs/architecture/saas-compat-audit.md`; backlog plans at `~/.claude/plans/backlog/saas-compat-*.yaml`.
 - Implementation plan tracking this ADR: `~/.claude/plans/unattended-auto-mode.yaml` (this plan).
