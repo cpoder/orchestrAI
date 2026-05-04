@@ -2932,14 +2932,8 @@ mod check_prompt_tests {
         }
     }
 
-    // TODO(unify-check-prompts/1.3): rewrite/retire these two tests.
-    // T1.1 stripped the git-log/branch verification block from
-    // build_check_prompt. The plan defers the test rewrite to 1.3
-    // (see plans/unify-check-prompts.yaml). #[ignore] keeps the bodies
-    // intact for 1.3 to delete or rewrite while CI stays green here.
     #[test]
-    #[ignore = "asserts deleted git-log behaviour; rewritten in unify-check-prompts/1.3"]
-    fn includes_git_log_verification_with_branch_and_files() {
+    fn excludes_branch_verification_after_unification() {
         let plan = sample_plan();
         let phase = plan_parser::PlanPhase {
             number: 1,
@@ -2962,46 +2956,26 @@ mod check_prompt_tests {
             std::path::Path::new("/tmp/proj"),
         );
         assert!(
-            prompt.contains("git log branchwork/dashboard-polish/1.3"),
-            "prompt must reference task branch git log"
+            !prompt.contains("branch"),
+            "prompt must not reference branches after unification"
+        );
+        assert!(!prompt.contains("git log"), "prompt must not shell git log");
+        assert!(
+            !prompt.contains("task branch"),
+            "prompt must not mention task branch"
         );
         assert!(
-            prompt.contains("'server-rs/src/api/plans.rs'"),
-            "prompt must quote acceptance files in the git log command"
+            !prompt.contains("--not master"),
+            "prompt must not exclude base branch history"
         );
         assert!(
-            prompt.contains("incomplete — agent did not commit its work"),
-            "prompt must instruct the uncommitted verdict phrasing"
+            prompt.contains("Read the relevant files"),
+            "prompt keeps the simple-shape instruction"
         );
         assert!(
-            prompt.contains("--not master main"),
-            "prompt must ask for commits unique to the task branch"
+            prompt.contains("Project directory:"),
+            "prompt keeps the project directory context"
         );
-        assert!(
-            prompt.contains("UNIQUE to the task branch"),
-            "prompt must explain why unique-commits matters"
-        );
-    }
-
-    #[test]
-    #[ignore = "asserts deleted git-log behaviour; rewritten in unify-check-prompts/1.3"]
-    fn falls_back_to_plain_git_log_when_no_files() {
-        let plan = sample_plan();
-        let phase = plan_parser::PlanPhase {
-            number: 2,
-            title: "Phase".into(),
-            description: String::new(),
-            tasks: vec![],
-        };
-        let task = sample_task("2.1", vec![]);
-        let prompt = build_check_prompt(
-            "myplan",
-            &plan,
-            &phase,
-            &task,
-            std::path::Path::new("/tmp/proj"),
-        );
-        assert!(prompt.contains("Run `git log branchwork/myplan/2.1`"));
     }
 
     #[test]
