@@ -85,6 +85,19 @@ export interface PlanWarning {
   timestamp: number;
 }
 
+export interface PlanConfig {
+  autoAdvance: boolean;
+  autoMode: boolean;
+  maxFixAttempts: number;
+  pausedReason: string | null;
+}
+
+export interface PlanConfigPatch {
+  autoAdvance?: boolean;
+  autoMode?: boolean;
+  maxFixAttempts?: number;
+}
+
 interface PlanStore {
   plans: PlanSummary[];
   selectedPlan: ParsedPlan | null;

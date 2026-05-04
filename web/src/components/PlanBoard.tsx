@@ -1,7 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   usePlanStore,
   type ParsedPlan,
+  type PlanConfig,
+  type PlanConfigPatch,
   type PlanVerdict,
 } from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
@@ -219,6 +221,7 @@ export function PlanBoard() {
           </button>
           <StaleBranchesButton planName={plan.name} onError={setError} onDone={() => selectPlan(plan.name)} />
         </div>
+        <AutoModeControls planName={plan.name} />
         {/* Error toast */}
         {error && (
           <div className="mt-2 text-xs text-red-400 bg-red-900/20 border border-red-800/30 rounded px-3 py-2 inline-flex items-center gap-2">
@@ -721,4 +724,168 @@ function formatAge(secs: number): string {
   if (secs < 3600) return `${Math.floor(secs / 60)}m`;
   if (secs < 86400) return `${Math.floor(secs / 3600)}h`;
   return `${Math.floor(secs / 86400)}d`;
+}
+
+const AUTO_MODE_TOOLTIP =
+  "Auto-mode: merges each task on completion, waits for CI, fixes failures up to N times before pausing.";
+const AUTO_ADVANCE_TOOLTIP =
+  "Auto-advance: when a task completes, automatically start the next ready task in the plan.";
+
+/// Plan-level auto-mode + auto-advance toggles. Reads/writes
+/// `/api/plans/:name/config`. The `max_fix_attempts` input only renders
+/// when auto-mode is on; 0 means "merge but never spawn a fix agent".
+/// Edits to the number input are committed on blur or Enter, not per
+/// keystroke — avoids a PUT per character and lets the user type "10".
+function AutoModeControls({ planName }: { planName: string }) {
+  const [config, setConfig] = useState<PlanConfig | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [draftMaxFix, setDraftMaxFix] = useState<string>("");
+
+  useEffect(() => {
+    let alive = true;
+    setError(null);
+    fetchJson<PlanConfig>(`/api/plans/${planName}/config`)
+      .then((c) => {
+        if (!alive) return;
+        setConfig(c);
+        setDraftMaxFix(String(c.maxFixAttempts));
+      })
+      .catch((e) => {
+        if (!alive) return;
+        setError(`Load config failed: ${e instanceof Error ? e.message : String(e)}`);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [planName]);
+
+  async function update(patch: PlanConfigPatch) {
+    setBusy(true);
+    setError(null);
+    try {
+      const cfg = await putJson<PlanConfig>(`/api/plans/${planName}/config`, patch);
+      setConfig(cfg);
+      setDraftMaxFix(String(cfg.maxFixAttempts));
+    } catch (e) {
+      setError(`Save failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function commitMaxFix() {
+    if (!config) return;
+    const v = parseInt(draftMaxFix, 10);
+    if (Number.isFinite(v) && v >= 0 && v <= 10) {
+      if (v !== config.maxFixAttempts) {
+        update({ maxFixAttempts: v });
+      }
+    } else {
+      // revert invalid entry
+      setDraftMaxFix(String(config.maxFixAttempts));
+    }
+  }
+
+  if (!config && !error) {
+    return <div className="mt-3 h-5" aria-hidden />;
+  }
+
+  return (
+    <div className="flex items-center gap-4 mt-3 text-xs">
+      {config && (
+        <>
+          <Switch
+            label="Auto-advance"
+            title={AUTO_ADVANCE_TOOLTIP}
+            checked={config.autoAdvance}
+            disabled={busy}
+            onChange={(v) => update({ autoAdvance: v })}
+          />
+          <Switch
+            label="Auto-mode"
+            title={AUTO_MODE_TOOLTIP}
+            checked={config.autoMode}
+            disabled={busy}
+            onChange={(v) => update({ autoMode: v })}
+          />
+          {config.autoMode && (
+            <label
+              className="flex items-center gap-1.5 text-gray-400"
+              title="Max fix attempts per task before auto-mode pauses (0 = merge only, never spawn a fix agent)."
+            >
+              <span>Fix attempts</span>
+              <input
+                type="number"
+                min={0}
+                max={10}
+                step={1}
+                value={draftMaxFix}
+                disabled={busy}
+                onChange={(e) => setDraftMaxFix(e.target.value)}
+                onBlur={commitMaxFix}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    (e.target as HTMLInputElement).blur();
+                  } else if (e.key === "Escape") {
+                    setDraftMaxFix(String(config.maxFixAttempts));
+                    (e.target as HTMLInputElement).blur();
+                  }
+                }}
+                className="bg-gray-900 border border-gray-700 rounded px-1.5 py-0.5 w-12 text-center text-gray-200 outline-none focus:border-indigo-500 disabled:opacity-50"
+              />
+            </label>
+          )}
+        </>
+      )}
+      {error && (
+        <span className="text-red-400" role="alert">
+          {error}
+        </span>
+      )}
+    </div>
+  );
+}
+
+interface SwitchProps {
+  label: string;
+  title: string;
+  checked: boolean;
+  disabled?: boolean;
+  onChange: (v: boolean) => void;
+}
+
+function Switch({ label, title, checked, disabled, onChange }: SwitchProps) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      onClick={() => onChange(!checked)}
+      disabled={disabled}
+      title={title}
+      className="flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed transition group"
+    >
+      <span
+        className={`relative inline-flex h-4 w-7 rounded-full transition-colors ${
+          checked
+            ? "bg-emerald-600 group-hover:bg-emerald-500"
+            : "bg-gray-700 group-hover:bg-gray-600"
+        }`}
+      >
+        <span
+          className={`absolute top-0.5 h-3 w-3 rounded-full bg-white shadow transition-transform ${
+            checked ? "translate-x-3.5" : "translate-x-0.5"
+          }`}
+        />
+      </span>
+      <span
+        className={
+          checked ? "text-gray-200 font-medium" : "text-gray-400 group-hover:text-gray-300"
+        }
+      >
+        {label}
+      </span>
+    </button>
+  );
 }
