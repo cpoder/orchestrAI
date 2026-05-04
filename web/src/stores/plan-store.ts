@@ -115,7 +115,13 @@ export interface PlanConfigPatch {
 /// info (which task is mid-merge, which fix attempt is in flight); the
 /// config fills in *persistent* info (paused or not, and why).
 export interface AutoModeRuntime {
-  state: "merging" | "awaiting_ci" | "fixing_ci" | "advancing" | "paused";
+  state:
+    | "auto_finishing"
+    | "merging"
+    | "awaiting_ci"
+    | "fixing_ci"
+    | "advancing"
+    | "paused";
   task?: string | null;
   sha?: string | null;
   reason?: string | null;

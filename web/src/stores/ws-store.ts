@@ -201,6 +201,29 @@ export function handleWsMessage(msg: { type: string; data: unknown }) {
       agentStore.fetchAgents();
       break;
     }
+    case "auto_finish_triggered": {
+      // The unattended Stop-hook (or idle-poller fallback) decided to
+      // finalize the agent. The auto-mode loop will run the
+      // merge → CI → advance state machine next; this transient pill
+      // label sits between `agent_stopped` and the first
+      // `auto_mode_state` event (state=merging) so the user sees the
+      // loop start work without a visible gap. Overwritten by the
+      // following `auto_mode_state` broadcast.
+      const d = msg.data as {
+        agent_id: string;
+        plan: string;
+        task: string;
+        trigger: string;
+      };
+      planStore.setAutoModeRuntime(d.plan, {
+        state: "auto_finishing",
+        task: d.task,
+      });
+      // Refresh agents so the row's stop_reason / status flips visibly
+      // even before `agent_stopped` lands (graceful_exit is async).
+      agentStore.fetchAgents();
+      break;
+    }
     case "auto_mode_state": {
       // Live pill feed: every transition from the auto-mode state machine
       // (merging → awaiting_ci → advancing|paused) carries a `state` label

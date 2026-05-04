@@ -931,6 +931,19 @@ export function AutoModeStatusPill({ planName }: { planName: string }) {
     );
   }
 
+  if (runtime?.state === "auto_finishing") {
+    const taskLabel = runtime.task ? ` task ${runtime.task}` : "";
+    return (
+      <span
+        className="flex-shrink-0 inline-flex items-center gap-1.5 px-2 py-0.5 text-xs rounded border border-sky-700/50 bg-sky-900/30 text-sky-200"
+        title="Stop hook fired — auto-finishing the agent before the merge step"
+      >
+        <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse" />
+        auto: finishing{taskLabel}
+      </span>
+    );
+  }
+
   if (runtime?.state === "merging") {
     const taskLabel = runtime.task ? ` task ${runtime.task}` : "";
     return (
