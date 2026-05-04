@@ -1642,49 +1642,7 @@ pub async fn check_task(
     let home = dirs::home_dir().unwrap();
     let project_dir = home.join(project);
 
-    let files_section = if !task.file_paths.is_empty() {
-        format!(
-            "\nFiles mentioned:\n{}",
-            task.file_paths
-                .iter()
-                .map(|f| format!("- {f}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
-    } else {
-        String::new()
-    };
-
-    let acceptance_section = if !task.acceptance.is_empty() {
-        format!("\nAcceptance criteria:\n{}", task.acceptance)
-    } else {
-        String::new()
-    };
-
-    let prompt = format!(
-        "You are verifying whether a task from a plan has been implemented.\n\
-         Answer with ONLY a JSON object, no other text: {{\"status\": \"completed\"|\"in_progress\"|\"pending\", \"reason\": \"brief explanation\"}}\n\n\
-         Project directory: {project_dir}\n\
-         Plan: {plan_title}\n\
-         Phase {phase_num}: {phase_title}\n\
-         Task {task_num}: {task_title}\n\n\
-         Task description:\n{description}\n\
-         {files}{acceptance}\n\n\
-         Check the project at {project_dir}. Read the relevant files. Determine if this task is:\n\
-         - \"completed\": all described changes exist in the code\n\
-         - \"in_progress\": some changes exist but the task is not fully done\n\
-         - \"pending\": no evidence of this task being started\n\n\
-         Respond with ONLY the JSON object.",
-        project_dir = project_dir.display(),
-        plan_title = plan.title,
-        phase_num = phase.number,
-        phase_title = phase.title,
-        task_num = task.number,
-        task_title = task.title,
-        description = task.description,
-        files = files_section,
-        acceptance = acceptance_section,
-    );
+    let prompt = build_check_prompt(&plan_name, &plan, phase, task, &project_dir);
 
     // Set task to checking state
     {
@@ -2888,12 +2846,13 @@ pub async fn check_all(
 }
 
 fn build_check_prompt(
-    _plan_name: &str,
+    plan_name: &str,
     plan: &plan_parser::ParsedPlan,
     phase: &plan_parser::PlanPhase,
     task: &plan_parser::PlanTask,
     project_dir: &std::path::Path,
 ) -> String {
+    let _ = plan_name;
     let files_section = if task.file_paths.is_empty() {
         String::new()
     } else {
