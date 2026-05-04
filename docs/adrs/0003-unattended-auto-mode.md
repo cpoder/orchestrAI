@@ -71,7 +71,19 @@ Two coordinated changes in the runtime, plus a small frontend piece for observab
 
 ### 1. Per-session Stop hook injected at spawn
 
-Branchwork generates a per-session settings file at `~/.claude/sessions/<session_id>.settings.json` containing a `Stop` hook that POSTs to `POST /hooks` (the existing endpoint at `server-rs/src/hooks.rs:18`). The Claude PTY is launched with `--settings <path>`, so the spawned agent's hook config is purely additive on top of whatever the user has in their global config.
+**Per-session settings file (locked in by Task 0.2):**
+
+| | Value |
+| --- | --- |
+| Path template | `<sockets_dir>/<agent_id>.settings.json` — concretely `~/.claude/sessions/<agent_id>.settings.json` for the default `claude_dir`. |
+| CLI flag | `--settings <file-or-json>` — verified against `claude --help` 2026-05-04: *"Path to a settings JSON file or a JSON string to load additional settings from"*. |
+| Naming source | `agent_id` (Branchwork's per-spawn UUID), matching the existing sibling files `<agent_id>.sock` / `<agent_id>.mcp.json` / `<agent_id>.log` / `<agent_id>.pid` written into the same directory by `AgentRegistry::socket_for` / `mcp_config_for` (`server-rs/src/agents/mod.rs:308-319`). |
+| Cleanup contract | `pty_agent::on_agent_exit` (currently `server-rs/src/agents/pty_agent.rs:529-531`) gains one more `let _ = std::fs::remove_file(...)` line for the settings path, alongside the existing socket + pidfile removals. Same best-effort semantics: silently ignore `NotFound` and IO errors so cleanup can never fail an exit. |
+| Crash leak sweep | `AgentRegistry::cleanup_and_reattach` (`server-rs/src/agents/mod.rs:335`) sweeps stale settings files for orphaned agent rows on startup, same code path that already handles stale sockets. |
+
+Branchwork writes the settings file at agent-spawn time containing a `Stop` hook that POSTs to `POST /hooks` (the existing endpoint at `server-rs/src/hooks.rs:18`). The Claude PTY is launched with `--settings <path>`. Branchwork deliberately does **not** pass `--setting-sources` — that flag would replace the layered `user,project,local` sources, but we want our settings to be purely additive on top of the user's global config (the user's `~/.claude/settings.json` keeps loading from the `user` source).
+
+The path lives under the same `claude_dir.join("sessions")` directory used for sockets / MCP configs / PTY logs (`server-rs/src/main.rs:74`). That directory is Branchwork-owned in practice — no Claude-internal feature writes there, so the `<agent_id>.settings.json` namespace is collision-free.
 
 The Stop handler in `hooks.rs::receive_hook` learns one new branch:
 
@@ -138,7 +150,7 @@ This ADR moves to **Accepted** once Phases 1–3 of the implementation plan are 
 2. **Stop hook not delivered.** Network blip between Claude and the local hook URL, or Claude's hook subsystem suppresses the event. Falls through to whatever the driver's idle timer is configured for; if the operator hasn't opted into the idle-poller, the agent sits at the prompt and a human Finish click is the recovery.
 3. **Stop event arrives after the agent already finished from another path.** Idempotency guard (`agents.status != 'running'`) makes the second invocation a no-op. The handler also debounces inside a short window so a same-turn duplicate doesn't double-fire even before the status update has landed.
 4. **Orphan-phase tasks** (a task whose dependencies are met but its phase is otherwise complete and the next phase has already been scanned). Out of scope for this ADR; current behaviour preserved — those tasks wait for a human nudge or the next plan-level scan trigger.
-5. **Per-session settings file collides with a real session settings file.** The session-id namespace is UUID-based; collision probability is zero in practice. Path is documented in 0.2 + Phase 1, and the cleanup path uses the same path-derivation function so a collision would fail loudly at startup (refuses to overwrite a non-branchwork-owned file).
+5. **Per-session settings file collides with another file.** The naming source is `agent_id`, a fresh per-spawn UUID; collision probability is zero in practice. The directory (`claude_dir.join("sessions")`) is Branchwork-owned — no Claude-internal feature writes there. Path template + cleanup contract are pinned in Decision §1 (Task 0.2), and the same `path_for(agent_id)` helper is used at write-time and exit-time so write/cleanup can't drift.
 6. **SaaS deployments where the runner can't reach the server's `/hooks` URL.** Out of scope — covered by the `saas-compat-*` backlog plans, which hand the hook URL through the runner's existing back-channel rather than assuming the agent can reach the server directly.
 
 ## Out of scope
@@ -157,4 +169,6 @@ This ADR moves to **Accepted** once Phases 1–3 of the implementation plan are 
 - Existing intra-phase early-return: `server-rs/src/agents/mod.rs:1089-1138`.
 - Existing hook receiver: `server-rs/src/hooks.rs:18`.
 - Existing graceful exit (the call we re-enter from the Stop handler): `server-rs/src/agents/mod.rs:605`.
+- Existing per-agent file siblings already living in the chosen directory: `AgentRegistry::socket_for` / `mcp_config_for` (`server-rs/src/agents/mod.rs:308-319`), pidfile via `supervisor::pidfile_path` (`server-rs/src/agents/supervisor.rs:174`), `sockets_dir` initialized at `server-rs/src/main.rs:74`.
+- `claude --settings <file-or-json>` flag verified via `claude --help` on 2026-05-04 (Claude Code CLI installed locally). Decision §1 also notes why we do **not** pair it with `--setting-sources`.
 - Implementation plan tracking this ADR: `~/.claude/plans/unattended-auto-mode.yaml` (this plan).
