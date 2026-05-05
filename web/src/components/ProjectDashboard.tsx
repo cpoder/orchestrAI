@@ -20,6 +20,39 @@ function isPlanDone(p: PlanSummary): boolean {
   return p.taskCount > 0 && p.doneCount >= p.taskCount;
 }
 
+/// Auto-namer shape used by the Claude Code CLI: three lowercase
+/// hyphen-separated tokens with the middle token ending in `-ing`
+/// (adjective-verbing-noun). Examples that match: enumerated-crafting-puffin,
+/// cosmic-toasting-lagoon, steady-prancing-squid. Examples that do NOT:
+/// unify-check-prompts (middle is `check`), auto-mode-merge-ci-fix-loop
+/// (six tokens). Anchored on both ends so a longer slug containing an
+/// auto-named middle does not pass.
+export const STALE_PLAN_NAME_RE = /^[a-z]+-[a-z]+ing-[a-z]+$/;
+
+export function isAutoNamedPlan(name: string): boolean {
+  return STALE_PLAN_NAME_RE.test(name);
+}
+
+export const STALE_PLAN_AGE_DAYS = 30;
+const MS_PER_DAY = 86400000;
+
+/// A plan is "stale" only when ALL three predicates hold:
+/// 1. created more than 30 days ago,
+/// 2. every task is completed or skipped (same as `isPlanDone`),
+/// 3. the slug matches the CLI auto-namer shape.
+/// Conservative on purpose — false negatives (a stale plan not flagged)
+/// are recoverable; false positives flag an active plan and risk losing
+/// work if the user trusts the heuristic blindly.
+export function isStalePlan(p: PlanSummary, nowMs: number): boolean {
+  if (!isPlanDone(p)) return false;
+  if (!isAutoNamedPlan(p.name)) return false;
+  if (!p.createdAt) return false;
+  const created = Date.parse(p.createdAt);
+  if (Number.isNaN(created)) return false;
+  const ageDays = (nowMs - created) / MS_PER_DAY;
+  return ageDays > STALE_PLAN_AGE_DAYS;
+}
+
 interface ProjectStats {
   name: string;
   plans: PlanSummary[];
@@ -48,6 +81,12 @@ export function ProjectDashboard() {
   const [selectionMode, setSelectionMode] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  // Opt-in stale-plan filter. Default off so the dashboard's first
+  // impression remains "every plan I have"; flipping it on filters
+  // the cards and exposes a "Select all" affordance for the bulk-delete
+  // workflow. Selection state is preserved across the toggle so the
+  // user can mix stale + non-stale picks if they really want to.
+  const [showStale, setShowStale] = useState(false);
 
   const toggleSelected = useCallback((name: string) => {
     setSelected((prev) => {
@@ -78,8 +117,13 @@ export function ProjectDashboard() {
   }
 
   const projectStats: ProjectStats[] = useMemo(() => {
+    const nowMs = Date.now();
+    const visiblePlans = showStale
+      ? plans.filter((p) => isStalePlan(p, nowMs))
+      : plans;
+
     const byProject = new Map<string, PlanSummary[]>();
-    for (const p of plans) {
+    for (const p of visiblePlans) {
       const key = p.project ?? "Unassigned";
       if (!byProject.has(key)) byProject.set(key, []);
       byProject.get(key)!.push(p);
@@ -133,7 +177,23 @@ export function ProjectDashboard() {
       }
       return a.name.localeCompare(b.name);
     });
-  }, [plans, agents]);
+  }, [plans, agents, showStale]);
+
+  const visibleStaleCount = showStale
+    ? projectStats.reduce((s, ps) => s + ps.plans.length, 0)
+    : 0;
+
+  const selectAllStale = useCallback(() => {
+    const nowMs = Date.now();
+    setSelectionMode(true);
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const p of plans) {
+        if (isStalePlan(p, nowMs)) next.add(p.name);
+      }
+      return next;
+    });
+  }, [plans]);
 
   const totalProjects = projectStats.length;
   const totalPlans = plans.length;
@@ -212,26 +272,71 @@ export function ProjectDashboard() {
             )}
           </div>
         </div>
-        <button
-          type="button"
-          onClick={() =>
-            selectionMode ? exitSelectionMode() : setSelectionMode(true)
-          }
-          aria-pressed={selectionMode}
-          className={`flex-shrink-0 px-3 py-1.5 text-xs rounded border transition ${
-            selectionMode
-              ? "bg-indigo-900/40 border-indigo-700 text-indigo-200 hover:bg-indigo-800/40"
-              : "bg-gray-800 border-gray-700 text-gray-300 hover:border-gray-600 hover:text-gray-100"
-          }`}
-          title={
-            selectionMode
-              ? "Exit selection mode"
-              : "Pick multiple plans to delete in one batch"
-          }
-        >
-          {selectionMode ? "Cancel selection" : "Select"}
-        </button>
+        <div className="flex-shrink-0 flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setShowStale((v) => !v)}
+            aria-pressed={showStale}
+            className={`px-3 py-1.5 text-xs rounded border transition ${
+              showStale
+                ? "bg-amber-900/40 border-amber-700 text-amber-200 hover:bg-amber-800/40"
+                : "bg-gray-800 border-gray-700 text-gray-300 hover:border-gray-600 hover:text-gray-100"
+            }`}
+            title="Filter to plans likely safe to retire: completed, auto-named, and older than 30 days"
+            data-testid="show-stale-toggle"
+          >
+            {showStale ? "Showing stale" : "Show stale plans"}
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              selectionMode ? exitSelectionMode() : setSelectionMode(true)
+            }
+            aria-pressed={selectionMode}
+            className={`px-3 py-1.5 text-xs rounded border transition ${
+              selectionMode
+                ? "bg-indigo-900/40 border-indigo-700 text-indigo-200 hover:bg-indigo-800/40"
+                : "bg-gray-800 border-gray-700 text-gray-300 hover:border-gray-600 hover:text-gray-100"
+            }`}
+            title={
+              selectionMode
+                ? "Exit selection mode"
+                : "Pick multiple plans to delete in one batch"
+            }
+          >
+            {selectionMode ? "Cancel selection" : "Select"}
+          </button>
+        </div>
       </div>
+
+      {showStale && (
+        <div
+          className="mb-4 rounded border border-amber-800/60 bg-amber-900/20 px-4 py-2.5 flex items-center justify-between gap-3"
+          data-testid="stale-banner"
+        >
+          <div className="text-xs text-amber-200">
+            {visibleStaleCount === 0 ? (
+              <>No stale plans &mdash; your dashboard is clean.</>
+            ) : (
+              <>
+                Showing <span className="font-mono">{visibleStaleCount}</span>{" "}
+                plan{visibleStaleCount !== 1 ? "s" : ""} that look retireable
+                (completed, auto-named, &gt; 30 days old).
+              </>
+            )}
+          </div>
+          {visibleStaleCount > 0 && (
+            <button
+              type="button"
+              onClick={selectAllStale}
+              className="flex-shrink-0 px-2.5 py-1 text-xs bg-amber-700/60 hover:bg-amber-600/70 text-amber-50 rounded transition"
+              data-testid="select-all-stale"
+            >
+              Select all {visibleStaleCount}
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Project cards grid */}
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
@@ -245,6 +350,7 @@ export function ProjectDashboard() {
             selectionMode={selectionMode}
             selected={selected}
             onToggleSelect={toggleSelected}
+            forceExpandDone={showStale}
           />
         ))}
       </div>
@@ -296,6 +402,7 @@ interface ProjectCardProps {
   selectionMode: boolean;
   selected: Set<string>;
   onToggleSelect: (name: string) => void;
+  forceExpandDone?: boolean;
 }
 
 function ProjectCard({
@@ -304,6 +411,7 @@ function ProjectCard({
   selectionMode,
   selected,
   onToggleSelect,
+  forceExpandDone = false,
 }: ProjectCardProps) {
   const pct =
     stats.totalTasks > 0
@@ -409,6 +517,7 @@ function ProjectCard({
             selectionMode={selectionMode}
             selected={selected}
             onToggleSelect={onToggleSelect}
+            forceExpand={forceExpandDone}
           />
         )}
       </div>
@@ -562,20 +671,24 @@ function DoneSection({
   selectionMode,
   selected,
   onToggleSelect,
+  forceExpand = false,
 }: {
   plans: PlanSummary[];
   onPlanClick: (name: string) => void;
   selectionMode: boolean;
   selected: Set<string>;
   onToggleSelect: (name: string) => void;
+  forceExpand?: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
   // Auto-expand done section in selection mode \u2014 the bootstrap-era
   // auto-named plans this feature targets are typically completed
   // (the original motivation in plan.context.md), and forcing the
   // user to expand each project's done list before they can pick
-  // those plans defeats the bulk-cleanup workflow.
-  const showRows = expanded || selectionMode;
+  // those plans defeats the bulk-cleanup workflow. Stale-filter mode
+  // (forceExpand) shares the same rationale: every stale plan is by
+  // definition completed, so collapsing them defeats the filter.
+  const showRows = expanded || selectionMode || forceExpand;
   return (
     <div>
       <button
