@@ -49,6 +49,12 @@ interface SettingsStore {
   effort: EffortLevel;
   skipPermissions: boolean;
   webhookUrl: string | null;
+  /// Days a soft-deleted plan's snapshot survives before purge. 0
+  /// collapses soft delete to hard delete (drives the modal copy
+  /// for `DeletePlanModal`). Server clamps to [0, 365]; the default
+  /// of 30 is mirrored here so a missing /api/settings doesn't
+  /// surprise the modal copy.
+  planArchiveRetentionDays: number;
   loaded: boolean;
   drivers: DriverInfo[];
   defaultDriver: string;
@@ -65,6 +71,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   effort: "high",
   skipPermissions: true,
   webhookUrl: null,
+  planArchiveRetentionDays: 30,
   loaded: false,
   drivers: [],
   defaultDriver: "claude",
@@ -74,11 +81,13 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       effort: EffortLevel;
       skip_permissions: boolean;
       webhook_url: string | null;
+      plan_archive_retention_days?: number;
     }>("/api/settings");
     set({
       effort: data.effort,
       skipPermissions: data.skip_permissions,
       webhookUrl: data.webhook_url ?? null,
+      planArchiveRetentionDays: data.plan_archive_retention_days ?? 30,
       loaded: true,
     });
   },

@@ -11,6 +11,7 @@ import { useAgentStore, type Agent } from "../stores/agent-store.js";
 import { fetchJson, postJson, putJson } from "../api.js";
 import { PhaseCard } from "./PhaseCard.js";
 import { EditableText } from "./EditableText.js";
+import { DeletePlanModal } from "./DeletePlanModal.js";
 
 export function PlanBoard() {
   const plan = usePlanStore((s) => s.selectedPlan);
@@ -22,6 +23,10 @@ export function PlanBoard() {
   const [checkingPlan, setCheckingPlan] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<string | null>(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const planArchiveRetentionDays = useSettingsStore(
+    (s) => s.planArchiveRetentionDays,
+  );
   const fetchPlans = usePlanStore((s) => s.fetchPlans);
   const savePlan = usePlanStore((s) => s.savePlan);
   const driverCapabilities = useSettingsStore((s) => s.driverCapabilities);
@@ -222,7 +227,24 @@ export function PlanBoard() {
           </button>
           <StaleBranchesButton planName={plan.name} onError={setError} onDone={() => selectPlan(plan.name)} />
         </div>
-        <AutoModeControls planName={plan.name} />
+        <div className="flex items-center justify-between gap-3">
+          <AutoModeControls planName={plan.name} />
+          <button
+            type="button"
+            onClick={() => setDeleteOpen(true)}
+            className="flex-shrink-0 mt-3 px-3 py-1.5 text-xs bg-red-900/30 border border-red-800/50 hover:bg-red-800/40 hover:border-red-600 text-red-300 hover:text-red-200 rounded transition"
+            title="Move this plan to the archive (recoverable for the configured retention window)"
+          >
+            Delete plan
+          </button>
+        </div>
+        {deleteOpen && (
+          <DeletePlanModal
+            planName={plan.name}
+            retentionDays={planArchiveRetentionDays}
+            onClose={() => setDeleteOpen(false)}
+          />
+        )}
         {/* Error toast */}
         {error && (
           <div className="mt-2 text-xs text-red-400 bg-red-900/20 border border-red-800/30 rounded px-3 py-2 inline-flex items-center gap-2">

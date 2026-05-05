@@ -161,6 +161,20 @@ export interface PushToastInput {
   ttlMs?: number;
 }
 
+/// Body returned by `DELETE /api/plans/:name`. Mirrors the camelCase
+/// shape from `api/plans.rs::delete_plan`. The Undo affordance lives
+/// on the WS event (toast push) — this body is mostly for the caller
+/// that wants to surface the snapshot id or warning inline.
+export interface DeletePlanResponse {
+  ok: true;
+  name: string;
+  snapshotId: number | null;
+  archivePath: string | null;
+  hard: boolean;
+  cascadedRows?: Record<string, number>;
+  warning?: string;
+}
+
 interface PlanStore {
   plans: PlanSummary[];
   selectedPlan: ParsedPlan | null;
@@ -199,6 +213,16 @@ interface PlanStore {
   setAutoModeRuntime: (planName: string, runtime: AutoModeRuntime | null) => void;
   pushToast: (toast: PushToastInput) => string;
   dismissToast: (id: string) => void;
+  /// DELETE /api/plans/:name (with `?hard=true` when `opts.hard`).
+  /// Throws `HttpError` on non-2xx so callers can branch on 409
+  /// (running agents, auto-mode in flight). Does NOT remove the plan
+  /// from the local list — that is driven by the `plan_deleted` WS
+  /// event (see ws-store.ts) so the sidebar converges identically
+  /// whether the delete was triggered from this tab or another.
+  deletePlan: (
+    name: string,
+    opts?: { hard?: boolean },
+  ) => Promise<DeletePlanResponse>;
 }
 
 export const usePlanStore = create<PlanStore>((set, get) => ({
@@ -438,5 +462,12 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
 
   dismissToast: (id: string) => {
     set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
+  },
+
+  deletePlan: async (name: string, opts) => {
+    const qs = opts?.hard ? "?hard=true" : "";
+    return await fetchJson<DeletePlanResponse>(`/api/plans/${name}${qs}`, {
+      method: "DELETE",
+    });
   },
 }));
