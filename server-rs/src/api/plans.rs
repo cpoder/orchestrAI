@@ -2273,7 +2273,7 @@ pub struct DeletePlanQuery {
 /// **Cascade**: the row is meaningless once the plan is gone (status,
 /// CI runs, auto-mode toggles, fix-attempt log, project mapping,
 /// per-plan settings, learnings, org ownership). All of these are
-/// wiped inside the same transaction in step 6 of `delete_plan`.
+/// wiped inside the same transaction in step 7 of `delete_plan`.
 ///
 /// **Preserve** (`agents`): completed/killed agent rows stay so the
 /// dashboard can still render their terminal output, diff, branch and
@@ -2288,10 +2288,10 @@ pub struct DeletePlanQuery {
 ///   touched — the historical audit trail is the load-bearing record
 ///   the Activity tab + Undo affordance read from.
 /// - `task_fix_attempts.outcome IS NULL`: load-bearing for the
-///   `auto_mode_in_flight` gate in step 3 of `delete_plan`. Open
+///   `auto_mode_in_flight` gate in step 4 of `delete_plan`. Open
 ///   attempts block the cascade with a 409 instead of being wiped.
 /// - `plan_snapshots`: holds the full pre-cascade blob for Undo
-///   (written by `plan_curate::snapshot_plan` in step 5 of
+///   (written by `plan_curate::snapshot_plan` in step 6 of
 ///   `delete_plan`, BEFORE the cascade runs). Listed in
 ///   `PLAN_NAME_PRESERVED_TABLES` so the cascade itself does NOT
 ///   delete snapshot rows; the retention purge job (0.5) is what
@@ -2336,8 +2336,11 @@ pub async fn delete_plan(
         }
     };
 
-    // 2. Safety gate: any starting/running agent for this plan blocks
-    //    delete. The user must kill or wait first.
+    // 2. Compute the safety-gate inputs. We deliberately read both gates
+    //    BEFORE branching on `dry_run` so the preview body can carry
+    //    `blockedBy` — that is what lets the modal disable the Delete
+    //    button before the user clicks (rather than discovering the 409
+    //    only after issuing the destructive request).
     let running_agents: Vec<String> = {
         let db = state.db.lock().unwrap();
         db.prepare(
@@ -2351,6 +2354,62 @@ pub async fn delete_plan(
         })
         .unwrap_or_default()
     };
+    let auto_mode_in_flight: bool = {
+        let db = state.db.lock().unwrap();
+        let n: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM task_fix_attempts \
+                 WHERE plan_name = ?1 AND outcome IS NULL",
+                params![name],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        n > 0
+    };
+    let blocked_by: Option<serde_json::Value> = if !running_agents.is_empty() || auto_mode_in_flight
+    {
+        Some(serde_json::json!({
+            "runningAgents": running_agents,
+            "autoModeInFlight": auto_mode_in_flight,
+        }))
+    } else {
+        None
+    };
+
+    // 3. dry_run: return the preview body and exit. We do NOT 409 on a
+    //    blocked plan — the gate state is reported via `blockedBy` so
+    //    the modal can render the cascade preview alongside a disabled
+    //    Delete button. Reads only; no audit, no WS broadcast, no FS
+    //    or DB mutation.
+    if q.dry_run {
+        // Per-table cascade counts. SELECT COUNT(*) is plan-scoped so
+        // failures on one table (schema drift, missing column) don't
+        // poison the rest — log and report 0 in that slot.
+        let would_delete: HashMap<&'static str, i64> = {
+            let db = state.db.lock().unwrap();
+            PLAN_CASCADE_TABLES
+                .iter()
+                .map(|table| {
+                    let sql = format!("SELECT COUNT(*) FROM {table} WHERE plan_name = ?1");
+                    let n: i64 = db.query_row(&sql, params![name], |r| r.get(0)).unwrap_or(0);
+                    (*table, n)
+                })
+                .collect()
+        };
+        return Json(serde_json::json!({
+            "ok": true,
+            "dryRun": true,
+            "name": name,
+            "filePath": plan_path.to_str(),
+            "hard": q.hard,
+            "cascadeTables": PLAN_CASCADE_TABLES,
+            "wouldDelete": would_delete,
+            "blockedBy": blocked_by,
+        }))
+        .into_response();
+    }
+
+    // 4. Real-delete safety gates. Mirror the dry_run state into 409s.
     if !running_agents.is_empty() {
         return (
             StatusCode::CONFLICT,
@@ -2361,19 +2420,7 @@ pub async fn delete_plan(
         )
             .into_response();
     }
-
-    // 3. Safety gate: open fix attempt = auto-mode is mid-flight.
-    let open_fix_attempts: i64 = {
-        let db = state.db.lock().unwrap();
-        db.query_row(
-            "SELECT COUNT(*) FROM task_fix_attempts \
-             WHERE plan_name = ?1 AND outcome IS NULL",
-            params![name],
-            |r| r.get(0),
-        )
-        .unwrap_or(0)
-    };
-    if open_fix_attempts > 0 {
+    if auto_mode_in_flight {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error": "auto_mode_in_flight"})),
@@ -2381,21 +2428,7 @@ pub async fn delete_plan(
             .into_response();
     }
 
-    // dry_run: gates passed, but skip the destructive work. Body shape
-    // mirrors the real-delete body so the UI can preview.
-    if q.dry_run {
-        return Json(serde_json::json!({
-            "ok": true,
-            "dryRun": true,
-            "name": name,
-            "filePath": plan_path.to_str(),
-            "hard": q.hard,
-            "cascadeTables": PLAN_CASCADE_TABLES,
-        }))
-        .into_response();
-    }
-
-    // 4. Build the archive path (soft delete only). Created lazily right
+    // 5. Build the archive path (soft delete only). Created lazily right
     //    before the rename so a hard delete never touches the FS.
     let archive_path: Option<std::path::PathBuf> = if q.hard {
         None
@@ -2418,7 +2451,7 @@ pub async fn delete_plan(
         Some(archive_dir.join(format!("{name}.{ts}.{ext}")))
     };
 
-    // 5. Snapshot prior state. Soft delete snapshots before the cascade
+    // 6. Snapshot prior state. Soft delete snapshots before the cascade
     //    so a mid-cascade failure still leaves a recovery row in
     //    `plan_snapshots`. Hard delete skips the snapshot per the brief
     //    — `?hard=true` is the explicit "no undo" path. Snapshot
@@ -2446,7 +2479,7 @@ pub async fn delete_plan(
         }
     };
 
-    // 6. Cascade DB rows in a single transaction so a partial failure
+    // 7. Cascade DB rows in a single transaction so a partial failure
     //    leaves the plan intact.
     let mut cascaded_rows: HashMap<String, i64> = HashMap::new();
     {
@@ -2490,7 +2523,7 @@ pub async fn delete_plan(
         }
     }
 
-    // 7. Move (soft) or remove (hard) the YAML. Failures here are
+    // 8. Move (soft) or remove (hard) the YAML. Failures here are
     //    warnings — the DB cascade is the authoritative source of truth.
     let mut warning: Option<String> = None;
     if q.hard {
@@ -2503,7 +2536,7 @@ pub async fn delete_plan(
         warning = Some(format!("DB cascade succeeded; archive move failed: {e}"));
     }
 
-    // 8. Audit log.
+    // 9. Audit log.
     {
         let db = state.db.lock().unwrap();
         let diff = serde_json::json!({
@@ -2525,7 +2558,7 @@ pub async fn delete_plan(
         );
     }
 
-    // 9. WS broadcast. The file watcher will also fire a remove event,
+    // 10. WS broadcast. The file watcher will also fire a remove event,
     //    but the explicit broadcast carries `snapshot_id` + `hard` for
     //    the Undo affordance and is faster than the watcher's debounce.
     crate::ws::broadcast_event(
@@ -3898,7 +3931,7 @@ mod cascade_audit_tests {
             .unwrap();
         }
 
-        // Run the same cascade loop the handler runs in step 6 of
+        // Run the same cascade loop the handler runs in step 7 of
         // delete_plan. Failure on any DELETE fails the test loudly.
         {
             let mut conn = db.lock().unwrap();

@@ -7,12 +7,52 @@ import {
   waitFor,
 } from "@testing-library/react";
 import axe from "axe-core";
-import { DeletePlanModal } from "./DeletePlanModal.js";
+import {
+  DeletePlanModal,
+  formatCascadeSummary,
+} from "./DeletePlanModal.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { HttpError } from "../api.js";
 
 const PLAN = "scratch-plan";
+
+/// Default dry-run preview shape — clean plan (not blocked, modest
+/// row counts). Tests that exercise the blocked path override this.
+function defaultPreview() {
+  return {
+    ok: true as const,
+    dryRun: true as const,
+    name: PLAN,
+    filePath: `/plans/${PLAN}.yaml`,
+    hard: false,
+    cascadeTables: [
+      "task_status",
+      "ci_runs",
+      "plan_auto_mode",
+      "plan_auto_advance",
+      "task_fix_attempts",
+      "plan_project",
+      "plan_verdicts",
+      "plan_budget",
+      "task_learnings",
+      "plan_org",
+    ],
+    wouldDelete: {
+      task_status: 12,
+      ci_runs: 8,
+      plan_auto_mode: 1,
+      plan_auto_advance: 1,
+      task_fix_attempts: 3,
+      plan_project: 1,
+      plan_verdicts: 0,
+      plan_budget: 0,
+      task_learnings: 0,
+      plan_org: 1,
+    },
+    blockedBy: null,
+  };
+}
 
 beforeEach(() => {
   // Replace store actions with spies; tests assert on these.
@@ -24,6 +64,7 @@ beforeEach(() => {
       archivePath: "/p/archive/x.yaml",
       hard: false,
     }),
+    previewDeletePlan: vi.fn().mockResolvedValue(defaultPreview()),
   });
   useAgentStore.setState({ selectAgent: vi.fn() });
 });
@@ -294,6 +335,193 @@ describe("DeletePlanModal", () => {
     unmount();
     expect(document.activeElement).toBe(trigger);
     document.body.removeChild(trigger);
+  });
+
+  it("renders 'Computing cascade preview…' until the dry-run fetch resolves", async () => {
+    // Don't resolve the preview promise during this assertion window.
+    let resolvePreview: (v: ReturnType<typeof defaultPreview>) => void = () => {};
+    const previewDeletePlan = vi
+      .fn()
+      .mockImplementation(
+        () =>
+          new Promise<ReturnType<typeof defaultPreview>>((res) => {
+            resolvePreview = res;
+          }),
+      );
+    usePlanStore.setState({ previewDeletePlan });
+    render(
+      <DeletePlanModal
+        planName={PLAN}
+        retentionDays={30}
+        onClose={() => {}}
+      />,
+    );
+    expect(
+      screen.getByText(/Computing cascade preview…/i),
+    ).toBeTruthy();
+    resolvePreview(defaultPreview());
+    await waitFor(() =>
+      expect(
+        screen.queryByText(/Computing cascade preview…/i),
+      ).toBeNull(),
+    );
+  });
+
+  it("renders the per-table cascade preview line from wouldDelete", async () => {
+    render(
+      <DeletePlanModal
+        planName={PLAN}
+        retentionDays={30}
+        onClose={() => {}}
+      />,
+    );
+    // Wait for the preview fetch to resolve.
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("delete-plan-cascade-preview").textContent,
+      ).toContain("12 task statuses"),
+    );
+    const previewText = screen.getByTestId(
+      "delete-plan-cascade-preview",
+    ).textContent;
+    expect(previewText).toContain("12 task statuses");
+    expect(previewText).toContain("8 CI runs");
+    expect(previewText).toContain("3 fix attempts");
+    // Skips zero counts.
+    expect(previewText).not.toMatch(/0 (check verdicts|budget settings|learnings)/);
+    // Tables with count 1 use the singular form.
+    expect(previewText).toContain("1 auto-mode setting");
+  });
+
+  it("disables Delete and lists running agents when dry-run reports blockedBy", async () => {
+    const previewDeletePlan = vi.fn().mockResolvedValue({
+      ...defaultPreview(),
+      blockedBy: {
+        runningAgents: ["agent-aaa", "agent-bbb"],
+        autoModeInFlight: false,
+      },
+    });
+    const deletePlan = vi.fn();
+    usePlanStore.setState({ previewDeletePlan, deletePlan });
+    render(
+      <DeletePlanModal
+        planName={PLAN}
+        retentionDays={30}
+        onClose={() => {}}
+      />,
+    );
+    // Banner copy from the blocked branch.
+    await waitFor(() =>
+      expect(
+        screen.getByText(/this plan has running agents/i),
+      ).toBeTruthy(),
+    );
+    // Agent IDs rendered as buttons (clickable to inspect).
+    expect(screen.getByRole("button", { name: "agent-aaa" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "agent-bbb" })).toBeTruthy();
+    // Delete button disabled — clicking it must NOT call deletePlan.
+    const deleteBtn = screen.getByRole("button", { name: /^Delete$/ });
+    expect((deleteBtn as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(deleteBtn);
+    expect(deletePlan).not.toHaveBeenCalled();
+  });
+
+  it("disables Delete with auto-mode banner when dry-run reports autoModeInFlight", async () => {
+    const previewDeletePlan = vi.fn().mockResolvedValue({
+      ...defaultPreview(),
+      blockedBy: { runningAgents: [], autoModeInFlight: true },
+    });
+    const deletePlan = vi.fn();
+    usePlanStore.setState({ previewDeletePlan, deletePlan });
+    render(
+      <DeletePlanModal
+        planName={PLAN}
+        retentionDays={30}
+        onClose={() => {}}
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.getByText(/auto-mode is mid-flight/i)).toBeTruthy(),
+    );
+    const deleteBtn = screen.getByRole("button", { name: /^Delete$/ });
+    expect((deleteBtn as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("falls back to 'preview unavailable' if dry-run fetch errors and Delete stays clickable", async () => {
+    const previewDeletePlan = vi
+      .fn()
+      .mockRejectedValue(new HttpError(500, "boom", { error: "x" }));
+    const deletePlan = vi.fn().mockResolvedValue({
+      ok: true,
+      name: PLAN,
+      snapshotId: 1,
+      archivePath: null,
+      hard: false,
+    });
+    usePlanStore.setState({ previewDeletePlan, deletePlan });
+    render(
+      <DeletePlanModal
+        planName={PLAN}
+        retentionDays={30}
+        onClose={() => {}}
+      />,
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByText(/Cascade preview unavailable/i),
+      ).toBeTruthy(),
+    );
+    // Delete button still clickable — preview is best-effort UX.
+    const deleteBtn = screen.getByRole("button", { name: /^Delete$/ });
+    expect((deleteBtn as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(deleteBtn);
+    await waitFor(() => expect(deletePlan).toHaveBeenCalledTimes(1));
+  });
+
+  describe("formatCascadeSummary", () => {
+    it("returns a fallback when nothing would be deleted", () => {
+      expect(
+        formatCascadeSummary({ task_status: 0, ci_runs: 0 }),
+      ).toMatch(/No cascade rows to delete\./);
+    });
+
+    it("renders a single non-zero count with singular/plural", () => {
+      expect(formatCascadeSummary({ task_status: 1 })).toBe(
+        "1 task status will be deleted.",
+      );
+      expect(formatCascadeSummary({ task_status: 12 })).toBe(
+        "12 task statuses will be deleted.",
+      );
+    });
+
+    it("joins two entries with 'and'", () => {
+      expect(
+        formatCascadeSummary({ task_status: 12, ci_runs: 8 }),
+      ).toBe("12 task statuses and 8 CI runs will be deleted.");
+    });
+
+    it("joins three or more entries with commas + Oxford and", () => {
+      const out = formatCascadeSummary({
+        task_status: 12,
+        ci_runs: 8,
+        task_fix_attempts: 3,
+      });
+      expect(out).toBe(
+        "12 task statuses, 8 CI runs, and 3 fix attempts will be deleted.",
+      );
+    });
+
+    it("skips zero-count entries silently", () => {
+      const out = formatCascadeSummary({
+        task_status: 12,
+        ci_runs: 0,
+        task_fix_attempts: 3,
+      });
+      expect(out).not.toContain("CI run");
+      expect(out).toBe(
+        "12 task statuses and 3 fix attempts will be deleted.",
+      );
+    });
   });
 
   it("axe-core reports zero violations on the rendered dialog", async () => {

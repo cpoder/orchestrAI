@@ -1,6 +1,9 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { HttpError } from "../api.js";
-import { usePlanStore } from "../stores/plan-store.js";
+import {
+  usePlanStore,
+  type DeletePlanPreview,
+} from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
 
 interface DeletePlanModalProps {
@@ -24,6 +27,48 @@ interface AutoModeInFlightBody {
 interface GenericErrorBody {
   error?: string;
   agents?: string[];
+}
+
+/// Human-readable, pluralized labels for the cascade preview line.
+/// Keys must match the table names in `api::plans::PLAN_CASCADE_TABLES`
+/// (which is also what the server returns in `wouldDelete`). Singular
+/// vs plural is selected on the count by the `formatCascadeSummary`
+/// helper below.
+const CASCADE_LABELS: Record<string, [string, string]> = {
+  task_status: ["task status", "task statuses"],
+  ci_runs: ["CI run", "CI runs"],
+  task_fix_attempts: ["fix attempt", "fix attempts"],
+  task_learnings: ["learning", "learnings"],
+  plan_auto_mode: ["auto-mode setting", "auto-mode settings"],
+  plan_auto_advance: ["auto-advance setting", "auto-advance settings"],
+  plan_project: ["project mapping", "project mappings"],
+  plan_verdicts: ["check verdict", "check verdicts"],
+  plan_budget: ["budget setting", "budget settings"],
+  plan_org: ["org membership", "org memberships"],
+};
+
+/// Render the per-table cascade counts as a single English sentence.
+/// Skips zero-count entries (those would just add noise) and falls
+/// back to a generic message when nothing would be deleted at all.
+/// The cascade-table order in `wouldDelete` is unspecified at the JSON
+/// layer; we use `CASCADE_LABELS`'s declaration order so the modal copy
+/// is stable across renders and never depends on hashmap iteration order.
+export function formatCascadeSummary(
+  wouldDelete: Record<string, number>,
+): string {
+  const parts: string[] = [];
+  for (const key of Object.keys(CASCADE_LABELS)) {
+    const n = wouldDelete[key];
+    if (typeof n !== "number" || n <= 0) continue;
+    const [singular, plural] = CASCADE_LABELS[key];
+    parts.push(`${n} ${n === 1 ? singular : plural}`);
+  }
+  if (parts.length === 0) return "No cascade rows to delete.";
+  if (parts.length === 1) return `${parts[0]} will be deleted.`;
+  if (parts.length === 2)
+    return `${parts[0]} and ${parts[1]} will be deleted.`;
+  const last = parts.pop();
+  return `${parts.join(", ")}, and ${last} will be deleted.`;
 }
 
 /// Confirmation modal for the per-plan Delete action. Drives the
@@ -64,9 +109,51 @@ export function DeletePlanModal({
   const [stage, setStage] = useState<"soft" | "hard">(initialStage);
   const [error, setError] = useState<string | null>(null);
   const [runningAgents, setRunningAgents] = useState<string[] | null>(null);
+  // Server-side cascade preview. `null` until the dry-run fetch
+  // resolves; `undefined` if the fetch errored (we still let the user
+  // try the delete — the real DELETE will surface a fresh error and
+  // the cascade preview is best-effort UX, not a gate).
+  const [preview, setPreview] = useState<
+    DeletePlanPreview | null | undefined
+  >(null);
 
   const deletePlan = usePlanStore((s) => s.deletePlan);
+  const previewDeletePlan = usePlanStore((s) => s.previewDeletePlan);
   const selectAgent = useAgentStore((s) => s.selectAgent);
+
+  // Kick off the dry-run preview on open. The cascade is independent
+  // of soft/hard (both flush the same DB rows; only the file action
+  // differs), so we fetch once.
+  useEffect(() => {
+    let cancelled = false;
+    previewDeletePlan(planName)
+      .then((p) => {
+        if (cancelled) return;
+        setPreview(p);
+        // Surface gate state proactively so the user does not have to
+        // click Delete to discover the plan is blocked.
+        if (p.blockedBy) {
+          if (p.blockedBy.runningAgents.length > 0) {
+            setRunningAgents(p.blockedBy.runningAgents);
+            setError("Cannot delete: this plan has running agents.");
+          } else if (p.blockedBy.autoModeInFlight) {
+            setError(
+              "Cannot delete: auto-mode is mid-flight (open fix attempt). Pause auto-mode or wait for it to settle.",
+            );
+          }
+        }
+      })
+      .catch(() => {
+        if (cancelled) return;
+        // Preview is best-effort — fall back to "no preview shown".
+        // The user can still click Delete; the real DELETE will
+        // surface any fresh error.
+        setPreview(undefined);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [planName, previewDeletePlan]);
 
   useEffect(() => {
     triggerRef.current = (document.activeElement as HTMLElement | null) ?? null;
@@ -131,6 +218,12 @@ export function DeletePlanModal({
   // Only show the Shift hint when we're on the soft path AND the org
   // hasn't opted out of retention — otherwise the modifier does nothing.
   const showShiftHint = !isHardConfirm && retentionDays > 0;
+
+  // The dry-run preview disables Delete proactively when the plan is
+  // blocked. Once the user is *busy* committing a delete, this latch
+  // doesn't matter — the in-flight request handles its own UI.
+  const previewBlocked = preview != null && preview.blockedBy != null;
+  const primaryDisabled = busy || previewBlocked;
 
   async function runDelete(hard: boolean) {
     setError(null);
@@ -221,6 +314,25 @@ export function DeletePlanModal({
             while clicking Delete to permanently delete (skip archive).
           </p>
         )}
+        {/* Cascade preview from the dry-run fetch. Loading shows
+            placeholder copy; resolved shows the per-table summary;
+            error silently collapses (the user can still try Delete). */}
+        <div
+          className="mt-3 rounded border border-gray-700 bg-gray-800/40 px-3 py-2 text-xs text-gray-300"
+          data-testid="delete-plan-cascade-preview"
+        >
+          {preview === null ? (
+            <span className="text-gray-500">
+              Computing cascade preview…
+            </span>
+          ) : preview === undefined ? (
+            <span className="text-gray-500">
+              Cascade preview unavailable. The delete will still proceed.
+            </span>
+          ) : (
+            formatCascadeSummary(preview.wouldDelete)
+          )}
+        </div>
         {error && (
           <div
             role="alert"
@@ -258,8 +370,13 @@ export function DeletePlanModal({
           <button
             type="button"
             onClick={onPrimary}
-            disabled={busy}
-            className="px-3 py-1.5 text-xs bg-red-700 hover:bg-red-600 disabled:opacity-50 text-white rounded transition"
+            disabled={primaryDisabled}
+            className="px-3 py-1.5 text-xs bg-red-700 hover:bg-red-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded transition"
+            title={
+              previewBlocked
+                ? "Plan is currently blocked. Resolve the blocker before deleting."
+                : undefined
+            }
           >
             {primaryLabel}
           </button>

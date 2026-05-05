@@ -392,6 +392,245 @@ fn delete_dry_run_passes_gates_without_touching_state() {
 }
 
 #[test]
+fn delete_dry_run_reports_would_delete_row_counts_per_cascade_table() {
+    // The PlanBoard modal renders a "12 task statuses, 8 CI runs, …"
+    // preview from the `wouldDelete` map. Seed the base singleton row
+    // (one per cascade table) plus an extra row in two of the
+    // multi-row tables so the per-table counts are not all 1 — that
+    // way a regression that swaps `wouldDelete["table"]` to a static
+    // 1 (or to the cascade-table list length) is visible.
+    let d = TestDashboard::new();
+    let plan = "preview-with-counts";
+    d.create_plan(plan, &minimal_plan(plan, &d.project));
+    seed_cascade_rows(&d, plan);
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        // Add a second task_status row (different task_number → no PK clash).
+        conn.execute(
+            "INSERT INTO task_status (plan_name, task_number, status) \
+             VALUES (?1, '1.2', 'completed')",
+            params![plan],
+        )
+        .unwrap();
+        // Add a second ci_runs row (no PK on (plan,task) → simple insert).
+        conn.execute(
+            "INSERT INTO ci_runs (plan_name, task_number, status) \
+             VALUES (?1, '1.2', 'success')",
+            params![plan],
+        )
+        .unwrap();
+    }
+
+    let (s, body) = d.delete(&format!("/api/plans/{plan}?dry_run=true"));
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["dryRun"], true);
+
+    let would_delete = body["wouldDelete"]
+        .as_object()
+        .unwrap_or_else(|| panic!("wouldDelete must be an object: {body}"));
+    let n = |k: &str| -> i64 {
+        would_delete
+            .get(k)
+            .and_then(|v| v.as_i64())
+            .unwrap_or_else(|| panic!("{k} missing or non-integer in {body}"))
+    };
+
+    // Tables we explicitly grew to 2 rows.
+    assert_eq!(n("task_status"), 2, "task_status: {body}");
+    assert_eq!(n("ci_runs"), 2, "ci_runs: {body}");
+    // Singleton-shaped seedings stay at 1.
+    assert_eq!(n("plan_auto_mode"), 1, "plan_auto_mode: {body}");
+    assert_eq!(n("plan_auto_advance"), 1, "plan_auto_advance: {body}");
+    assert_eq!(n("task_fix_attempts"), 1, "task_fix_attempts: {body}");
+    assert_eq!(n("plan_project"), 1, "plan_project: {body}");
+    assert_eq!(n("plan_verdicts"), 1, "plan_verdicts: {body}");
+    assert_eq!(n("plan_budget"), 1, "plan_budget: {body}");
+    assert_eq!(n("task_learnings"), 1, "task_learnings: {body}");
+    assert_eq!(n("plan_org"), 1, "plan_org: {body}");
+
+    // Every cascade-table key must be present, even when the count is 0
+    // (so the modal can render zero counts as "0 task statuses" rather
+    // than skipping the row).
+    for table in PLAN_CASCADE_TABLES_FOR_TEST {
+        assert!(
+            would_delete.contains_key(*table),
+            "wouldDelete must include {table}: {body}"
+        );
+    }
+
+    // No mutation: file still on disk, every cascade row still in the DB.
+    let yaml = d.plans_dir.join(format!("{plan}.yaml"));
+    assert!(yaml.exists(), "dry-run must not move the file");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    assert_eq!(count_in(&conn, "task_status", plan), 2);
+    assert_eq!(count_in(&conn, "ci_runs", plan), 2);
+    assert_eq!(audit_plan_delete_count(&conn, plan), 0);
+}
+
+/// Mirror of `api::plans::PLAN_CASCADE_TABLES` so tests can iterate
+/// the canonical cascade list without a `pub(crate)` re-export. Drift
+/// between the two is fine *visually* (the production const is the
+/// source of truth) but `delete_dry_run_reports_would_delete_row_counts_per_cascade_table`
+/// will panic if the `wouldDelete` map ever drops a key listed here.
+const PLAN_CASCADE_TABLES_FOR_TEST: &[&str] = &[
+    "task_status",
+    "ci_runs",
+    "plan_auto_mode",
+    "plan_auto_advance",
+    "task_fix_attempts",
+    "plan_project",
+    "plan_verdicts",
+    "plan_budget",
+    "task_learnings",
+    "plan_org",
+];
+
+#[test]
+fn delete_dry_run_reports_blocked_by_running_agent_without_409() {
+    // The modal disables Delete proactively when the dry-run preview
+    // says the plan is blocked. That contract requires the dry-run
+    // path to never 409 — gate state is rolled into `blockedBy`
+    // instead. Real DELETE still 409s; that is covered separately.
+    let d = TestDashboard::new();
+    let plan = "blocked-preview-agent";
+    d.create_plan(plan, &minimal_plan(plan, &d.project));
+
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO agents (id, cwd, status, plan_name, task_id) \
+         VALUES ('agent-running-preview', ?1, 'running', ?2, '1.1')",
+        params![d.project.to_string_lossy(), plan],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (s, body) = d.delete(&format!("/api/plans/{plan}?dry_run=true"));
+    assert_eq!(s, 200, "dry-run must NOT 409 on a blocked plan: {body}");
+    assert_eq!(body["dryRun"], true);
+
+    let blocked = body["blockedBy"]
+        .as_object()
+        .unwrap_or_else(|| panic!("blockedBy must be populated: {body}"));
+    let agents = blocked["runningAgents"]
+        .as_array()
+        .unwrap_or_else(|| panic!("runningAgents must be an array: {body}"));
+    assert_eq!(
+        agents.len(),
+        1,
+        "runningAgents should list the one agent: {body}"
+    );
+    assert_eq!(agents[0], "agent-running-preview");
+    assert_eq!(blocked["autoModeInFlight"], false);
+}
+
+#[test]
+fn delete_dry_run_reports_blocked_by_auto_mode_in_flight() {
+    let d = TestDashboard::new();
+    let plan = "blocked-preview-fix";
+    d.create_plan(plan, &minimal_plan(plan, &d.project));
+
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO task_fix_attempts (plan_name, task_number, attempt, outcome) \
+         VALUES (?1, '1.1', 1, NULL)",
+        params![plan],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (s, body) = d.delete(&format!("/api/plans/{plan}?dry_run=true"));
+    assert_eq!(s, 200, "dry-run must NOT 409: {body}");
+    assert_eq!(body["dryRun"], true);
+
+    let blocked = body["blockedBy"]
+        .as_object()
+        .unwrap_or_else(|| panic!("blockedBy must be populated: {body}"));
+    assert_eq!(blocked["autoModeInFlight"], true);
+    assert_eq!(
+        blocked["runningAgents"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(usize::MAX),
+        0,
+        "runningAgents must be an empty array, not absent: {body}"
+    );
+}
+
+#[test]
+fn delete_dry_run_blocked_by_is_null_when_plan_is_not_blocked() {
+    let d = TestDashboard::new();
+    let plan = "preview-not-blocked";
+    d.create_plan(plan, &minimal_plan(plan, &d.project));
+    seed_cascade_rows(&d, plan);
+
+    let (s, body) = d.delete(&format!("/api/plans/{plan}?dry_run=true"));
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["dryRun"], true);
+    assert!(
+        body["blockedBy"].is_null(),
+        "blockedBy must be null when plan is not blocked: {body}"
+    );
+}
+
+#[test]
+fn delete_dry_run_does_not_create_snapshot_or_audit_or_broadcast() {
+    // Tightens the no-side-effects contract of the dry-run path.
+    // Specifically: no plan_snapshots row, no audit_logs row, no FS
+    // change. WS broadcast is harder to assert here without wiring a
+    // listener, but the absence of `broadcast_event` calls in the
+    // dry-run branch is verified by code inspection — this test pins
+    // the observable side effects.
+    let d = TestDashboard::new();
+    let plan = "preview-no-side-effects";
+    d.create_plan(plan, &minimal_plan(plan, &d.project));
+    seed_cascade_rows(&d, plan);
+
+    let yaml = d.plans_dir.join(format!("{plan}.yaml"));
+    let archive_dir = d.plans_dir.join("archive");
+    let archive_existed_before = archive_dir.exists();
+
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    let snap_count_before: i64 = {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM plan_snapshots WHERE plan_name = ?1",
+            params![plan],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1)
+    };
+
+    let (s, _body) = d.delete(&format!("/api/plans/{plan}?dry_run=true"));
+    assert_eq!(s, 200);
+
+    // No archive directory created, no archived YAML, original yaml
+    // still on disk.
+    assert!(yaml.exists(), "dry-run must not move the file");
+    assert_eq!(
+        archive_dir.exists(),
+        archive_existed_before,
+        "dry-run must not create the archive directory"
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let snap_count_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM plan_snapshots WHERE plan_name = ?1",
+            params![plan],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1);
+    assert_eq!(
+        snap_count_before, snap_count_after,
+        "dry-run must not write a plan_snapshots row"
+    );
+    assert_eq!(audit_plan_delete_count(&conn, plan), 0);
+}
+
+#[test]
 fn delete_soft_then_hard_replays_cascade_for_a_recreated_plan() {
     // The same plan name can be re-created (e.g. by re-saving the YAML)
     // and re-deleted. Verifies the handler isn't sensitive to leftover

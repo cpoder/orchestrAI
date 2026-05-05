@@ -175,6 +175,33 @@ export interface DeletePlanResponse {
   warning?: string;
 }
 
+/// Body returned by `DELETE /api/plans/:name?dry_run=true`. The dry-run
+/// path runs every safety gate without touching the FS or DB; the
+/// response is the cascade preview the modal renders before the user
+/// commits. `blockedBy` carries the gate state — when populated, the
+/// modal disables the Delete button proactively (instead of waiting for
+/// the real DELETE to 409).
+export interface DeletePlanPreview {
+  ok: true;
+  dryRun: true;
+  name: string;
+  filePath: string | null;
+  hard: boolean;
+  cascadeTables: string[];
+  /// Per-cascade-table row count. Keys are SQL table names (snake_case
+  /// because they ARE the SQL identifiers). Every cascade table is
+  /// always present, including those at zero, so a future schema add
+  /// shows up in the preview without a UI release.
+  wouldDelete: Record<string, number>;
+  /// Null when the plan is not blocked. When populated, the object
+  /// carries both gate slots — `runningAgents` is always an array
+  /// (possibly empty) and `autoModeInFlight` is always a bool.
+  blockedBy: {
+    runningAgents: string[];
+    autoModeInFlight: boolean;
+  } | null;
+}
+
 interface PlanStore {
   plans: PlanSummary[];
   selectedPlan: ParsedPlan | null;
@@ -223,6 +250,12 @@ interface PlanStore {
     name: string,
     opts?: { hard?: boolean },
   ) => Promise<DeletePlanResponse>;
+  /// DELETE /api/plans/:name?dry_run=true — read-only cascade preview.
+  /// Used by `DeletePlanModal` on open so the user sees how many rows
+  /// will be cleared and whether the plan is currently blocked. Throws
+  /// `HttpError` on non-2xx; the dry-run path itself never 409s, so a
+  /// 4xx here means the plan is gone (404) or the request was malformed.
+  previewDeletePlan: (name: string) => Promise<DeletePlanPreview>;
 }
 
 export const usePlanStore = create<PlanStore>((set, get) => ({
@@ -469,5 +502,12 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
     return await fetchJson<DeletePlanResponse>(`/api/plans/${name}${qs}`, {
       method: "DELETE",
     });
+  },
+
+  previewDeletePlan: async (name: string) => {
+    return await fetchJson<DeletePlanPreview>(
+      `/api/plans/${name}?dry_run=true`,
+      { method: "DELETE" },
+    );
   },
 }));
