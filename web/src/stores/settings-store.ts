@@ -63,6 +63,7 @@ interface SettingsStore {
   setEffort: (level: EffortLevel) => Promise<void>;
   setSkipPermissions: (value: boolean) => Promise<void>;
   setWebhookUrl: (value: string | null) => Promise<void>;
+  setPlanArchiveRetentionDays: (value: number) => Promise<void>;
   driverCapabilities: (name: string | null | undefined) => DriverCapabilities;
   driverAuth: (name: string | null | undefined) => AuthStatus | undefined;
 }
@@ -112,6 +113,11 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   setWebhookUrl: async (value) => {
     await putJson("/api/settings", { webhook_url: value });
     set({ webhookUrl: value });
+  },
+
+  setPlanArchiveRetentionDays: async (value) => {
+    await putJson("/api/settings", { plan_archive_retention_days: value });
+    set({ planArchiveRetentionDays: value });
   },
 
   // Look up capabilities by driver name. Falls back to the default driver's

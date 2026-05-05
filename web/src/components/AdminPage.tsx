@@ -8,6 +8,28 @@ const EFFORT_LEVELS: { value: EffortLevel; label: string }[] = [
   { value: "max", label: "Max" },
 ];
 
+const RETENTION_MIN = 0;
+const RETENTION_MAX = 365;
+
+/// Clamp a typed retention-days string into the server's accepted range.
+/// Non-numeric / empty / NaN inputs fall back to the previous saved value
+/// so a half-typed entry on blur can't wipe the setting.
+export function clampRetentionDays(input: string, fallback: number): number {
+  const parsed = Number.parseInt(input.trim(), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  if (parsed < RETENTION_MIN) return RETENTION_MIN;
+  if (parsed > RETENTION_MAX) return RETENTION_MAX;
+  return parsed;
+}
+
+/// Live preview copy for the Retention input. Mirrors the modal copy in
+/// `DeletePlanModal` so the admin sees the exact phrasing the operator
+/// will see when deleting (0 = permanent path, >0 = archive-then-purge).
+export function retentionPreview(days: number): string {
+  if (days === 0) return "Soft-delete disabled — Delete is permanent.";
+  return `Soft-deleted plans are kept for ${days} day${days === 1 ? "" : "s"}.`;
+}
+
 export function AdminPage() {
   const effort = useSettingsStore((s) => s.effort);
   const setEffort = useSettingsStore((s) => s.setEffort);
@@ -15,6 +37,12 @@ export function AdminPage() {
   const setSkipPermissions = useSettingsStore((s) => s.setSkipPermissions);
   const webhookUrl = useSettingsStore((s) => s.webhookUrl);
   const setWebhookUrl = useSettingsStore((s) => s.setWebhookUrl);
+  const planArchiveRetentionDays = useSettingsStore(
+    (s) => s.planArchiveRetentionDays,
+  );
+  const setPlanArchiveRetentionDays = useSettingsStore(
+    (s) => s.setPlanArchiveRetentionDays,
+  );
 
   const [webhookDraft, setWebhookDraft] = useState(webhookUrl ?? "");
   const [webhookStatus, setWebhookStatus] = useState<"idle" | "saving" | "saved" | "error">(
@@ -22,11 +50,52 @@ export function AdminPage() {
   );
   const [webhookError, setWebhookError] = useState<string | null>(null);
 
+  const [retentionDraft, setRetentionDraft] = useState(
+    String(planArchiveRetentionDays),
+  );
+  const [retentionStatus, setRetentionStatus] = useState<
+    "idle" | "saving" | "saved" | "error"
+  >("idle");
+  const [retentionError, setRetentionError] = useState<string | null>(null);
+
   useEffect(() => {
     setWebhookDraft(webhookUrl ?? "");
   }, [webhookUrl]);
 
+  // Reflect external store updates (initial fetch, optimistic resets) into
+  // the input. The clamp on blur owns its own write-back, so this only
+  // refires when the canonical value actually changes.
+  useEffect(() => {
+    setRetentionDraft(String(planArchiveRetentionDays));
+  }, [planArchiveRetentionDays]);
+
   const dirty = (webhookDraft.trim() || null) !== webhookUrl;
+
+  // Preview always reflects what the *committed* value would be — i.e. the
+  // clamped draft if the user blurred right now. Keeps the chip consistent
+  // with the modal copy after a save.
+  const retentionPreviewDays = clampRetentionDays(
+    retentionDraft,
+    planArchiveRetentionDays,
+  );
+
+  async function commitRetention() {
+    const next = clampRetentionDays(retentionDraft, planArchiveRetentionDays);
+    // Reflect the clamp back into the input even when no PUT fires, so
+    // typing 9999 + blur visibly snaps to 365.
+    if (String(next) !== retentionDraft) setRetentionDraft(String(next));
+    if (next === planArchiveRetentionDays) return;
+    setRetentionStatus("saving");
+    setRetentionError(null);
+    try {
+      await setPlanArchiveRetentionDays(next);
+      setRetentionStatus("saved");
+      setTimeout(() => setRetentionStatus("idle"), 2000);
+    } catch (e) {
+      setRetentionStatus("error");
+      setRetentionError(String(e));
+    }
+  }
 
   async function saveWebhook() {
     setWebhookStatus("saving");
@@ -121,6 +190,52 @@ export function AdminPage() {
         )}
         {webhookStatus === "error" && webhookError && (
           <p className="text-[11px] text-red-400 mt-1.5">{webhookError}</p>
+        )}
+      </Section>
+
+      <Section
+        title="Retention"
+        description={
+          <>
+            Days a soft-deleted plan stays in the archive before purge. Set
+            to 0 to disable soft delete — Delete becomes permanent and
+            skips the archive. Range 0–365; out-of-range values clamp on
+            blur.
+          </>
+        }
+      >
+        <div className="flex items-center gap-3">
+          <input
+            type="number"
+            inputMode="numeric"
+            min={RETENTION_MIN}
+            max={RETENTION_MAX}
+            step={1}
+            value={retentionDraft}
+            onChange={(e) => setRetentionDraft(e.target.value)}
+            onBlur={commitRetention}
+            disabled={retentionStatus === "saving"}
+            aria-label="Plan archive retention days"
+            data-testid="retention-input"
+            className="w-24 bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-indigo-600 disabled:opacity-60"
+          />
+          <span className="text-xs text-gray-500">days</span>
+          <span
+            data-testid="retention-preview"
+            className={`text-[11px] px-2 py-0.5 rounded border ${
+              retentionPreviewDays === 0
+                ? "border-amber-700/50 bg-amber-900/30 text-amber-200"
+                : "border-gray-700 bg-gray-800 text-gray-300"
+            }`}
+          >
+            {retentionPreview(retentionPreviewDays)}
+          </span>
+        </div>
+        {retentionStatus === "saved" && (
+          <p className="text-[11px] text-emerald-400 mt-1.5">Saved.</p>
+        )}
+        {retentionStatus === "error" && retentionError && (
+          <p className="text-[11px] text-red-400 mt-1.5">{retentionError}</p>
         )}
       </Section>
     </div>
