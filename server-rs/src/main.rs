@@ -267,6 +267,8 @@ async fn run_server(cli: Cli) {
                 .put(api::plans::update_plan)
                 .delete(api::plans::delete_plan),
         )
+        .route("/api/snapshots", get(api::plans::list_snapshots))
+        .route("/api/snapshots/{id}", delete(api::plans::delete_snapshot))
         .route(
             "/api/snapshots/{id}/restore",
             post(api::plans::restore_snapshot),

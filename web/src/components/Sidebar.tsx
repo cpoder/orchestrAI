@@ -21,8 +21,10 @@ function isPlanDone(p: PlanSummary): boolean {
 }
 
 interface Props {
-  view: "plans" | "agents" | "new-plan" | "audit" | "admin";
-  onViewChange: (v: "plans" | "agents" | "new-plan" | "audit" | "admin") => void;
+  view: "plans" | "agents" | "new-plan" | "audit" | "archive" | "admin";
+  onViewChange: (
+    v: "plans" | "agents" | "new-plan" | "audit" | "archive" | "admin",
+  ) => void;
 }
 
 export function Sidebar({ view, onViewChange }: Props) {
@@ -146,7 +148,7 @@ export function Sidebar({ view, onViewChange }: Props) {
       <nav className="p-2 flex gap-1">
         <button
           onClick={() => onViewChange("plans")}
-          className={`flex-1 px-3 py-1.5 rounded text-sm font-medium transition ${
+          className={`flex-1 px-2 py-1.5 rounded text-xs font-medium transition ${
             view === "plans"
               ? "bg-indigo-600 text-white"
               : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
@@ -156,7 +158,7 @@ export function Sidebar({ view, onViewChange }: Props) {
         </button>
         <button
           onClick={() => onViewChange("agents")}
-          className={`flex-1 px-3 py-1.5 rounded text-sm font-medium transition relative ${
+          className={`flex-1 px-2 py-1.5 rounded text-xs font-medium transition relative ${
             view === "agents"
               ? "bg-indigo-600 text-white"
               : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
@@ -171,13 +173,24 @@ export function Sidebar({ view, onViewChange }: Props) {
         </button>
         <button
           onClick={() => onViewChange("audit")}
-          className={`flex-1 px-3 py-1.5 rounded text-sm font-medium transition ${
+          className={`flex-1 px-2 py-1.5 rounded text-xs font-medium transition ${
             view === "audit"
               ? "bg-indigo-600 text-white"
               : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
           }`}
         >
           Activity
+        </button>
+        <button
+          onClick={() => onViewChange("archive")}
+          className={`flex-1 px-2 py-1.5 rounded text-xs font-medium transition ${
+            view === "archive"
+              ? "bg-indigo-600 text-white"
+              : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
+          }`}
+          title="Soft-deleted plans pending retention"
+        >
+          Archive
         </button>
       </nav>
 

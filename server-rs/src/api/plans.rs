@@ -2845,6 +2845,230 @@ pub async fn restore_snapshot(
     Json(response).into_response()
 }
 
+// ── GET /api/snapshots ──────────────────────────────────────────────────────
+
+/// One snapshot row as returned by [`list_snapshots`]. Frontend keys
+/// off `id` for restore/purge actions and `expires_at` for the
+/// countdown chip; `restored_at` is non-null for snapshots that have
+/// been replayed but are not yet expired (kept for the audit trail).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotListEntry {
+    id: i64,
+    plan_name: String,
+    kind: String,
+    created_at: String,
+    expires_at: String,
+    archive_path: Option<String>,
+    restored_at: Option<String>,
+}
+
+/// List every `plan_snapshots` row scoped to the caller's org. Used by
+/// the Archive panel to show pending soft-deleted plans, their
+/// retention countdown, and offer Restore / Purge-now affordances.
+///
+/// Sort: newest snapshot first (`created_at DESC`) so a freshly
+/// soft-deleted plan lands at the top of the list.
+///
+/// Excludes nothing: restored snapshots stay visible until the
+/// retention purger frees them so the audit trail is accessible from
+/// the same panel as live entries. The frontend can dim restored rows
+/// based on `restored_at`.
+pub async fn list_snapshots(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+) -> impl IntoResponse {
+    let org_id = auth.org_id().to_string();
+    let entries: Vec<SnapshotListEntry> = {
+        let db = state.db.lock().unwrap();
+        let mut stmt = match db.prepare(
+            "SELECT id, plan_name, kind, created_at, expires_at, archive_path, restored_at \
+             FROM plan_snapshots \
+             WHERE org_id = ?1 \
+             ORDER BY created_at DESC, id DESC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("snapshot list prepare failed: {e}"),
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        let rows = stmt.query_map(params![org_id], |r| {
+            Ok(SnapshotListEntry {
+                id: r.get(0)?,
+                plan_name: r.get(1)?,
+                kind: r.get(2)?,
+                created_at: r.get(3)?,
+                expires_at: r.get(4)?,
+                archive_path: r.get(5)?,
+                restored_at: r.get(6)?,
+            })
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("snapshot list query failed: {e}"),
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+    Json(serde_json::json!({ "snapshots": entries })).into_response()
+}
+
+// ── DELETE /api/snapshots/:id ───────────────────────────────────────────────
+
+/// Immediately hard-delete a `plan_snapshots` row + its archive YAML.
+/// Counterpart of `restore_snapshot`. Surfaced from the Archive panel
+/// behind a second-confirm modal — no undo.
+///
+/// Status code contract:
+/// - 200: row + archive removed (best-effort on archive: a missing
+///   file does not fail the delete).
+/// - 403: snapshot belongs to a different org than the caller.
+/// - 404: snapshot id is unknown (already purged, or never existed).
+/// - 500: SQLite delete failed.
+pub async fn delete_snapshot(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    // 1. Look up the snapshot. Kind, plan_name, archive_path, org_id
+    //    are all needed for the audit row; the caller's org_id gates
+    //    cross-tenant access.
+    #[derive(Debug)]
+    struct SnapshotRow {
+        plan_name: String,
+        kind: String,
+        archive_path: Option<String>,
+        org_id: String,
+    }
+    let row = {
+        let db = state.db.lock().unwrap();
+        db.query_row(
+            "SELECT plan_name, kind, archive_path, org_id \
+             FROM plan_snapshots WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok(SnapshotRow {
+                    plan_name: r.get(0)?,
+                    kind: r.get(1)?,
+                    archive_path: r.get(2)?,
+                    org_id: r.get(3)?,
+                })
+            },
+        )
+        .ok()
+    };
+    let Some(row) = row else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "snapshot_not_found"})),
+        )
+            .into_response();
+    };
+
+    if row.org_id != auth.org_id() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "snapshot_not_in_org"})),
+        )
+            .into_response();
+    }
+
+    // 2. Best-effort: remove the archive YAML. NotFound is fine —
+    //    operator may have cleaned the directory by hand. Any other
+    //    error is captured as a warning so the row delete still wins.
+    let mut warning: Option<String> = None;
+    if let Some(ref path) = row.archive_path {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warning = Some(format!("archive cleanup failed: {e}"));
+            }
+        }
+    }
+
+    // 3. Delete the snapshot row. If the retention purger raced us and
+    //    already removed it, return 404 — the row is gone either way,
+    //    but the user should know they didn't trigger the purge.
+    let n = {
+        let db = state.db.lock().unwrap();
+        match db.execute("DELETE FROM plan_snapshots WHERE id = ?1", params![id]) {
+            Ok(n) => n,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("snapshot delete failed: {e}"),
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+    if n == 0 {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "snapshot_not_found"})),
+        )
+            .into_response();
+    }
+
+    // 4. Audit log. Append-only; matches the shape used by the
+    //    automatic retention purger so both events render in the same
+    //    Activity-tab column.
+    {
+        let db = state.db.lock().unwrap();
+        let diff = serde_json::json!({
+            "snapshot_id": id,
+            "kind": row.kind,
+            "archive_path": row.archive_path,
+        });
+        crate::audit::log(
+            &db,
+            &row.org_id,
+            auth.0.as_ref().map(|u| u.id.as_str()),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::audit::actions::PLAN_SNAPSHOT_PURGED_MANUAL,
+            crate::audit::resources::PLAN,
+            Some(&row.plan_name),
+            Some(&diff.to_string()),
+        );
+    }
+
+    // 5. WS broadcast so any open Archive panel drops the row without
+    //    a manual refresh.
+    crate::ws::broadcast_event(
+        &state.broadcast_tx,
+        "snapshot_purged",
+        serde_json::json!({
+            "snapshot_id": id,
+            "plan": row.plan_name,
+        }),
+    );
+
+    let mut response = serde_json::json!({
+        "ok": true,
+        "snapshotId": id,
+        "plan": row.plan_name,
+    });
+    if let Some(w) = warning {
+        response["warning"] = serde_json::Value::String(w);
+    }
+    Json(response).into_response()
+}
+
 /// Write `body` to `path` atomically: write to a sibling tempfile in
 /// the same directory, then rename. POSIX rename is atomic; Windows
 /// rename-over-existing fails but our caller (`restore_snapshot`)

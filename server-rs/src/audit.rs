@@ -64,6 +64,12 @@ pub mod actions {
     /// snapshotted plan's name. Append-only: no second-level undo for
     /// purged snapshots.
     pub const PLAN_SNAPSHOT_PURGED: &str = "plan.snapshot_purged";
+    /// `DELETE /api/snapshots/:id` immediately hard-deleted a snapshot
+    /// row + its archive YAML at the user's request from the Archive
+    /// panel — counterpart of `PLAN_RESTORE`. Diff carries
+    /// `{snapshot_id, kind, archive_path}`; resource is the snapshotted
+    /// plan's name. Append-only: no second-level undo.
+    pub const PLAN_SNAPSHOT_PURGED_MANUAL: &str = "plan.snapshot_purged_manual";
     pub const AUTH_SIGNUP: &str = "auth.signup";
     pub const AUTH_LOGIN: &str = "auth.login";
     pub const SSO_LOGIN: &str = "sso.login";

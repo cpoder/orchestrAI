@@ -11,10 +11,11 @@ import { AgentTree } from "./components/AgentTree.js";
 import { AgentPanel } from "./components/AgentPanel.js";
 import { NewPlanForm } from "./components/NewPlanForm.js";
 import { AuditLog } from "./components/AuditLog.js";
+import { ArchivePanel } from "./components/ArchivePanel.js";
 import { LoginPage } from "./components/LoginPage.js";
 import { AdminPage } from "./components/AdminPage.js";
 
-type View = "plans" | "agents" | "new-plan" | "audit" | "admin";
+type View = "plans" | "agents" | "new-plan" | "audit" | "archive" | "admin";
 
 export function App() {
   const [view, setView] = useState<View>("plans");
@@ -86,6 +87,7 @@ export function App() {
           {view === "plans" && (selectedPlan ? <PlanBoard /> : <ProjectDashboard />)}
           {view === "agents" && <AgentTree />}
           {view === "audit" && <AuditLog />}
+          {view === "archive" && <ArchivePanel />}
           {view === "admin" && <AdminPage />}
           {view === "new-plan" && (
             <NewPlanForm onClose={() => setView("plans")} />
