@@ -5,6 +5,8 @@
 //! is scoped to an organization and exposed via API as an activity feed,
 //! exportable as CSV for compliance.
 
+use std::collections::HashMap;
+
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
@@ -96,6 +98,24 @@ pub struct AuditEntry {
     pub resource_id: Option<String>,
     pub diff: Option<String>,
     pub created_at: String,
+    /// `diff.snapshot_id` parsed out at query time for actions that
+    /// snapshot before mutating (`plan.delete` and friends). `None`
+    /// when the diff is missing, malformed, or carried no snapshot
+    /// (hard delete). The Activity-tab Undo affordance keys off this
+    /// field plus `recoverable` / `restored_at`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<i64>,
+    /// `true` iff `snapshot_id` resolves to a `plan_snapshots` row whose
+    /// `restored_at IS NULL` AND `expires_at > datetime('now')`. `false`
+    /// when the snapshot was purged, expired, or already restored.
+    /// Always `false` when `snapshot_id` is `None`.
+    pub recoverable: bool,
+    /// `plan_snapshots.restored_at` for the row pointed at by
+    /// `snapshot_id`. Set after the snapshot has been replayed via
+    /// `POST /api/snapshots/:id/restore`; `None` while still
+    /// recoverable, expired, or never snapshotted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restored_at: Option<String>,
 }
 
 /// Insert an audit log entry. Call this from any handler that mutates state.
@@ -199,7 +219,8 @@ pub fn list(
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
         params_vec.iter().map(|p| p.as_ref()).collect();
 
-    conn.prepare(&sql)
+    let mut entries = conn
+        .prepare(&sql)
         .and_then(|mut stmt| {
             stmt.query_map(param_refs.as_slice(), |row| {
                 Ok(AuditEntry {
@@ -212,11 +233,74 @@ pub fn list(
                     resource_id: row.get(6)?,
                     diff: row.get(7)?,
                     created_at: row.get(8)?,
+                    snapshot_id: None,
+                    recoverable: false,
+                    restored_at: None,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    enrich_with_snapshot_state(conn, &mut entries);
+    entries
+}
+
+/// Decorate each `AuditEntry` with `snapshot_id`, `recoverable`, and
+/// `restored_at` by parsing the diff and (when a snapshot id is
+/// present) joining against `plan_snapshots`. Missing-table or
+/// JSON-parse errors degrade silently — the entry simply renders
+/// without an Undo affordance.
+fn enrich_with_snapshot_state(conn: &Connection, entries: &mut [AuditEntry]) {
+    let mut indices: Vec<(usize, i64)> = Vec::new();
+    for (i, e) in entries.iter_mut().enumerate() {
+        let Some(diff) = e.diff.as_deref() else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(diff) else {
+            continue;
+        };
+        let Some(sid) = value.get("snapshot_id").and_then(|n| n.as_i64()) else {
+            continue;
+        };
+        e.snapshot_id = Some(sid);
+        indices.push((i, sid));
+    }
+    if indices.is_empty() {
+        return;
+    }
+    let ids: Vec<i64> = indices.iter().map(|(_, s)| *s).collect();
+    let placeholders = (0..ids.len())
+        .map(|i| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, restored_at, (expires_at > datetime('now')) AS is_live \
+         FROM plan_snapshots WHERE id IN ({placeholders})",
+    );
+    let id_params: Vec<&dyn rusqlite::types::ToSql> = ids
+        .iter()
+        .map(|i| i as &dyn rusqlite::types::ToSql)
+        .collect();
+    let rows: HashMap<i64, (Option<String>, bool)> = conn
+        .prepare(&sql)
+        .and_then(|mut stmt| {
+            stmt.query_map(id_params.as_slice(), |row| {
+                let id: i64 = row.get(0)?;
+                let restored_at: Option<String> = row.get(1)?;
+                let is_live: i64 = row.get(2)?;
+                Ok((id, (restored_at, is_live != 0)))
+            })?
+            .collect::<Result<HashMap<_, _>, _>>()
+        })
+        .unwrap_or_default();
+    for (i, sid) in indices {
+        let entry = &mut entries[i];
+        if let Some((restored_at, is_live)) = rows.get(&sid) {
+            entry.restored_at = restored_at.clone();
+            entry.recoverable = restored_at.is_none() && *is_live;
+        }
+    }
 }
 
 /// Total count of audit entries for an org (for pagination).
@@ -465,10 +549,41 @@ mod tests {
                 diff          TEXT,
                 created_at    TEXT NOT NULL DEFAULT (datetime('now'))
             );
-            CREATE INDEX idx_audit_org_created ON audit_logs(org_id, created_at DESC);",
+            CREATE INDEX idx_audit_org_created ON audit_logs(org_id, created_at DESC);
+            CREATE TABLE plan_snapshots (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                plan_name     TEXT NOT NULL,
+                kind          TEXT NOT NULL,
+                created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                expires_at    TEXT NOT NULL,
+                org_id        TEXT NOT NULL DEFAULT 'default-org',
+                archive_path  TEXT,
+                yaml_body     TEXT NOT NULL,
+                cascade_json  TEXT NOT NULL,
+                restored_at   TEXT
+            );",
         )
         .unwrap();
         conn
+    }
+
+    /// Insert a fake `plan_snapshots` row and return its id. Tests use
+    /// this to drive the recoverable/restored/expired branches of
+    /// `enrich_with_snapshot_state` end-to-end.
+    fn seed_snapshot(
+        conn: &Connection,
+        plan_name: &str,
+        expires_at: &str,
+        restored_at: Option<&str>,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO plan_snapshots \
+                 (plan_name, kind, expires_at, yaml_body, cascade_json, restored_at) \
+             VALUES (?1, 'delete', ?2, '', '{}', ?3)",
+            params![plan_name, expires_at, restored_at],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
     }
 
     #[test]
@@ -635,6 +750,9 @@ mod tests {
                 resource_id: Some("agent-1".into()),
                 diff: Some(r#"{"key":"value"}"#.into()),
                 created_at: "2026-04-16T00:00:00Z".into(),
+                snapshot_id: None,
+                recoverable: false,
+                restored_at: None,
             },
             AuditEntry {
                 id: 2,
@@ -646,6 +764,9 @@ mod tests {
                 resource_id: None,
                 diff: None,
                 created_at: "2026-04-16T01:00:00Z".into(),
+                snapshot_id: None,
+                recoverable: false,
+                restored_at: None,
             },
         ];
         let csv = to_csv(&entries);
@@ -688,5 +809,175 @@ mod tests {
 
         let total = count(&conn, "org-1", None, None);
         assert_eq!(total, 10);
+    }
+
+    #[test]
+    fn list_surfaces_recoverable_for_unrestored_unexpired_snapshot() {
+        let conn = test_conn();
+        let snap = seed_snapshot(&conn, "doomed", "2099-01-01 00:00:00", None);
+        log(
+            &conn,
+            "org-1",
+            Some("u"),
+            Some("u@example.com"),
+            actions::PLAN_DELETE,
+            resources::PLAN,
+            Some("doomed"),
+            Some(&format!(
+                r#"{{"file_path":"/p/doomed.yaml","snapshot_id":{snap},"hard":false}}"#
+            )),
+        );
+
+        let entries = list(&conn, "org-1", 50, 0, None, None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].snapshot_id, Some(snap));
+        assert!(entries[0].recoverable);
+        assert!(entries[0].restored_at.is_none());
+    }
+
+    #[test]
+    fn list_marks_already_restored_snapshot_as_unrecoverable() {
+        let conn = test_conn();
+        let snap = seed_snapshot(
+            &conn,
+            "saved",
+            "2099-01-01 00:00:00",
+            Some("2026-04-12 09:00:00"),
+        );
+        log(
+            &conn,
+            "org-1",
+            None,
+            None,
+            actions::PLAN_DELETE,
+            resources::PLAN,
+            Some("saved"),
+            Some(&format!(r#"{{"snapshot_id":{snap},"hard":false}}"#)),
+        );
+
+        let entries = list(&conn, "org-1", 50, 0, None, None);
+        assert_eq!(entries[0].snapshot_id, Some(snap));
+        assert!(!entries[0].recoverable);
+        assert_eq!(
+            entries[0].restored_at.as_deref(),
+            Some("2026-04-12 09:00:00")
+        );
+    }
+
+    #[test]
+    fn list_marks_expired_snapshot_as_unrecoverable_without_restored_at() {
+        let conn = test_conn();
+        let snap = seed_snapshot(&conn, "expired", "2000-01-01 00:00:00", None);
+        log(
+            &conn,
+            "org-1",
+            None,
+            None,
+            actions::PLAN_DELETE,
+            resources::PLAN,
+            Some("expired"),
+            Some(&format!(r#"{{"snapshot_id":{snap},"hard":false}}"#)),
+        );
+
+        let entries = list(&conn, "org-1", 50, 0, None, None);
+        assert_eq!(entries[0].snapshot_id, Some(snap));
+        assert!(!entries[0].recoverable);
+        assert!(entries[0].restored_at.is_none());
+    }
+
+    #[test]
+    fn list_marks_purged_snapshot_id_as_unrecoverable() {
+        // The retention purger may have hard-deleted the snapshot row;
+        // the audit row's diff still references the (now stale) id.
+        let conn = test_conn();
+        log(
+            &conn,
+            "org-1",
+            None,
+            None,
+            actions::PLAN_DELETE,
+            resources::PLAN,
+            Some("ghost"),
+            Some(r#"{"snapshot_id":99999,"hard":false}"#),
+        );
+
+        let entries = list(&conn, "org-1", 50, 0, None, None);
+        assert_eq!(entries[0].snapshot_id, Some(99999));
+        assert!(!entries[0].recoverable);
+        assert!(entries[0].restored_at.is_none());
+    }
+
+    #[test]
+    fn list_leaves_non_snapshot_actions_alone() {
+        let conn = test_conn();
+        log(
+            &conn,
+            "org-1",
+            Some("u"),
+            Some("u@example.com"),
+            actions::AGENT_START,
+            resources::AGENT,
+            Some("agent-1"),
+            Some(r#"{"plan":"p","task":"1.1"}"#),
+        );
+
+        let entries = list(&conn, "org-1", 50, 0, None, None);
+        assert!(entries[0].snapshot_id.is_none());
+        assert!(!entries[0].recoverable);
+        assert!(entries[0].restored_at.is_none());
+    }
+
+    #[test]
+    fn list_handles_hard_delete_without_snapshot_id() {
+        // Hard delete carries `snapshot_id: null` in the diff. Same
+        // contract as actions that never snapshot — no Undo affordance.
+        let conn = test_conn();
+        log(
+            &conn,
+            "org-1",
+            None,
+            None,
+            actions::PLAN_DELETE,
+            resources::PLAN,
+            Some("hard-removed"),
+            Some(r#"{"snapshot_id":null,"hard":true}"#),
+        );
+
+        let entries = list(&conn, "org-1", 50, 0, None, None);
+        assert!(entries[0].snapshot_id.is_none());
+        assert!(!entries[0].recoverable);
+        assert!(entries[0].restored_at.is_none());
+    }
+
+    #[test]
+    fn list_serializes_snapshot_fields_in_camelcase() {
+        let conn = test_conn();
+        let snap = seed_snapshot(&conn, "p", "2099-01-01 00:00:00", None);
+        log(
+            &conn,
+            "org-1",
+            None,
+            None,
+            actions::PLAN_DELETE,
+            resources::PLAN,
+            Some("p"),
+            Some(&format!(r#"{{"snapshot_id":{snap}}}"#)),
+        );
+
+        let entries = list(&conn, "org-1", 50, 0, None, None);
+        let json = serde_json::to_string(&entries[0]).unwrap();
+        assert!(
+            json.contains("\"snapshotId\""),
+            "json must use camelCase: {json}"
+        );
+        assert!(
+            json.contains("\"recoverable\":true"),
+            "recoverable must be true: {json}"
+        );
+        // restoredAt is omitted when None per skip_serializing_if.
+        assert!(
+            !json.contains("\"restoredAt\""),
+            "restoredAt should be omitted when None: {json}"
+        );
     }
 }

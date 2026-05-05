@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
-import { fetchJson } from "../api.js";
+import { fetchJson, HttpError } from "../api.js";
 import { useAuthStore } from "../stores/auth-store.js";
+import { usePlanStore } from "../stores/plan-store.js";
 import { useWsStore } from "../stores/ws-store.js";
 
 interface AuditEntry {
@@ -13,6 +14,27 @@ interface AuditEntry {
   resourceId: string | null;
   diff: string | null;
   createdAt: string;
+  /// Set by the server for actions that snapshot before mutating
+  /// (`plan.delete` and the rearrange-plan primitives that land in
+  /// `project-plan-rearrange.yaml`). Drives the Undo affordance below.
+  snapshotId?: number | null;
+  /// `true` iff `snapshotId` resolves to a `plan_snapshots` row whose
+  /// `restored_at IS NULL` AND `expires_at > datetime('now')`. Always
+  /// present on the wire (the server defaults to `false`); checked
+  /// alongside `snapshotId` because `false` collapses three different
+  /// conditions (no snapshot, expired, already restored).
+  recoverable: boolean;
+  /// Wall-clock from `plan_snapshots.restored_at`. Set after the
+  /// snapshot has been replayed via `POST /api/snapshots/:id/restore`.
+  restoredAt?: string | null;
+}
+
+interface SnapshotRestoreResponse {
+  ok: true;
+  plan: string;
+  snapshotId: number;
+  restoredAt: string;
+  warning?: string;
 }
 
 interface AuditResponse {
@@ -43,6 +65,8 @@ const ACTION_LABELS: Record<string, string> = {
   "org.member_role_change": "Changed member role",
   "plan.create": "Created plan",
   "plan.update": "Updated plan",
+  "plan.delete": "Deleted plan",
+  "plan.restore": "Restored plan",
   "auth.signup": "Signed up",
   "auth.login": "Logged in",
   "auto_mode.merged": "Auto-merged task",
@@ -67,6 +91,8 @@ const ACTION_COLORS: Record<string, string> = {
   "org.member_remove": "text-red-400",
   "plan.create": "text-indigo-400",
   "plan.update": "text-blue-400",
+  "plan.delete": "text-red-400",
+  "plan.restore": "text-emerald-400",
   "auth.signup": "text-emerald-400",
   "auth.login": "text-gray-400",
   "auto_mode.merged": "text-emerald-400",
@@ -125,6 +151,28 @@ function autoFinishTriggerLabel(diff: string | null): string {
   if (trigger === "stop_hook") return "Stop hook";
   if (trigger === "idle_timeout") return "idle timeout";
   return "auto";
+}
+
+/// Audit actions that snapshot before mutating, so a `snapshotId` on
+/// the row points at a `plan_snapshots` entry that can be replayed via
+/// `POST /api/snapshots/:id/restore`. `plan.merge`, `plan.archive`,
+/// `plan.rename`, `plan.context_rewritten` ship with
+/// `project-plan-rearrange.yaml`; including them now means the Undo
+/// column lights up the moment those primitives start writing
+/// snapshots, with no code change here.
+const UNDOABLE_ACTIONS: ReadonlySet<string> = new Set([
+  "plan.delete",
+  "plan.merge",
+  "plan.archive",
+  "plan.rename",
+  "plan.context_rewritten",
+]);
+
+function formatRestoredAt(iso: string): string {
+  // The server sends `YYYY-MM-DD HH:MM:SS` (datetime('now')) in UTC.
+  // Append Z so JS parses it as UTC and the `formatTimestamp` relative
+  // form ("Just now", "5m ago") stays accurate after a restore.
+  return formatTimestamp(iso);
 }
 
 function DiffSummary({ diff, action }: { diff: string | null; action: string }) {
@@ -259,6 +307,56 @@ function DiffSummary({ diff, action }: { diff: string | null; action: string }) 
   return null;
 }
 
+/// One of three states per row:
+/// - Already restored → "Restored at <relative ts>"
+/// - Still recoverable → small Undo button + any inline diagnostic
+///   from a prior 409/410
+/// - Snapshot is gone (expired or hard delete) → faint "no longer
+///   recoverable" hint
+/// Rows whose action is not in `UNDOABLE_ACTIONS` render nothing
+/// (the column is left blank for unrelated activity).
+function UndoCell({
+  entry,
+  busy,
+  diagnostic,
+  onUndo,
+}: {
+  entry: AuditEntry;
+  busy: boolean;
+  diagnostic: string | undefined;
+  onUndo: () => void;
+}) {
+  if (!UNDOABLE_ACTIONS.has(entry.action)) return null;
+  if (entry.restoredAt) {
+    return (
+      <span className="text-emerald-400/80 text-[11px]">
+        Restored {formatRestoredAt(entry.restoredAt)}
+      </span>
+    );
+  }
+  if (entry.snapshotId == null || !entry.recoverable) {
+    return (
+      <span className="text-gray-600 text-[11px] italic">
+        no longer recoverable
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-2">
+      <button
+        onClick={onUndo}
+        disabled={busy}
+        className="text-[11px] px-2 py-0.5 rounded border border-indigo-700/60 bg-indigo-900/20 text-indigo-200 hover:border-indigo-500 hover:bg-indigo-900/40 disabled:opacity-50 transition"
+      >
+        {busy ? "Restoring..." : "Undo"}
+      </button>
+      {diagnostic && (
+        <span className="text-[11px] text-amber-400">{diagnostic}</span>
+      )}
+    </span>
+  );
+}
+
 export function AuditLog() {
   const user = useAuthStore((s) => s.user);
   const orgSlug = user?.orgId ?? "default-org";
@@ -274,6 +372,114 @@ export function AuditLog() {
   const [resourceFilter, setResourceFilter] = useState("");
 
   const [exporting, setExporting] = useState(false);
+  /// Per-entry state for in-flight Undo POSTs and any diagnostic the
+  /// server returned (409 slug_collision, 410 already_restored). Keyed
+  /// by audit entry id so a row's spinner / error survives unrelated
+  /// rerenders. Cleared when the entry transitions to `restoredAt`.
+  const [restoring, setRestoring] = useState<Record<number, boolean>>({});
+  const [undoErrors, setUndoErrors] = useState<Record<number, string>>({});
+
+  const pushToast = usePlanStore((s) => s.pushToast);
+
+  const undoSnapshot = useCallback(
+    async (entryId: number, snapshotId: number, planName: string | null) => {
+      setRestoring((r) => ({ ...r, [entryId]: true }));
+      setUndoErrors((e) => {
+        if (!(entryId in e)) return e;
+        const { [entryId]: _omit, ...rest } = e;
+        return rest;
+      });
+      try {
+        const res = await fetchJson<SnapshotRestoreResponse>(
+          `/api/snapshots/${snapshotId}/restore`,
+          { method: "POST" },
+        );
+        // Optimistic patch: flip this row's `restoredAt` so the Undo
+        // button hides without waiting for a refetch. The server has
+        // already audited a `plan.restore` row that the next refresh
+        // (or a future audit_log broadcast) will surface separately.
+        setEntries((prev) =>
+          prev.map((p) =>
+            p.id === entryId
+              ? { ...p, recoverable: false, restoredAt: res.restoredAt }
+              : p,
+          ),
+        );
+        pushToast({
+          kind: "success",
+          message: `Restored plan ${res.plan}`,
+          ttlMs: 5_000,
+        });
+      } catch (err) {
+        if (err instanceof HttpError) {
+          if (err.status === 410) {
+            // Snapshot was already replayed (concurrent Undo, or the
+            // user reloaded a stale tab). Pull the new restoredAt out
+            // of the body so the row updates in place rather than
+            // showing a stale Undo button.
+            const body = (err.body ?? {}) as {
+              restored_at?: string | null;
+              error?: string;
+            };
+            const restoredAt = body.restored_at ?? null;
+            setEntries((prev) =>
+              prev.map((p) =>
+                p.id === entryId
+                  ? { ...p, recoverable: false, restoredAt }
+                  : p,
+              ),
+            );
+            setUndoErrors((e) => ({
+              ...e,
+              [entryId]: "already restored",
+            }));
+          } else if (err.status === 409) {
+            // Slug collision — another plan owns the same name now,
+            // and the user must rename/delete it before retrying.
+            const body = (err.body ?? {}) as { current?: string };
+            const current = body.current ? ` (${body.current})` : "";
+            setUndoErrors((e) => ({
+              ...e,
+              [entryId]: `name in use${current}`,
+            }));
+          } else if (err.status === 404) {
+            setUndoErrors((e) => ({
+              ...e,
+              [entryId]: "snapshot expired",
+            }));
+            setEntries((prev) =>
+              prev.map((p) =>
+                p.id === entryId ? { ...p, recoverable: false } : p,
+              ),
+            );
+          } else {
+            setUndoErrors((e) => ({
+              ...e,
+              [entryId]: err.message,
+            }));
+          }
+        } else {
+          setUndoErrors((e) => ({
+            ...e,
+            [entryId]: err instanceof Error ? err.message : String(err),
+          }));
+        }
+        pushToast({
+          kind: "error",
+          message: planName
+            ? `Failed to restore ${planName}`
+            : "Failed to restore plan",
+          ttlMs: 5_000,
+        });
+      } finally {
+        setRestoring((r) => {
+          const { [entryId]: _omit, ...rest } = r;
+          return rest;
+        });
+      }
+    },
+    [pushToast],
+  );
 
   const fetchLogs = useCallback(
     async (newOffset = 0) => {
@@ -439,6 +645,7 @@ export function AuditLog() {
                 <th className="px-3 py-2 font-medium">Action</th>
                 <th className="px-3 py-2 font-medium">Resource</th>
                 <th className="px-3 py-2 font-medium">Details</th>
+                <th className="px-3 py-2 font-medium">Undo</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-800/50">
@@ -489,6 +696,17 @@ export function AuditLog() {
                   </td>
                   <td className="px-3 py-2 text-xs truncate max-w-[200px]">
                     <DiffSummary diff={e.diff} action={e.action} />
+                  </td>
+                  <td className="px-3 py-2 text-xs whitespace-nowrap">
+                    <UndoCell
+                      entry={e}
+                      busy={restoring[e.id] === true}
+                      diagnostic={undoErrors[e.id]}
+                      onUndo={() =>
+                        e.snapshotId != null &&
+                        undoSnapshot(e.id, e.snapshotId, e.resourceId)
+                      }
+                    />
                   </td>
                 </tr>
               ))}
